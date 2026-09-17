@@ -1,219 +1,166 @@
 import streamlit as st
 import yfinance as yf
-import numpy as np
 
-# Page Configuration
+# ---------------------------------------------------------
+# Streamlit Mobile Page Configuration & Dark Theme CSS
+# ---------------------------------------------------------
 st.set_page_config(
-    page_title="Trading Dashboard & Dynamic Setup Generator",
-    page_icon="📈",
-    layout="wide"
+    page_title="2026 Bull Run System Scanner",
+    page_icon="⚡",
+    layout="centered",
+    initial_sidebar_state="collapsed"
 )
 
-st.title("📈 Mobile Trading Dashboard & Setup Generator")
-st.markdown("---")
+st.markdown("""
+    <style>
+    /* Compact padding for mobile screen optimization */
+    .block-container { padding-top: 1.2rem; padding-bottom: 2rem; padding-left: 0.8rem; padding-right: 0.8rem; }
+    .stMetric { background-color: #1a1c23; padding: 10px; border-radius: 8px; border: 1px solid #2e323e; }
+    .card-a-plus { border-left: 5px solid #00E676; background-color: #132419; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
+    .card-b { border-left: 5px solid #FFD600; background-color: #262413; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
+    .card-c { border-left: 5px solid #FF1744; background-color: #281215; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
+    </style>
+""", unsafe_allow_html=True)
 
 # ---------------------------------------------------------
-# 1. WATCHLIST DEFINITION (Including BTC, ETH, SOL)
+# Asset Classification & Tiering Engine
 # ---------------------------------------------------------
-TICKER_MAP = {
-    "Bitcoin (BTC-USD)": "BTC-USD",
-    "Ethereum (ETH-USD)": "ETH-USD",
-    "Solana (SOL-USD)": "SOL-USD",
-    "Zcash (ZEC-USD)": "ZEC-USD",
-    "Sui (SUI-USD)": "SUI-USD",
-    "Avalanche (AVAX-USD)": "AVAX-USD",
-    "Gold Futures (GC=F)": "GC=F",
-    "Brent Crude Oil (BZ=F)": "BZ=F",
-    "Apple (AAPL)": "AAPL",
-    "Google (GOOGL)": "GOOGL",
-    "eBay (EBAY)": "EBAY",
-    "SpaceX (Private - No Live Feed)": "SPACEX",
-    "Custom Ticker Input": "CUSTOM"
+ASSET_TIERS = {
+    # Existing Crypto Assets
+    "BTC-USD": {"name": "Bitcoin", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"},
+    "ETH-USD": {"name": "Ethereum", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"},
+    "SOL-USD": {"name": "Solana", "tier": 2, "max_lev": "2x - 3x", "trail": "10% - 15%"},
+    "AVAX-USD": {"name": "Avalanche", "tier": 2, "max_lev": "2x - 3x", "trail": "10% - 15%"},
+    "NEAR-USD": {"name": "NEAR Protocol", "tier": 2, "max_lev": "2x - 3x", "trail": "10% - 15%"},
+    "DOGE-USD": {"name": "Dogecoin", "tier": 3, "max_lev": "1x (Spot)", "trail": "25% - 35%"},
+    
+    # Newly Added Crypto Assets
+    "SUI-USD": {"name": "Sui", "tier": 2, "max_lev": "2x - 3x", "trail": "10% - 15%"},
+    "ZEC-USD": {"name": "Zcash", "tier": 2, "max_lev": "2x - 3x", "trail": "10% - 15%"},
+
+    # Commodities
+    "GC=F": {"name": "Gold Futures", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"},
+    "CL=F": {"name": "Crude Oil WTI", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"},
+
+    # U.S. Stocks
+    "AAPL": {"name": "Apple Inc.", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"},
+    "GOOGL": {"name": "Alphabet (Google)", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"},
+    "EBAY": {"name": "eBay Inc.", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"},
+    "SPCX": {"name": "SpaceX", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"}
 }
 
+st.title("⚡ 2026 Active System Scanner")
+st.caption("Active Trading Engine • Hyperliquid, Bybit & Stocks Rules")
+
 # ---------------------------------------------------------
-# 2. HELPER FUNCTION: Calculate Dynamic Setup via ATR
+# Top Inputs (Mobile Optimized)
 # ---------------------------------------------------------
-def generate_live_setup(ticker_symbol):
-    """
-    Fetches recent price history to dynamically compute ATR-based trade setups.
-    Returns: (current_price, delta_price, entry, take_profit, stop_loss)
-    """
+col1, col2 = st.columns([2, 1])
+with col1:
+    selected_asset = st.selectbox("Select Asset Ticker", list(ASSET_TIERS.keys()), index=2)
+with col2:
+    account_equity = st.number_input("Account ($)", value=10000, step=1000)
+
+asset_meta = ASSET_TIERS[selected_asset]
+
+# ---------------------------------------------------------
+# Fetch Live Market Data
+# ---------------------------------------------------------
+@st.cache_data(ttl=60)
+def fetch_market_data(symbol):
     try:
-        stock = yf.Ticker(ticker_symbol)
-        df = stock.history(period="1mo")
-        
-        if df.empty or len(df) < 2:
-            return None, None, None, None, None
+        ticker = yf.Ticker(symbol)
+        df_daily = ticker.history(period="60d", interval="1d")
+        df_4h = ticker.history(period="14d", interval="1h") # Approximation for mobile scan
+        return df_daily, df_4h
+    except Exception as e:
+        return None, None
 
-        current_price = float(df['Close'].iloc[-1])
-        prev_close = float(df['Close'].iloc[-2]) if len(df) >= 2 else current_price
-        delta_price = current_price - prev_close
+df_daily, df_4h = fetch_market_data(selected_asset)
 
-        # Calculate 14-period ATR (Average True Range)
-        if len(df) >= 14:
-            df['H-L'] = df['High'] - df['Low']
-            df['H-PC'] = np.abs(df['High'] - df['Close'].shift(1))
-            df['L-PC'] = np.abs(df['Low'] - df['Close'].shift(1))
-            df['TR'] = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
-            atr = df['TR'].rolling(window=14).mean().iloc[-1]
-            if np.isnan(atr) or atr <= 0:
-                atr = current_price * 0.02
-        else:
-            atr = current_price * 0.02
-
-        # Dynamic Setup Logic (1:2 Risk-to-Reward Ratio)
-        entry_price = current_price
-        stop_loss = max(0.01, current_price - (1.5 * atr))
-        take_profit = current_price + (3.0 * atr)
-
-        return current_price, delta_price, entry_price, take_profit, stop_loss
-    except Exception:
-        return None, None, None, None, None
-
-
-# ---------------------------------------------------------
-# 3. SIDEBAR - Watchlist Selection & Live Metric Display
-# ---------------------------------------------------------
-st.sidebar.header("Ticker Settings")
-
-selected_preset = st.sidebar.selectbox("Select Asset Watchlist", options=list(TICKER_MAP.keys()))
-selected_symbol = TICKER_MAP[selected_preset]
-
-if selected_symbol == "CUSTOM":
-    ticker_symbol = st.sidebar.text_input("Enter Custom Ticker", value="BTC-USD").upper().strip()
-elif selected_symbol == "SPACEX":
-    ticker_symbol = ""
-    st.sidebar.info("SpaceX is a private company and does not have a public market ticker feed.")
-else:
-    ticker_symbol = selected_symbol
-
-current_price, delta_price, auto_entry, auto_tp, auto_sl = None, None, None, None, None
-data_fetched = False
-
-if ticker_symbol:
-    with st.spinner(f"Fetching live prices & computing setup for {ticker_symbol}..."):
-        current_price, delta_price, auto_entry, auto_tp, auto_sl = generate_live_setup(ticker_symbol)
-        
-        if current_price is not None:
-            data_fetched = True
-            st.sidebar.metric(
-                label=f"Live Market Price ({ticker_symbol})",
-                value=f"${current_price:,.2f}",
-                delta=f"{delta_price:+.2f}"
-            )
-            st.sidebar.success("✅ Dynamic setup levels auto-populated!")
-        else:
-            st.sidebar.error(f"Could not fetch live pricing for '{ticker_symbol}'.")
-
-# ---------------------------------------------------------
-# 4. MAIN PANEL - Inputs & Auto-Calculated Setups
-# ---------------------------------------------------------
-col_left, col_right = st.columns(2)
-
-default_entry = auto_entry if data_fetched else 100.0
-default_tp = auto_tp if data_fetched else 110.0
-default_sl = auto_sl if data_fetched else 95.0
-
-with col_left:
-    st.subheader("⚙️ Active Trade Setup (Live Pricing)")
-    entry_price = st.number_input(
-        "Entry Price ($)", 
-        value=float(default_entry), 
-        step=0.10,
-        format="%.2f",
-        help="Defaults to current market price."
-    )
-    take_profit_target = st.number_input(
-        "Take-Profit Target ($)", 
-        value=float(default_tp), 
-        step=0.10,
-        format="%.2f",
-        help="Auto-calculated target based on market volatility (2x Risk)."
-    )
-    stop_loss_price = st.number_input(
-        "Stop-Loss Price ($)", 
-        value=float(default_sl), 
-        step=0.10,
-        format="%.2f",
-        help="Auto-calculated stop loss based on recent volatility."
-    )
-
-with col_right:
-    st.subheader("💼 Account & Risk Limits")
-    account_balance = st.number_input(
-        "Total Portfolio Balance ($)", 
-        value=10000.0, 
-        step=500.0,
-        format="%.2f"
-    )
-    risk_percentage = st.slider(
-        "Max Risk Per Trade (%)", 
-        min_value=0.5, 
-        max_value=5.0, 
-        value=1.0, 
-        step=0.5
-    )
-
-st.markdown("---")
-
-# ---------------------------------------------------------
-# 5. TAKE-PROFIT & ALERTS MONITORING
-# ---------------------------------------------------------
-st.subheader("🎯 Target & Alert Status")
-
-if data_fetched and current_price > 0:
-    if current_price >= take_profit_target:
-        st.success(
-            f"🚨 **TAKE-PROFIT TRIGGERED!** Current price (${current_price:,.2f}) "
-            f"has reached or passed your target (${take_profit_target:,.2f})."
-        )
-    elif current_price <= stop_loss_price:
-        st.error(
-            f"⚠️ **STOP-LOSS TRIGGERED!** Current price (${current_price:,.2f}) "
-            f"has dropped to or below your stop loss (${stop_loss_price:,.2f})."
-        )
+if df_daily is not None and not df_daily.empty:
+    current_price = df_daily['Close'].iloc[-1]
+    
+    # ---------------------------------------------------------
+    # System Regime & Setup Calculation Protocol
+    # ---------------------------------------------------------
+    ma50_daily = df_daily['Close'].rolling(50).mean().iloc[-1]
+    regime_1d = "BULLISH" if current_price > ma50_daily else "NEUTRAL / BEARISH"
+    
+    # Determine Entry & Structural Stop based on Tier
+    if asset_meta["tier"] == 1:
+        stop_dist_pct = 0.025 # 2.5% structural stop baseline
+        score = 8 if regime_1d == "BULLISH" else 6
+    elif asset_meta["tier"] == 2:
+        stop_dist_pct = 0.0497 # 4.97% structural stop baseline
+        score = 8 if regime_1d == "BULLISH" else 6
     else:
-        dist_tp = ((take_profit_target - current_price) / current_price) * 100
-        dist_sl = ((current_price - stop_loss_price) / current_price) * 100
-        st.info(
-            f"📊 **In Range:** Current price is **${current_price:,.2f}** | "
-            f"Take-Profit is **{dist_tp:.2f}%** away | Stop-Loss is **{dist_sl:.2f}%** below."
-        )
-else:
-    st.warning("Select or enter a valid ticker in the sidebar to run live status alerts.")
+        stop_dist_pct = 0.12 # Memes / High Beta Spot
+        score = 5
 
-st.markdown("---")
+    entry_price = current_price
+    hard_stop = entry_price * (1 - stop_dist_pct)
+    target_1 = entry_price + (2.0 * (entry_price - hard_stop))
+    target_2 = entry_price + (3.5 * (entry_price - hard_stop))
 
-# ---------------------------------------------------------
-# 6. POSITION SIZING & CALCULATIONS
-# ---------------------------------------------------------
-st.subheader("🧮 Calculated Position Sizing & P&L")
+    # Risk Management Mechanics (1% Risk Engine)
+    risk_amount = account_equity * 0.01
+    position_size_usd = risk_amount / stop_dist_pct
+    units = position_size_usd / entry_price
 
-risk_amount = account_balance * (risk_percentage / 100)
-risk_per_share = entry_price - stop_loss_price
+    # ---------------------------------------------------------
+    # Render Setup Card
+    # ---------------------------------------------------------
+    if score >= 8:
+        card_class = "card-a-plus"
+        grade = "8 / 10 — A+ SETUP"
+    elif score >= 6:
+        card_class = "card-b"
+        grade = "6–7 / 10 — B SETUP (Scale-In Only)"
+    else:
+        card_class = "card-c"
+        grade = "≤5 / 10 — C SETUP (NO TRADE)"
 
-if risk_per_share > 0:
-    position_shares = risk_amount / risk_per_share
-    total_cost = position_shares * entry_price
-    potential_profit = position_shares * (take_profit_target - entry_price)
-    reward_risk_ratio = (take_profit_target - entry_price) / risk_per_share
+    st.markdown(f"""
+        <div class="{card_class}">
+            <h3 style="margin:0;">{asset_meta['name']} ({selected_asset})</h3>
+            <p style="margin:0; font-weight:bold; font-size: 1.1rem;">RATING: {grade}</p>
+        </div>
+    """, unsafe_allow_html=True)
+
+    # Key Metrics Display
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Live Price", f"${current_price:,.2f}")
+    m2.metric("1D Regime", regime_1d)
+    m3.metric("Max Leverage", asset_meta["max_lev"])
+
+    st.divider()
+
+    # ---------------------------------------------------------
+    # Trade Execution Parameters
+    # ---------------------------------------------------------
+    st.subheader("🎯 Trade Parameters")
     
-    m1, m2, m3, m4 = st.columns(4)
-    # Crypto support fractional units
-    is_crypto = "-USD" in ticker_symbol
-    qty_format = f"{position_shares:,.4f} units" if is_crypto else f"{int(position_shares):,} shares"
-    
-    m1.metric(label="Suggested Units/Shares", value=qty_format)
-    m2.metric(label="Capital Required", value=f"${total_cost:,.2f}")
-    m3.metric(label="Max Loss Risk", value=f"${risk_amount:,.2f}")
-    m4.metric(label="Potential Gain", value=f"${potential_profit:,.2f}", delta=f"R:R {reward_risk_ratio:.2f}")
+    p1, p2 = st.columns(2)
+    p1.write(f"**Entry Zone:** `${entry_price:,.2f}`")
+    p1.write(f"**Hard Stop:** `${hard_stop:,.2f}` (-{stop_dist_pct*100:.2f}%)")
+    p2.write(f"**Target 1 (2.0R):** `${target_1:,.2f}`")
+    p2.write(f"**Target 2 (3.5R):** `${target_2:,.2f}`")
 
-    if total_cost > account_balance:
-        st.warning(
-            f"⚠️ Capital required (${total_cost:,.2f}) exceeds total account balance "
-            f"(${account_balance:,.2f}). Consider applying leverage or adjusting position size."
-        )
+    # Position Sizing Breakdown
+    st.info(f"""
+    **Position Sizing (1% Account Risk):**
+    * **Dollar Risk:** `${risk_amount:,.2f}`
+    * **Position Value:** `${position_size_usd:,.2f}` ({units:.2f} units)
+    * **Trailing Stop Transition:** Activate **{asset_meta['trail']}** trailing stop once price reaches Target 1 (`${target_1:,.2f}`). Move hard stop to breakeven (`${entry_price:,.2f}`).
+    """)
+
+    # Pros and Cons Breakdown
+    st.markdown("**System Pros & Cons:**")
+    st.write(f"✅ Aligns with {asset_meta['name']} Tier {asset_meta['tier']} risk parameters using isolated margin.")
+    st.write(f"✅ Structural stop strictly enforces 1% max account risk.")
+    st.write(f"⚠️ Requires manual confirmation of 4H higher-low candle close before entry execution.")
+
 else:
-    st.error("Stop-Loss price must be set below the Entry Price to calculate position size.")
+    st.error("Market data unavailable for this ticker. Please select another asset.")
     
