@@ -1,166 +1,269 @@
 import streamlit as st
 import yfinance as yf
 
-# ---------------------------------------------------------
-# Streamlit Mobile Page Configuration & Dark Theme CSS
-# ---------------------------------------------------------
+# Page Configuration
 st.set_page_config(
-    page_title="2026 Bull Run System Scanner",
-    page_icon="⚡",
-    layout="centered",
-    initial_sidebar_state="collapsed"
+    page_title="Trading Dashboard & Risk Calculator",
+    page_icon="📈",
+    layout="wide"
 )
 
-st.markdown("""
-    <style>
-    /* Compact padding for mobile screen optimization */
-    .block-container { padding-top: 1.2rem; padding-bottom: 2rem; padding-left: 0.8rem; padding-right: 0.8rem; }
-    .stMetric { background-color: #1a1c23; padding: 10px; border-radius: 8px; border: 1px solid #2e323e; }
-    .card-a-plus { border-left: 5px solid #00E676; background-color: #132419; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
-    .card-b { border-left: 5px solid #FFD600; background-color: #262413; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
-    .card-c { border-left: 5px solid #FF1744; background-color: #281215; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
-    </style>
-""", unsafe_allow_html=True)
+st.title("📈 Mobile Trading Dashboard")
+st.caption(
+    "⚠️ For educational/planning purposes only — not financial advice. "
+    "Prices update only when this app reruns; there is no background monitoring "
+    "or push alerting while the app is closed."
+)
+st.markdown("---")
 
 # ---------------------------------------------------------
-# Asset Classification & Tiering Engine
+# 1. SIDEBAR - Dynamic Ticker Selection & Fetch
 # ---------------------------------------------------------
-ASSET_TIERS = {
-    # Existing Crypto Assets
-    "BTC-USD": {"name": "Bitcoin", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"},
-    "ETH-USD": {"name": "Ethereum", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"},
-    "SOL-USD": {"name": "Solana", "tier": 2, "max_lev": "2x - 3x", "trail": "10% - 15%"},
-    "AVAX-USD": {"name": "Avalanche", "tier": 2, "max_lev": "2x - 3x", "trail": "10% - 15%"},
-    "NEAR-USD": {"name": "NEAR Protocol", "tier": 2, "max_lev": "2x - 3x", "trail": "10% - 15%"},
-    "DOGE-USD": {"name": "Dogecoin", "tier": 3, "max_lev": "1x (Spot)", "trail": "25% - 35%"},
-    
-    # Newly Added Crypto Assets
-    "SUI-USD": {"name": "Sui", "tier": 2, "max_lev": "2x - 3x", "trail": "10% - 15%"},
-    "ZEC-USD": {"name": "Zcash", "tier": 2, "max_lev": "2x - 3x", "trail": "10% - 15%"},
+st.sidebar.header("Ticker Settings")
+ticker_symbol = st.sidebar.text_input("Stock Ticker", value="AAPL").upper().strip()
 
-    # Commodities
-    "GC=F": {"name": "Gold Futures", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"},
-    "CL=F": {"name": "Crude Oil WTI", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"},
+current_price = 0.0
+data_fetched = False
 
-    # U.S. Stocks
-    "AAPL": {"name": "Apple Inc.", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"},
-    "GOOGL": {"name": "Alphabet (Google)", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"},
-    "EBAY": {"name": "eBay Inc.", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"},
-    "SPCX": {"name": "SpaceX", "tier": 1, "max_lev": "3x - 5x", "trail": "5% - 7%"}
-}
-
-st.title("⚡ 2026 Active System Scanner")
-st.caption("Active Trading Engine • Hyperliquid, Bybit & Stocks Rules")
-
-# ---------------------------------------------------------
-# Top Inputs (Mobile Optimized)
-# ---------------------------------------------------------
-col1, col2 = st.columns([2, 1])
-with col1:
-    selected_asset = st.selectbox("Select Asset Ticker", list(ASSET_TIERS.keys()), index=2)
-with col2:
-    account_equity = st.number_input("Account ($)", value=10000, step=1000)
-
-asset_meta = ASSET_TIERS[selected_asset]
-
-# ---------------------------------------------------------
-# Fetch Live Market Data
-# ---------------------------------------------------------
-@st.cache_data(ttl=60)
-def fetch_market_data(symbol):
+if ticker_symbol:
     try:
-        ticker = yf.Ticker(symbol)
-        df_daily = ticker.history(period="60d", interval="1d")
-        df_4h = ticker.history(period="14d", interval="1h") # Approximation for mobile scan
-        return df_daily, df_4h
+        stock = yf.Ticker(ticker_symbol)
+        # Fetch 2 days so we can compute a real "previous close" delta.
+        history = stock.history(period="2d")
+
+        if not history.empty:
+            current_price = float(history['Close'].iloc[-1])
+            if len(history) > 1:
+                prev_close = float(history['Close'].iloc[-2])
+            else:
+                # Only one row of data available (e.g. brand-new listing,
+                # or market hasn't produced a prior bar yet) — fall back to
+                # today's open rather than silently showing a $0.00 delta.
+                prev_close = float(history['Open'].iloc[-1])
+            delta_price = current_price - prev_close
+
+            st.sidebar.metric(
+                label=f"Live Price ({ticker_symbol})",
+                value=f"${current_price:.2f}",
+                delta=f"{delta_price:+.2f}"
+            )
+            data_fetched = True
+        else:
+            st.sidebar.error(f"No pricing data found for '{ticker_symbol}'.")
     except Exception as e:
-        return None, None
+        st.sidebar.error(f"Error fetching ticker data: {e}")
 
-df_daily, df_4h = fetch_market_data(selected_asset)
+# ---------------------------------------------------------
+# 2. MAIN PANEL - Inputs & Parameters
+# ---------------------------------------------------------
+col_left, col_right = st.columns(2)
 
-if df_daily is not None and not df_daily.empty:
-    current_price = df_daily['Close'].iloc[-1]
-    
-    # ---------------------------------------------------------
-    # System Regime & Setup Calculation Protocol
-    # ---------------------------------------------------------
-    ma50_daily = df_daily['Close'].rolling(50).mean().iloc[-1]
-    regime_1d = "BULLISH" if current_price > ma50_daily else "NEUTRAL / BEARISH"
-    
-    # Determine Entry & Structural Stop based on Tier
-    if asset_meta["tier"] == 1:
-        stop_dist_pct = 0.025 # 2.5% structural stop baseline
-        score = 8 if regime_1d == "BULLISH" else 6
-    elif asset_meta["tier"] == 2:
-        stop_dist_pct = 0.0497 # 4.97% structural stop baseline
-        score = 8 if regime_1d == "BULLISH" else 6
+with col_left:
+    st.subheader("⚙️ Trade Parameters")
+    entry_price = st.number_input(
+        "Entry Price ($)",
+        value=float(current_price) if data_fetched else 150.0,
+        min_value=0.01,
+        step=1.0,
+        format="%.2f"
+    )
+
+    # --- session_state guards so manual edits to TP/SL aren't silently
+    # --- overwritten by the auto-calculated default on the next rerun.
+    if "tp_initialized" not in st.session_state or st.session_state.get("tp_entry_ref") != entry_price:
+        st.session_state["take_profit_target"] = entry_price * 1.10
+        st.session_state["stop_loss_price"] = entry_price * 0.95
+        st.session_state["tp_initialized"] = True
+        st.session_state["tp_entry_ref"] = entry_price
+
+    take_profit_target = st.number_input(
+        "Take-Profit Target ($)",
+        step=1.0,
+        format="%.2f",
+        key="take_profit_target"
+    )
+    stop_loss_price = st.number_input(
+        "Stop-Loss Price ($)",
+        step=1.0,
+        format="%.2f",
+        key="stop_loss_price"
+    )
+
+with col_right:
+    st.subheader("💼 Account & Risk Limits")
+    account_balance = st.number_input(
+        "Total Portfolio Balance ($)",
+        value=10000.0,
+        min_value=0.0,
+        step=500.0,
+        format="%.2f"
+    )
+    risk_percentage = st.slider(
+        "Max Risk Per Trade (%)",
+        min_value=0.5,
+        max_value=5.0,
+        value=2.0,
+        step=0.5
+    )
+
+st.markdown("---")
+
+# ---------------------------------------------------------
+# 3. POSITION SIZING & CALCULATIONS (computed up front so both
+#    tabs below can use the results)
+# ---------------------------------------------------------
+risk_amount = account_balance * (risk_percentage / 100)
+risk_per_share = entry_price - stop_loss_price
+position_shares = 0
+total_cost = 0.0
+potential_profit = 0.0
+reward_risk_ratio = 0.0
+sizing_valid = entry_price > 0 and risk_per_share > 0
+
+if sizing_valid:
+    position_shares = int(risk_amount / risk_per_share)
+    total_cost = position_shares * entry_price
+    potential_profit = position_shares * (take_profit_target - entry_price)
+    reward_risk_ratio = (take_profit_target - entry_price) / risk_per_share
+
+# ---------------------------------------------------------
+# 4. TABS - Dashboard view / Trailing Stop Manager
+# ---------------------------------------------------------
+tab_dashboard, tab_trailing = st.tabs(["🎯 Dashboard", "🔒 Trailing Stop Manager"])
+
+with tab_dashboard:
+    st.subheader("🎯 Target & Alert Status")
+
+    if entry_price <= 0:
+        st.warning("Entry price must be greater than $0.")
+    elif data_fetched and current_price > 0:
+        if current_price >= take_profit_target:
+            st.success(
+                f"🚨 **TAKE-PROFIT TRIGGERED!** Current price (${current_price:.2f}) "
+                f"has reached or passed your target (${take_profit_target:.2f})."
+            )
+        elif current_price <= stop_loss_price:
+            st.error(
+                f"⚠️ **STOP-LOSS TRIGGERED!** Current price (${current_price:.2f}) "
+                f"has dropped to or below your stop loss (${stop_loss_price:.2f})."
+            )
+        else:
+            dist_tp = ((take_profit_target - current_price) / current_price) * 100
+            dist_sl = ((current_price - stop_loss_price) / current_price) * 100
+            st.info(
+                f"📊 **In Range:** Current price is **${current_price:.2f}** | "
+                f"Take-Profit is **{dist_tp:.2f}%** away | Stop-Loss is **{dist_sl:.2f}%** below."
+            )
     else:
-        stop_dist_pct = 0.12 # Memes / High Beta Spot
-        score = 5
+        st.warning("Enter a valid ticker in the sidebar to run live status alerts.")
 
-    entry_price = current_price
-    hard_stop = entry_price * (1 - stop_dist_pct)
-    target_1 = entry_price + (2.0 * (entry_price - hard_stop))
-    target_2 = entry_price + (3.5 * (entry_price - hard_stop))
+    st.markdown("---")
+    st.subheader("🧮 Calculated Position Sizing & P&L")
 
-    # Risk Management Mechanics (1% Risk Engine)
-    risk_amount = account_equity * 0.01
-    position_size_usd = risk_amount / stop_dist_pct
-    units = position_size_usd / entry_price
-
-    # ---------------------------------------------------------
-    # Render Setup Card
-    # ---------------------------------------------------------
-    if score >= 8:
-        card_class = "card-a-plus"
-        grade = "8 / 10 — A+ SETUP"
-    elif score >= 6:
-        card_class = "card-b"
-        grade = "6–7 / 10 — B SETUP (Scale-In Only)"
+    if entry_price <= 0:
+        st.error("Entry price must be greater than $0 to calculate position size.")
+    elif risk_per_share <= 0:
+        st.error("Stop-Loss price must be set below the Entry Price to calculate position size.")
+    elif position_shares == 0:
+        st.warning(
+            f"⚠️ Your risk budget (${risk_amount:,.2f}) divided by the per-share risk "
+            f"(${risk_per_share:.2f}) rounds down to **0 shares**. This trade isn't sized-in "
+            f"under your current risk %/stop distance — widen your risk % or tighten the stop."
+        )
     else:
-        card_class = "card-c"
-        grade = "≤5 / 10 — C SETUP (NO TRADE)"
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(label="Suggested Shares", value=f"{position_shares:,} qty")
+        m2.metric(label="Capital Required", value=f"${total_cost:,.2f}")
+        m3.metric(label="Max Loss Risk", value=f"${risk_amount:,.2f}")
+        m4.metric(label="Potential Gain", value=f"${potential_profit:,.2f}", delta=f"R:R {reward_risk_ratio:.2f}")
 
-    st.markdown(f"""
-        <div class="{card_class}">
-            <h3 style="margin:0;">{asset_meta['name']} ({selected_asset})</h3>
-            <p style="margin:0; font-weight:bold; font-size: 1.1rem;">RATING: {grade}</p>
-        </div>
-    """, unsafe_allow_html=True)
+        if total_cost > account_balance:
+            st.warning(
+                f"⚠️ Capital required (${total_cost:,.2f}) exceeds total account balance "
+                f"(${account_balance:,.2f}). Consider adjusting leverage or lowering risk."
+            )
 
-    # Key Metrics Display
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Live Price", f"${current_price:,.2f}")
-    m2.metric("1D Regime", regime_1d)
-    m3.metric("Max Leverage", asset_meta["max_lev"])
+with tab_trailing:
+    st.subheader("🔒 Trailing Stop Manager")
+    st.caption(
+        "Once your trade moves into profit, this tracks a trailing stop that only ever "
+        "moves up (never down) and shows how much profit is currently locked in."
+    )
 
-    st.divider()
+    if entry_price <= 0:
+        st.warning("Set a valid entry price to use the trailing stop manager.")
+    elif not data_fetched or current_price <= 0:
+        st.info("Enter a valid ticker in the sidebar to activate trailing stop management.")
+    else:
+        trade_active = current_price > entry_price
 
-    # ---------------------------------------------------------
-    # Trade Execution Parameters
-    # ---------------------------------------------------------
-    st.subheader("🎯 Trade Parameters")
-    
-    p1, p2 = st.columns(2)
-    p1.write(f"**Entry Zone:** `${entry_price:,.2f}`")
-    p1.write(f"**Hard Stop:** `${hard_stop:,.2f}` (-{stop_dist_pct*100:.2f}%)")
-    p2.write(f"**Target 1 (2.0R):** `${target_1:,.2f}`")
-    p2.write(f"**Target 2 (3.5R):** `${target_2:,.2f}`")
+        if not trade_active:
+            st.warning(
+                f"Trade not yet active. Current price (${current_price:.2f}) is at or below "
+                f"your entry price (${entry_price:.2f}). Trailing stop management kicks in "
+                f"once the trade is in profit."
+            )
+            # Keep the stored trailing level in sync with the manual stop-loss
+            # until the trade actually goes active.
+            st.session_state["trailing_stop_level"] = stop_loss_price
+            st.session_state["trailing_stop_ticker"] = ticker_symbol
+        else:
+            trailing_pct = st.slider(
+                "Trailing Stop Distance (%)",
+                min_value=0.5,
+                max_value=20.0,
+                value=5.0,
+                step=0.5,
+                help="How far below the current price to trail your stop-loss."
+            )
 
-    # Position Sizing Breakdown
-    st.info(f"""
-    **Position Sizing (1% Account Risk):**
-    * **Dollar Risk:** `${risk_amount:,.2f}`
-    * **Position Value:** `${position_size_usd:,.2f}` ({units:.2f} units)
-    * **Trailing Stop Transition:** Activate **{asset_meta['trail']}** trailing stop once price reaches Target 1 (`${target_1:,.2f}`). Move hard stop to breakeven (`${entry_price:,.2f}`).
-    """)
+            # Initialize (or reset on ticker change) the ratcheting stop level.
+            if (
+                "trailing_stop_level" not in st.session_state
+                or st.session_state.get("trailing_stop_ticker") != ticker_symbol
+            ):
+                st.session_state["trailing_stop_level"] = stop_loss_price
+                st.session_state["trailing_stop_ticker"] = ticker_symbol
 
-    # Pros and Cons Breakdown
-    st.markdown("**System Pros & Cons:**")
-    st.write(f"✅ Aligns with {asset_meta['name']} Tier {asset_meta['tier']} risk parameters using isolated margin.")
-    st.write(f"✅ Structural stop strictly enforces 1% max account risk.")
-    st.write(f"⚠️ Requires manual confirmation of 4H higher-low candle close before entry execution.")
+            proposed_stop = current_price * (1 - trailing_pct / 100)
+            # Ratchet mechanic: the stop only ever moves up, never down,
+            # even if price pulls back and trailing_pct implies a lower level.
+            if proposed_stop > st.session_state["trailing_stop_level"]:
+                st.session_state["trailing_stop_level"] = proposed_stop
 
-else:
-    st.error("Market data unavailable for this ticker. Please select another asset.")
-    
+            active_stop = st.session_state["trailing_stop_level"]
+            locked_profit_per_share = active_stop - entry_price
+            locked_in = locked_profit_per_share > 0
+            shares_for_calc = position_shares if sizing_valid else 0
+            locked_profit_total = locked_profit_per_share * shares_for_calc if locked_in else 0.0
+
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Current Price", f"${current_price:.2f}")
+            t2.metric("Recommended Stop", f"${active_stop:.2f}")
+            t3.metric(
+                "Locked-In Profit/Share",
+                f"${locked_profit_per_share:+.2f}",
+                delta="Profit secured" if locked_in else "Not yet in profit"
+            )
+
+            if locked_in:
+                st.success(
+                    f"✅ **Move your stop-loss to ${active_stop:.2f}.** If price reverses and "
+                    f"hits this level, you lock in at least **${locked_profit_total:,.2f}** "
+                    f"in profit across {shares_for_calc:,} shares."
+                )
+            else:
+                st.info(
+                    f"Trailing stop is currently at **${active_stop:.2f}**, still below your "
+                    f"entry price (${entry_price:.2f}) — no profit locked in yet, but risk is "
+                    f"tightening as price rises toward breakeven."
+                )
+
+            st.caption(
+                "This tool only *recommends* where to move your stop — you still need to "
+                "update the actual stop-loss order with your broker."
+            )
+
+            if st.button("Reset Trailing Stop to Manual Stop-Loss"):
+                st.session_state["trailing_stop_level"] = stop_loss_price
+                st.rerun()
