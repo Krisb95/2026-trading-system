@@ -36,9 +36,6 @@ if ticker_symbol:
             if len(history) > 1:
                 prev_close = float(history['Close'].iloc[-2])
             else:
-                # Only one row of data available (e.g. brand-new listing,
-                # or market hasn't produced a prior bar yet) — fall back to
-                # today's open rather than silently showing a $0.00 delta.
                 prev_close = float(history['Open'].iloc[-1])
             delta_price = current_price - prev_close
 
@@ -68,8 +65,6 @@ with col_left:
         format="%.2f"
     )
 
-    # --- session_state guards so manual edits to TP/SL aren't silently
-    # --- overwritten by the auto-calculated default on the next rerun.
     if "tp_initialized" not in st.session_state or st.session_state.get("tp_entry_ref") != entry_price:
         st.session_state["take_profit_target"] = entry_price * 1.10
         st.session_state["stop_loss_price"] = entry_price * 0.95
@@ -107,10 +102,8 @@ with col_right:
     )
 
 st.markdown("---")
-
 # ---------------------------------------------------------
-# 3. POSITION SIZING & CALCULATIONS (computed up front so both
-#    tabs below can use the results)
+# 3. POSITION SIZING & CALCULATIONS
 # ---------------------------------------------------------
 risk_amount = account_balance * (risk_percentage / 100)
 risk_per_share = entry_price - stop_loss_price
@@ -203,8 +196,6 @@ with tab_trailing:
                 f"your entry price (${entry_price:.2f}). Trailing stop management kicks in "
                 f"once the trade is in profit."
             )
-            # Keep the stored trailing level in sync with the manual stop-loss
-            # until the trade actually goes active.
             st.session_state["trailing_stop_level"] = stop_loss_price
             st.session_state["trailing_stop_ticker"] = ticker_symbol
         else:
@@ -217,7 +208,6 @@ with tab_trailing:
                 help="How far below the current price to trail your stop-loss."
             )
 
-            # Initialize (or reset on ticker change) the ratcheting stop level.
             if (
                 "trailing_stop_level" not in st.session_state
                 or st.session_state.get("trailing_stop_ticker") != ticker_symbol
@@ -226,8 +216,6 @@ with tab_trailing:
                 st.session_state["trailing_stop_ticker"] = ticker_symbol
 
             proposed_stop = current_price * (1 - trailing_pct / 100)
-            # Ratchet mechanic: the stop only ever moves up, never down,
-            # even if price pulls back and trailing_pct implies a lower level.
             if proposed_stop > st.session_state["trailing_stop_level"]:
                 st.session_state["trailing_stop_level"] = proposed_stop
 
