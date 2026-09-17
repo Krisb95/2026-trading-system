@@ -1,5 +1,6 @@
 import streamlit as st
 import yfinance as yf
+import requests
 
 # Page Configuration
 st.set_page_config(
@@ -20,7 +21,65 @@ st.markdown("---")
 # 1. SIDEBAR - Dynamic Ticker Selection & Fetch
 # ---------------------------------------------------------
 st.sidebar.header("Ticker Settings")
-ticker_symbol = st.sidebar.text_input("Stock Ticker", value="AAPL").upper().strip()
+
+
+@st.cache_data(ttl=3600)
+def get_top_100_cryptos():
+    """Top 100 cryptos by market cap, mapped to Yahoo Finance '-USD' tickers."""
+    try:
+        response = requests.get(
+            "https://api.coingecko.com/api/v3/coins/markets",
+            params={
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": 100,
+                "page": 1,
+                "sparkline": "false",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        coins = response.json()
+        return {
+            f"{coin['name']} ({coin['symbol'].upper()})": f"{coin['symbol'].upper()}-USD"
+            for coin in coins
+        }
+    except Exception:
+        return {}
+
+
+asset_type = st.sidebar.radio("Asset Type", ["Stock", "Crypto"], horizontal=True)
+
+if asset_type == "Crypto":
+    top_cryptos = get_top_100_cryptos()
+    if top_cryptos:
+        options = list(top_cryptos.keys()) + ["Custom (type below)"]
+        # Default the dropdown to Solana if it's present in the live list.
+        default_index = next(
+            (i for i, name in enumerate(options) if name.startswith("Solana")), 0
+        )
+        crypto_choice = st.sidebar.selectbox(
+            "Select Crypto (Top 100 by market cap)",
+            options=options,
+            index=default_index,
+        )
+        if crypto_choice == "Custom (type below)":
+            ticker_symbol = st.sidebar.text_input(
+                "Custom Crypto Ticker (e.g. DOGE-USD)", value="SOL-USD"
+            ).upper().strip()
+        else:
+            ticker_symbol = top_cryptos[crypto_choice]
+            st.sidebar.caption(f"Ticker: `{ticker_symbol}`")
+    else:
+        st.sidebar.warning(
+            "Couldn't load the live top-100 list (CoinGecko unavailable) — "
+            "enter a crypto ticker manually."
+        )
+        ticker_symbol = st.sidebar.text_input(
+            "Crypto Ticker", value="SOL-USD"
+        ).upper().strip()
+else:
+    ticker_symbol = st.sidebar.text_input("Stock Ticker", value="AAPL").upper().strip()
 
 current_price = 0.0
 data_fetched = False
@@ -36,6 +95,9 @@ if ticker_symbol:
             if len(history) > 1:
                 prev_close = float(history['Close'].iloc[-2])
             else:
+                # Only one row of data available (e.g. brand-new listing,
+                # or market hasn't produced a prior bar yet) — fall back to
+                # today's open rather than silently showing a $0.00 delta.
                 prev_close = float(history['Open'].iloc[-1])
             delta_price = current_price - prev_close
 
@@ -65,6 +127,8 @@ with col_left:
         format="%.2f"
     )
 
+    # --- session_state guards so manual edits to TP/SL aren't silently
+    # --- overwritten by the auto-calculated default on the next rerun.
     if "tp_initialized" not in st.session_state or st.session_state.get("tp_entry_ref") != entry_price:
         st.session_state["take_profit_target"] = entry_price * 1.10
         st.session_state["stop_loss_price"] = entry_price * 0.95
@@ -102,8 +166,10 @@ with col_right:
     )
 
 st.markdown("---")
+
 # ---------------------------------------------------------
-# 3. POSITION SIZING & CALCULATIONS
+# 3. POSITION SIZING & CALCULATIONS (computed up front so both
+#    tabs below can use the results)
 # ---------------------------------------------------------
 risk_amount = account_balance * (risk_percentage / 100)
 risk_per_share = entry_price - stop_loss_price
@@ -196,6 +262,8 @@ with tab_trailing:
                 f"your entry price (${entry_price:.2f}). Trailing stop management kicks in "
                 f"once the trade is in profit."
             )
+            # Keep the stored trailing level in sync with the manual stop-loss
+            # until the trade actually goes active.
             st.session_state["trailing_stop_level"] = stop_loss_price
             st.session_state["trailing_stop_ticker"] = ticker_symbol
         else:
@@ -208,6 +276,7 @@ with tab_trailing:
                 help="How far below the current price to trail your stop-loss."
             )
 
+            # Initialize (or reset on ticker change) the ratcheting stop level.
             if (
                 "trailing_stop_level" not in st.session_state
                 or st.session_state.get("trailing_stop_ticker") != ticker_symbol
@@ -216,6 +285,8 @@ with tab_trailing:
                 st.session_state["trailing_stop_ticker"] = ticker_symbol
 
             proposed_stop = current_price * (1 - trailing_pct / 100)
+            # Ratchet mechanic: the stop only ever moves up, never down,
+            # even if price pulls back and trailing_pct implies a lower level.
             if proposed_stop > st.session_state["trailing_stop_level"]:
                 st.session_state["trailing_stop_level"] = proposed_stop
 
