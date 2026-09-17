@@ -116,6 +116,70 @@ if ticker_symbol:
 # 2. MAIN PANEL - Inputs & Parameters
 # ---------------------------------------------------------
 col_left, col_right = st.columns(2)
+def rate_trade_setup(entry, tp, sl):
+    """Score a trade setup 0-10 using reward:risk and stop-distance sanity.
+    Returns None if the setup isn't valid (TP not above entry, or SL not below entry)."""
+    risk = entry - sl
+    reward = tp - entry
+    if entry <= 0 or risk <= 0 or reward <= 0:
+        return None
+
+    reward_risk = reward / risk
+    stop_pct = (risk / entry) * 100
+
+    # Reward:Risk component — out of 6 points
+    if reward_risk >= 3:
+        rr_score = 6.0
+    elif reward_risk >= 2:
+        rr_score = 4.5
+    elif reward_risk >= 1.5:
+        rr_score = 3.0
+    elif reward_risk >= 1:
+        rr_score = 1.5
+    else:
+        rr_score = 0.0
+
+    # Stop-distance sanity component — out of 4 points.
+    # Too tight (<0.5%) risks noise stop-outs; too wide (>15%) risks oversized loss.
+    if 1.0 <= stop_pct <= 8.0:
+        stop_score = 4.0
+    elif 0.5 <= stop_pct < 1.0 or 8.0 < stop_pct <= 15.0:
+        stop_score = 2.0
+    else:
+        stop_score = 0.0
+
+    return rr_score + stop_score, reward_risk, stop_pct
+    st.markdown("##### 📋 Trade Setup Rating")
+    rating = rate_trade_setup(entry_price, take_profit_target, stop_loss_price)
+    if rating is None:
+        st.warning(
+            "⚠️ Take-Profit must be above Entry and Stop-Loss must be below Entry "
+            "to calculate a rating."
+        )
+    else:
+        setup_score, reward_risk_setup, stop_pct_setup = rating
+        setup_grade = score_to_grade(setup_score)
+        rc1, rc2 = st.columns([1, 2])
+        rc1.metric("Rating", f"{setup_score:.1f}/10", setup_grade)
+        rc2.caption(
+            f"Reward:Risk = {reward_risk_setup:.2f} : 1  \n"
+            f"Stop distance = {stop_pct_setup:.1f}% from entry"
+        )
+
+def score_to_grade(score):
+    if score >= 9:
+        return "A+"
+    if score >= 8:
+        return "A"
+    if score >= 7:
+        return "B+"
+    if score >= 6:
+        return "B"
+    if score >= 5:
+        return "C"
+    if score >= 3:
+        return "D"
+    return "F"
 
 with col_left:
     st.subheader("⚙️ Trade Parameters")
