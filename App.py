@@ -6,42 +6,41 @@ st.set_page_config(page_title="Trade Setup & Rating Scanner", layout="wide")
 st.title("⚡ Active System Setup & Trade Rating")
 
 # ---------------------------------------------------------
-# WATCHLIST & TICKER SELECTION
+# WATCHLIST & PRESET TRADE PARAMETERS DATABASE
 # ---------------------------------------------------------
-TICKER_PRESETS = {
-    "Apple (AAPL)": "AAPL",
-    "Tesla (TSLA)": "TSLA",
-    "Nvidia (NVDA)": "NVDA",
-    "Google (GOOGL)": "GOOGL",
-    "Gold Futures (GC=F)": "GC=F",
-    "Brent Crude Oil (BZ=F)": "BZ=F",
-    "Bitcoin (BTC-USD)": "BTC-USD",
-    "Ethereum (ETH-USD)": "ETH-USD",
-    "Zcash (ZEC-USD)": "ZEC-USD",
-    "Sui (SUI-USD)": "SUI-USD",
-    "Hyperliquid (HYPE-USD)": "HYPE-USD",
-    "Custom Ticker": "CUSTOM"
+TICKER_DATABASE = {
+    "Apple (AAPL)": {"symbol": "AAPL", "entry": 225.00, "target": 255.00, "stop": 215.00, "regime": True, "confluence": True, "volume": True},
+    "Tesla (TSLA)": {"symbol": "TSLA", "entry": 210.00, "target": 245.00, "stop": 195.00, "regime": True, "confluence": False, "volume": True},
+    "Nvidia (NVDA)": {"symbol": "NVDA", "entry": 120.00, "target": 145.00, "stop": 110.00, "regime": True, "confluence": True, "volume": True},
+    "Google (GOOGL)": {"symbol": "GOOGL", "entry": 175.00, "target": 195.00, "stop": 165.00, "regime": True, "confluence": True, "volume": False},
+    "Gold Futures (GC=F)": {"symbol": "GC=F", "entry": 2500.00, "target": 2700.00, "stop": 2420.00, "regime": True, "confluence": True, "volume": True},
+    "Brent Crude Oil (BZ=F)": {"symbol": "BZ=F", "entry": 78.00, "target": 88.00, "stop": 73.00, "regime": False, "confluence": True, "volume": False},
+    "Bitcoin (BTC-USD)": {"symbol": "BTC-USD", "entry": 62000.00, "target": 72000.00, "stop": 58000.00, "regime": True, "confluence": True, "volume": True},
+    "Ethereum (ETH-USD)": {"symbol": "ETH-USD", "entry": 2600.00, "target": 3100.00, "stop": 2400.00, "regime": True, "confluence": False, "volume": True},
+    "Zcash (ZEC-USD)": {"symbol": "ZEC-USD", "entry": 32.00, "target": 45.00, "stop": 28.50, "regime": False, "confluence": True, "volume": True},
+    "Sui (SUI-USD)": {"symbol": "SUI-USD", "entry": 1.80, "target": 2.50, "stop": 1.55, "regime": True, "confluence": True, "volume": True},
+    "Hyperliquid (HYPE-USD)": {"symbol": "HYPE-USD", "entry": 12.50, "target": 18.00, "stop": 10.50, "regime": True, "confluence": True, "volume": True}
 }
 
 st.sidebar.header("🎯 Watchlist Selection")
-selected_preset = st.sidebar.selectbox("Select Asset", options=list(TICKER_PRESETS.keys()))
+selected_preset = st.sidebar.selectbox("Select Asset Ticker", options=list(TICKER_DATABASE.keys()))
 
-if TICKER_PRESETS[selected_preset] == "CUSTOM":
-    ticker_symbol = st.sidebar.text_input("Enter Symbol", value="AAPL").upper().strip()
-else:
-    ticker_symbol = TICKER_PRESETS[selected_preset]
+asset_data = TICKER_DATABASE[selected_preset]
+ticker_symbol = asset_data["symbol"]
 
-# Fetch Market Data
+# ---------------------------------------------------------
+# LIVE PRICE FEED FETCHING
+# ---------------------------------------------------------
 current_price = 0.0
 data_fetched = False
 
 if ticker_symbol:
     try:
         stock = yf.Ticker(ticker_symbol)
-        history = stock.history(period="1d")
+        history = stock.history(period="5d")
         if not history.empty:
             current_price = float(history['Close'].iloc[-1])
-            prev_close = float(history['Open'].iloc[0])
+            prev_close = float(history['Close'].iloc[-2]) if len(history) > 1 else float(history['Open'].iloc[-1])
             delta = current_price - prev_close
             pct_change = (delta / prev_close) * 100 if prev_close > 0 else 0
             
@@ -51,37 +50,37 @@ if ticker_symbol:
                 delta=f"{delta:+.2f} ({pct_change:+.2f}%)"
             )
             data_fetched = True
+        else:
+            st.sidebar.warning(f"Could not retrieve quote for '{ticker_symbol}'.")
     except Exception as e:
-        st.sidebar.error(f"Quote error: {e}")
-
-entry_default = float(current_price) if data_fetched and current_price > 0 else 100.0
+        st.sidebar.error(f"Data Fetch Error: {e}")
 
 # ---------------------------------------------------------
-# TRADE PARAMETERS
+# FIXED TRADE PARAMETERS (READ-ONLY)
 # ---------------------------------------------------------
-st.subheader(f"⚙️ Trade Parameters: {ticker_symbol}")
+st.subheader(f"⚙️ Fixed Trade Parameters: {ticker_symbol}")
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    entry_price = st.number_input("Entry Price ($)", value=entry_default, step=0.50, format="%.2f")
+    entry_price = st.number_input("Entry Price ($)", value=float(asset_data["entry"]), disabled=True, format="%.2f")
 with col2:
-    take_profit = st.number_input("Target Price ($)", value=float(entry_price * 1.15), step=0.50, format="%.2f")
+    take_profit = st.number_input("Target Price ($)", value=float(asset_data["target"]), disabled=True, format="%.2f")
 with col3:
-    stop_loss = st.number_input("Hard Stop-Loss ($)", value=float(entry_price * 0.95), step=0.50, format="%.2f")
+    stop_loss = st.number_input("Hard Stop-Loss ($)", value=float(asset_data["stop"]), disabled=True, format="%.2f")
 
 st.markdown("---")
 
 # ---------------------------------------------------------
-# TRADE SETUP CHECKLIST & RATING SCORE
+# TRADE SETUP CHECKLIST & RATING SCORING MATRIX
 # ---------------------------------------------------------
-st.subheader("⭐ Trade Setup Checklist & Rating Score")
+st.subheader("⭐ Trade Setup Checklist & System Rating")
 
 c1, c2 = st.columns(2)
 
 with c1:
-    check_regime = st.checkbox("Market Regime Alignment (+3 Pts)", value=True)
-    check_confluence = st.checkbox("Key Level Confluence Zone (+2 Pts)", value=True)
-    check_volume = st.checkbox("Volume / Liquidity Expansion (+1 Pt)", value=True)
+    check_regime = st.checkbox("Market Regime Alignment (+3 Pts)", value=asset_data["regime"], disabled=True)
+    check_confluence = st.checkbox("Key Level Confluence Zone (+2 Pts)", value=asset_data["confluence"], disabled=True)
+    check_volume = st.checkbox("Volume / Liquidity Expansion (+1 Pt)", value=asset_data["volume"], disabled=True)
 
 risk_per_unit = entry_price - stop_loss
 reward_per_unit = take_profit - entry_price
@@ -93,9 +92,9 @@ with c2:
     if check_rr:
         st.success(f"✅ R:R Ratio is **{rr_ratio:.2f}:1** (≥ 2.0 Met)")
     else:
-        st.error(f"❌ R:R Ratio is **{rr_ratio:.2f}:1** (< 2.0 Target)")
+        st.error(f"❌ R:R Ratio is **{rr_ratio:.2f}:1** (< 2.0 Benchmark)")
 
-    check_trigger = st.checkbox("Price Action Confirmation Trigger (+2 Pts)", value=True)
+    check_trigger = st.checkbox("Price Action Confirmation Trigger (+2 Pts)", value=True, disabled=True)
 
 # Total Score Calculation
 score = 0
@@ -111,13 +110,13 @@ st.markdown("---")
 sc1, sc2 = st.columns([1, 2])
 
 with sc1:
-    st.metric("Setup Matrix Score", f"{score} / 10 Pts")
+    st.metric("Setup Rating Score", f"{score} / 10 Pts")
 
 with sc2:
     if score >= 8:
-        st.success("🌟 **GRADE: A+ SETUP (Full Position Allocation)**\n\nHigh conviction trade meeting core parameters.")
+        st.success("🌟 **GRADE: A+ SETUP (Full Position Sizing)**\n\nHigh conviction trade meeting core parameters.")
     elif 6 <= score <= 7:
-        st.warning("⚠️ **GRADE: B SETUP (50% Half-Sizing Allocation)**\n\nAcceptable setup. Reduce risk capital.")
+        st.warning("⚠️ **GRADE: B SETUP (50% Sizing)**\n\nAcceptable setup. Reduce risk capital.")
     else:
         st.error("🚫 **GRADE: C SETUP (NO TRADE / PASS)**\n\nScore is below 6 points. Do not execute.")
 
