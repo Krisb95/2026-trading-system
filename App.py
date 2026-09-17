@@ -3,16 +3,16 @@ import yfinance as yf
 
 # Page Configuration
 st.set_page_config(
-    page_title="Trading Dashboard & Risk Calculator",
-    page_icon="📈",
+    page_title="2026 Bull Run Active Trading Dashboard",
+    page_icon="⚡",
     layout="wide"
 )
 
-st.title("📈 Mobile Trading Dashboard")
+st.title("⚡ Active System Scanner & Position Manager")
 st.markdown("---")
 
 # ---------------------------------------------------------
-# WATCHLIST PRESETS & TICKER SELECTION
+# WATCHLIST PRESETS & TICKER MAPPING
 # ---------------------------------------------------------
 WATCHLIST = {
     "Apple (AAPL)": "AAPL",
@@ -25,10 +25,8 @@ WATCHLIST = {
     "Hyperliquid Crypto (HYPE-USD)": "HYPE-USD",
 }
 
-st.sidebar.header("Ticker Selection")
-
-# Asset selection via Watchlist Dropdown or Manual Custom Input
-selected_preset = st.sidebar.selectbox("Choose from Watchlist", options=["Custom Input"] + list(WATCHLIST.keys()))
+st.sidebar.header("Asset Selection")
+selected_preset = st.sidebar.selectbox("Choose Watchlist Asset", options=["Custom Input"] + list(WATCHLIST.keys()))
 
 if selected_preset != "Custom Input":
     ticker_symbol = WATCHLIST[selected_preset]
@@ -58,105 +56,144 @@ if ticker_symbol:
         else:
             st.sidebar.error(f"No price data found for '{ticker_symbol}'.")
     except Exception as e:
-        st.sidebar.error(f"Error retrieving data: {e}")
+        st.sidebar.error(f"Error fetching ticker data: {e}")
 
 # ---------------------------------------------------------
-# MAIN PANEL - Trade & Risk Setup
+# TABBED NAVIGATION: SETUP CALCULATOR vs ACTIVE TRADE MANAGER
 # ---------------------------------------------------------
-col_left, col_right = st.columns(2)
+tab_setup, tab_active = st.tabs(["📊 Trade Setup & Risk Calculator", "📈 Active Trade & Trailing Stop Manager"])
 
-with col_left:
-    st.subheader("⚙️ Trade Parameters")
-    entry_price = st.number_input(
-        "Entry Price ($)", 
-        value=float(current_price) if data_fetched else 100.0, 
-        step=1.0,
-        format="%.2f"
-    )
-    take_profit_target = st.number_input(
-        "Take-Profit Target ($)", 
-        value=float(entry_price * 1.10), 
-        step=1.0,
-        format="%.2f"
-    )
-    stop_loss_price = st.number_input(
-        "Stop-Loss Price ($)", 
-        value=float(entry_price * 0.95), 
-        step=1.0,
-        format="%.2f"
-    )
+with tab_setup:
+    col_left, col_right = st.columns(2)
 
-with col_right:
-    st.subheader("💼 Account & Risk Limits")
-    account_balance = st.number_input(
-        "Total Portfolio Balance ($)", 
-        value=10000.0, 
-        step=500.0,
-        format="%.2f"
-    )
-    risk_percentage = st.slider(
-        "Max Risk Per Trade (%)", 
-        min_value=0.5, 
-        max_value=5.0, 
-        value=2.0, 
-        step=0.5
-    )
-
-st.markdown("---")
-
-# ---------------------------------------------------------
-# TARGET & ALERT STATUS
-# ---------------------------------------------------------
-st.subheader("🎯 Target & Alert Status")
-
-if data_fetched and current_price > 0:
-    if current_price >= take_profit_target:
-        st.success(
-            f"🚨 **TAKE-PROFIT TRIGGERED!** Current price (${current_price:.2f}) "
-            f"has reached or passed your target (${take_profit_target:.2f})."
+    with col_left:
+        st.subheader("⚙️ Trade Setup Parameters")
+        entry_price = st.number_input(
+            "Entry Price ($)", 
+            value=float(current_price) if data_fetched and current_price > 0 else 100.0, 
+            step=1.0,
+            format="%.2f"
         )
-    elif current_price <= stop_loss_price:
-        st.error(
-            f"⚠️ **STOP-LOSS TRIGGERED!** Current price (${current_price:.2f}) "
-            f"has dropped to or below your stop loss (${stop_loss_price:.2f})."
+        take_profit_target = st.number_input(
+            "Target Price ($)", 
+            value=float(entry_price * 1.10), 
+            step=1.0,
+            format="%.2f"
         )
+        stop_loss_price = st.number_input(
+            "Hard Stop-Loss ($)", 
+            value=float(entry_price * 0.95), 
+            step=1.0,
+            format="%.2f"
+        )
+
+    with col_right:
+        st.subheader("💼 Account Risk & Leverage Controls")
+        account_balance = st.number_input(
+            "Total Portfolio Balance ($)", 
+            value=10000.0, 
+            step=500.0,
+            format="%.2f"
+        )
+        risk_percentage = st.slider(
+            "Max Risk Per Trade (%)", 
+            min_value=0.5, 
+            max_value=3.0, 
+            value=1.0, 
+            step=0.5
+        )
+        leverage = st.slider(
+            "Isolated Margin Leverage (Max 5x Cap)", 
+            min_value=1.0, 
+            max_value=5.0, 
+            value=3.0, 
+            step=0.5
+        )
+
+    st.markdown("---")
+
+    # Target & Status
+    st.subheader("🎯 Target & Alert Status")
+    if data_fetched and current_price > 0:
+        if current_price >= take_profit_target:
+            st.success(f"🚨 **TAKE-PROFIT TRIGGERED!** Current price (${current_price:.2f}) reached or passed target (${take_profit_target:.2f}).")
+        elif current_price <= stop_loss_price:
+            st.error(f"⚠️ **STOP-LOSS TRIGGERED!** Current price (${current_price:.2f}) dropped below stop loss (${stop_loss_price:.2f}).")
+        else:
+            dist_tp = ((take_profit_target - current_price) / current_price) * 100
+            dist_sl = ((current_price - stop_loss_price) / current_price) * 100
+            st.info(f"📊 **In Range:** Live Price: **${current_price:.2f}** | TP Target: **+{dist_tp:.2f}%** away | Stop-Loss: **-{dist_sl:.2f}%** below")
+
+    # Sizing Math
+    st.subheader("🧮 Calculated Position Sizing (1% Risk Engine)")
+    risk_amount = account_balance * (risk_percentage / 100)
+    risk_per_unit = entry_price - stop_loss_price
+
+    if risk_per_unit > 0:
+        position_units = risk_amount / risk_per_unit
+        total_position_val = position_units * entry_price
+        margin_required = total_position_val / leverage
+        potential_profit = position_units * (take_profit_target - entry_price)
+        rr_ratio = (take_profit_target - entry_price) / risk_per_unit
+        
+        # Estimated Liquidation Price (Longs)
+        est_liq_price = entry_price * (1 - (1 / leverage))
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Position Units", f"{position_units:,.2f}")
+        m2.metric("Margin Required", f"${margin_required:,.2f}", help=f"Total Value: ${total_position_val:,.2f} @ {leverage}x Leverage")
+        m3.metric("Max Dollar Risk (1%)", f"${risk_amount:,.2f}")
+        m4.metric("Potential Gain", f"${potential_profit:,.2f}", delta=f"R:R {rr_ratio:.2f}")
+
+        if est_liq_price >= stop_loss_price:
+            st.error(f"🚨 **LEVERAGE RISK WARNING:** Estimated Liquidation Price (${est_liq_price:.2f}) is higher than or equal to your Stop Loss (${stop_loss_price:.2f}). Lower your leverage or widen your stop distance!")
+        else:
+            st.caption(f"Estimated Liquidation Price: **${est_liq_price:.2f}** (Safely below Hard Stop of **${stop_loss_price:.2f}**)")
     else:
-        dist_tp = ((take_profit_target - current_price) / current_price) * 100
-        dist_sl = ((current_price - stop_loss_price) / current_price) * 100
-        st.info(
-            f"📊 **In Range:** Current price is **${current_price:.2f}** | "
-            f"Take-Profit is **{dist_tp:.2f}%** away | Stop-Loss is **{dist_sl:.2f}%** below."
-        )
-else:
-    st.warning("Select or enter a valid ticker in the sidebar to run alerts.")
-
-st.markdown("---")
+        st.error("Stop-Loss price must be set below Entry Price to calculate position sizing.")
 
 # ---------------------------------------------------------
-# POSITION SIZING & CALCULATIONS
+# TAB 2: ACTIVE TRADE & TRAILING STOP MANAGER
 # ---------------------------------------------------------
-st.subheader("🧮 Calculated Position Sizing & P&L")
+with tab_active:
+    st.subheader("🔄 Trailing Stop & Profit Lock Manager")
+    st.markdown("Automates trailing stop loss updates using real-time market feeds.")
 
-risk_amount = account_balance * (risk_percentage / 100)
-risk_per_share = entry_price - stop_loss_price
+    # Checkbox to toggle between auto live price and manual scenario simulation
+    override_live = st.checkbox("Simulate Target Scenario (Manual Price Input)", value=False)
 
-if risk_per_share > 0:
-    position_shares = int(risk_amount / risk_per_share)
-    total_cost = position_shares * entry_price
-    potential_profit = position_shares * (take_profit_target - entry_price)
-    reward_risk_ratio = (take_profit_target - entry_price) / risk_per_share
-    
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric(label="Suggested Units/Shares", value=f"{position_shares:,} qty")
-    m2.metric(label="Capital Required", value=f"${total_cost:,.2f}")
-    m3.metric(label="Max Loss Risk", value=f"${risk_amount:,.2f}")
-    m4.metric(label="Potential Gain", value=f"${potential_profit:,.2f}", delta=f"R:R {reward_risk_ratio:.2f}")
+    c1, c2, c3 = st.columns(3)
+    active_entry = c1.number_input("Active Entry Price ($)", value=float(entry_price), step=1.0, format="%.2f")
 
-    if total_cost > account_balance:
-        st.warning(
-            f"⚠️ Capital required (${total_cost:,.2f}) exceeds total account balance "
-            f"(${account_balance:,.2f}). Consider adjusting leverage or lowering risk."
-        )
-else:
-    st.error("Stop-Loss price must be set below the Entry Price to calculate position size.")
-    
+    if override_live or current_price == 0.0:
+        active_live_price = c2.number_input("Simulated Market Price ($)", value=float(active_entry * 1.05), step=1.0, format="%.2f")
+    else:
+        # Automatically pulls live market price
+        active_live_price = c2.number_input("Current Live Market Price ($)", value=float(current_price), disabled=True, format="%.2f")
+
+    trail_pct = c3.slider("Trailing Stop Distance (%)", min_value=3.0, max_value=20.0, value=8.0, step=0.5)
+
+    if active_live_price > active_entry:
+        gain_pct = ((active_live_price - active_entry) / active_entry) * 100
+        unrealized_pnl = (active_live_price - active_entry) * (position_units if risk_per_unit > 0 else 0)
+        
+        # Trailing Stop Calculations
+        trailing_sl_price = active_live_price * (1 - (trail_pct / 100))
+        breakeven_price = active_entry
+
+        st.success(f"🔥 **Position is in Profit!** Live Gain: **+{gain_pct:.2f}%** | Unrealized P&L: **+${unrealized_pnl:,.2f}**")
+
+        st.markdown("---")
+        st.subheader("🛡️ Recommended Updated Stop-Loss Orders")
+
+        col_sl1, col_sl2 = st.columns(2)
+        
+        with col_sl1:
+            st.info(f"**1. Move Stop to Breakeven:**\n\n**New SL:** `${breakeven_price:,.2f}`\n\n*Action:* Guarantees a risk-free trade once price hits Target 1.")
+
+        with col_sl2:
+            st.success(f"**2. Active Trailing Stop ({trail_pct}% Offset):**\n\n**New SL:** `${trailing_sl_price:,.2f}`\n\n*Action:* Set exchange stop to `${trailing_sl_price:,.2f}` to lock in gains if the trend reverses.")
+
+    else:
+        st.warning("Position is currently at or below entry price. Keep your original Hard Stop-Loss active.")
+        
