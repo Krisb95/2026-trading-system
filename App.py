@@ -1,6 +1,7 @@
 import streamlit as st
 import yfinance as yf
 import requests
+from datetime import datetime
 
 # Page Configuration
 st.set_page_config(
@@ -111,6 +112,23 @@ if ticker_symbol:
             st.sidebar.error(f"No pricing data found for '{ticker_symbol}'.")
     except Exception as e:
         st.sidebar.error(f"Error fetching ticker data: {e}")
+
+st.sidebar.markdown("---")
+auto_refresh = st.sidebar.checkbox(
+    "🔄 Auto-refresh price",
+    value=False,
+    help="Reloads the page periodically so the live price and trailing stop "
+         "keep updating without you having to touch anything."
+)
+if auto_refresh:
+    refresh_choice = st.sidebar.selectbox(
+        "Refresh every", ["15 seconds", "30 seconds", "60 seconds"], index=1
+    )
+    _interval_seconds = {"15 seconds": 15, "30 seconds": 30, "60 seconds": 60}[refresh_choice]
+    st.markdown(
+        f'<meta http-equiv="refresh" content="{_interval_seconds}">',
+        unsafe_allow_html=True
+    )
 
 # ---------------------------------------------------------
 # 2. MAIN PANEL - Inputs & Parameters
@@ -256,6 +274,73 @@ if sizing_valid:
     reward_risk_ratio = (take_profit_target - entry_price) / risk_per_share
 
 # ---------------------------------------------------------
+# 3b. TRAILING STOP STATE (computed once, before the tabs, so it
+#     stays current no matter which tab is showing, and so a
+#     persistent summary can be shown in the sidebar too)
+# ---------------------------------------------------------
+trade_active = data_fetched and current_price > 0 and entry_price > 0 and current_price > entry_price
+active_stop = None
+locked_profit_per_share = 0.0
+locked_in = False
+locked_profit_total = 0.0
+shares_for_calc = position_shares if sizing_valid else 0
+
+if "stop_history" not in st.session_state:
+    st.session_state["stop_history"] = []
+if "trailing_pct_setting" not in st.session_state:
+    st.session_state["trailing_pct_setting"] = 5.0
+
+if entry_price > 0 and data_fetched and current_price > 0:
+    if not trade_active:
+        # Not yet in profit — keep the trailing level pinned to the manual stop.
+        st.session_state["trailing_stop_level"] = stop_loss_price
+        st.session_state["trailing_stop_ticker"] = ticker_symbol
+    else:
+        # Default trailing distance before the user has opened the Trailing
+        # Stop Manager tab this session.
+        trailing_pct = st.session_state.get("trailing_pct_setting", 5.0)
+
+        if (
+            "trailing_stop_level" not in st.session_state
+            or st.session_state.get("trailing_stop_ticker") != ticker_symbol
+        ):
+            st.session_state["trailing_stop_level"] = stop_loss_price
+            st.session_state["trailing_stop_ticker"] = ticker_symbol
+
+        proposed_stop = current_price * (1 - trailing_pct / 100)
+        previous_stop = st.session_state["trailing_stop_level"]
+        if proposed_stop > previous_stop:
+            st.session_state["trailing_stop_level"] = proposed_stop
+            # Log every time the stop actually ratchets up.
+            st.session_state["stop_history"].append({
+                "Time": datetime.now().strftime("%H:%M:%S"),
+                "Price": f"${current_price:.2f}",
+                "New Stop": f"${proposed_stop:.2f}",
+                "Locked Profit/Share": f"${max(proposed_stop - entry_price, 0):+.2f}",
+            })
+
+        active_stop = st.session_state["trailing_stop_level"]
+        locked_profit_per_share = active_stop - entry_price
+        locked_in = locked_profit_per_share > 0
+        locked_profit_total = locked_profit_per_share * shares_for_calc if locked_in else 0.0
+
+# Persistent sidebar summary — always visible, regardless of which tab is open.
+if entry_price > 0 and data_fetched and current_price > 0:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🔒 Trailing Stop Status")
+    if not trade_active:
+        st.sidebar.caption(
+            f"Not yet in profit (entry ${entry_price:.2f}). Trailing starts once "
+            f"price moves above entry."
+        )
+    else:
+        st.sidebar.metric("Recommended Stop", f"${active_stop:.2f}")
+        if locked_in:
+            st.sidebar.success(f"✅ Locked in: ${locked_profit_total:,.2f} ({shares_for_calc:,} shares)")
+        else:
+            st.sidebar.info("In profit, but stop hasn't cleared entry yet — no profit locked in.")
+
+# ---------------------------------------------------------
 # 4. TABS - Dashboard view / Trailing Stop Manager
 # ---------------------------------------------------------
 tab_dashboard, tab_trailing = st.tabs(["🎯 Dashboard", "🔒 Trailing Stop Manager"])
@@ -316,83 +401,64 @@ with tab_trailing:
     st.subheader("🔒 Trailing Stop Manager")
     st.caption(
         "Once your trade moves into profit, this tracks a trailing stop that only ever "
-        "moves up (never down) and shows how much profit is currently locked in."
+        "moves up (never down) and shows how much profit is currently locked in. "
+        "It re-evaluates on every rerun — turn on auto-refresh in the sidebar to have "
+        "it keep adjusting on its own as the price moves, without you touching anything."
     )
 
     if entry_price <= 0:
         st.warning("Set a valid entry price to use the trailing stop manager.")
     elif not data_fetched or current_price <= 0:
         st.info("Enter a valid ticker in the sidebar to activate trailing stop management.")
+    elif not trade_active:
+        st.warning(
+            f"Trade not yet active. Current price (${current_price:.2f}) is at or below "
+            f"your entry price (${entry_price:.2f}). Trailing stop management kicks in "
+            f"once the trade is in profit."
+        )
     else:
-        trade_active = current_price > entry_price
+        trailing_pct = st.slider(
+            "Trailing Stop Distance (%)",
+            min_value=0.5,
+            max_value=20.0,
+            step=0.5,
+            help="How far below the current price to trail your stop-loss.",
+            key="trailing_pct_setting"
+        )
 
-        if not trade_active:
-            st.warning(
-                f"Trade not yet active. Current price (${current_price:.2f}) is at or below "
-                f"your entry price (${entry_price:.2f}). Trailing stop management kicks in "
-                f"once the trade is in profit."
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Current Price", f"${current_price:.2f}")
+        t2.metric("Recommended Stop", f"${active_stop:.2f}")
+        t3.metric(
+            "Locked-In Profit/Share",
+            f"${locked_profit_per_share:+.2f}",
+            delta="Profit secured" if locked_in else "Not yet in profit"
+        )
+
+        if locked_in:
+            st.success(
+                f"✅ **Move your stop-loss to ${active_stop:.2f}.** If price reverses and "
+                f"hits this level, you lock in at least **${locked_profit_total:,.2f}** "
+                f"in profit across {shares_for_calc:,} shares."
             )
-            # Keep the stored trailing level in sync with the manual stop-loss
-            # until the trade actually goes active.
-            st.session_state["trailing_stop_level"] = stop_loss_price
-            st.session_state["trailing_stop_ticker"] = ticker_symbol
         else:
-            trailing_pct = st.slider(
-                "Trailing Stop Distance (%)",
-                min_value=0.5,
-                max_value=20.0,
-                value=5.0,
-                step=0.5,
-                help="How far below the current price to trail your stop-loss."
+            st.info(
+                f"Trailing stop is currently at **${active_stop:.2f}**, still below your "
+                f"entry price (${entry_price:.2f}) — no profit locked in yet, but risk is "
+                f"tightening as price rises toward breakeven."
             )
 
-            # Initialize (or reset on ticker change) the ratcheting stop level.
-            if (
-                "trailing_stop_level" not in st.session_state
-                or st.session_state.get("trailing_stop_ticker") != ticker_symbol
-            ):
-                st.session_state["trailing_stop_level"] = stop_loss_price
-                st.session_state["trailing_stop_ticker"] = ticker_symbol
+        st.caption(
+            "This tool only *recommends* where to move your stop — you still need to "
+            "update the actual stop-loss order with your broker."
+        )
 
-            proposed_stop = current_price * (1 - trailing_pct / 100)
-            # Ratchet mechanic: the stop only ever moves up, never down,
-            # even if price pulls back and trailing_pct implies a lower level.
-            if proposed_stop > st.session_state["trailing_stop_level"]:
-                st.session_state["trailing_stop_level"] = proposed_stop
+        history = [h for h in st.session_state["stop_history"]]
+        if history:
+            with st.expander(f"📜 Stop Adjustment History ({len(history)} moves)", expanded=False):
+                st.table(list(reversed(history)))
 
-            active_stop = st.session_state["trailing_stop_level"]
-            locked_profit_per_share = active_stop - entry_price
-            locked_in = locked_profit_per_share > 0
-            shares_for_calc = position_shares if sizing_valid else 0
-            locked_profit_total = locked_profit_per_share * shares_for_calc if locked_in else 0.0
-
-            t1, t2, t3 = st.columns(3)
-            t1.metric("Current Price", f"${current_price:.2f}")
-            t2.metric("Recommended Stop", f"${active_stop:.2f}")
-            t3.metric(
-                "Locked-In Profit/Share",
-                f"${locked_profit_per_share:+.2f}",
-                delta="Profit secured" if locked_in else "Not yet in profit"
-            )
-
-            if locked_in:
-                st.success(
-                    f"✅ **Move your stop-loss to ${active_stop:.2f}.** If price reverses and "
-                    f"hits this level, you lock in at least **${locked_profit_total:,.2f}** "
-                    f"in profit across {shares_for_calc:,} shares."
-                )
-            else:
-                st.info(
-                    f"Trailing stop is currently at **${active_stop:.2f}**, still below your "
-                    f"entry price (${entry_price:.2f}) — no profit locked in yet, but risk is "
-                    f"tightening as price rises toward breakeven."
-                )
-
-            st.caption(
-                "This tool only *recommends* where to move your stop — you still need to "
-                "update the actual stop-loss order with your broker."
-            )
-
-            if st.button("Reset Trailing Stop to Manual Stop-Loss"):
-                st.session_state["trailing_stop_level"] = stop_loss_price
-                st.rerun()
+        if st.button("Reset Trailing Stop to Manual Stop-Loss"):
+            st.session_state["trailing_stop_level"] = stop_loss_price
+            st.session_state["stop_history"] = []
+            st.rerun()
