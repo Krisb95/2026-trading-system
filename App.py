@@ -1,12 +1,13 @@
 import streamlit as st
 import yfinance as yf
 
+# Page Configuration
 st.set_page_config(page_title="Trade Setup & Rating Scanner", layout="wide")
 
 st.title("⚡ Active System Setup & Trade Rating")
 
 # ---------------------------------------------------------
-# WATCHLIST & PRESET TRADE PARAMETERS DATABASE
+# WATCHLIST DATABASE (READ-ONLY PRESETS)
 # ---------------------------------------------------------
 TICKER_DATABASE = {
     "Apple (AAPL)": {"symbol": "AAPL", "entry": 225.00, "target": 255.00, "stop": 215.00, "regime": True, "confluence": True, "volume": True},
@@ -22,18 +23,17 @@ TICKER_DATABASE = {
     "Hyperliquid (HYPE-USD)": {"symbol": "HYPE-USD", "entry": 12.50, "target": 18.00, "stop": 10.50, "regime": True, "confluence": True, "volume": True}
 }
 
+# ---------------------------------------------------------
+# SIDEBAR WATCHLIST SELECTOR
+# ---------------------------------------------------------
 st.sidebar.header("🎯 Watchlist Selection")
 selected_preset = st.sidebar.selectbox("Select Asset Ticker", options=list(TICKER_DATABASE.keys()))
 
 asset_data = TICKER_DATABASE[selected_preset]
 ticker_symbol = asset_data["symbol"]
 
-# ---------------------------------------------------------
-# LIVE PRICE FEED FETCHING
-# ---------------------------------------------------------
+# Fetch Live Market Price
 current_price = 0.0
-data_fetched = False
-
 if ticker_symbol:
     try:
         stock = yf.Ticker(ticker_symbol)
@@ -49,14 +49,13 @@ if ticker_symbol:
                 value=f"${current_price:,.2f}",
                 delta=f"{delta:+.2f} ({pct_change:+.2f}%)"
             )
-            data_fetched = True
         else:
-            st.sidebar.warning(f"Could not retrieve quote for '{ticker_symbol}'.")
+            st.sidebar.warning(f"No live feed for '{ticker_symbol}'.")
     except Exception as e:
-        st.sidebar.error(f"Data Fetch Error: {e}")
+        st.sidebar.error(f"Quote error: {e}")
 
 # ---------------------------------------------------------
-# FIXED TRADE PARAMETERS (READ-ONLY)
+# LOCKED TRADE PARAMETERS
 # ---------------------------------------------------------
 st.subheader(f"⚙️ Fixed Trade Parameters: {ticker_symbol}")
 
