@@ -49,7 +49,20 @@ def get_top_100_cryptos():
         return {}
 
 
-asset_type = st.sidebar.radio("Asset Type", ["Stock", "Crypto"], horizontal=True)
+OIL_TICKERS = {
+    "WTI Crude Oil (Futures)": "CL=F",
+    "Brent Crude Oil (Futures)": "BZ=F",
+    "US Oil Fund ETF (USO)": "USO",
+    "Brent Oil Fund ETF (BNO)": "BNO",
+    "2x Leveraged Crude Oil ETF (UCO)": "UCO",
+    "Inverse Crude Oil ETF (SCO)": "SCO",
+    "Energy Select Sector ETF (XLE)": "XLE",
+    "RBOB Gasoline (Futures)": "RB=F",
+    "Heating Oil (Futures)": "HO=F",
+    "Natural Gas (Futures)": "NG=F",
+}
+
+asset_type = st.sidebar.radio("Asset Type", ["Stock", "Crypto", "Oil & Energy"], horizontal=True)
 
 if asset_type == "Crypto":
     top_cryptos = get_top_100_cryptos()
@@ -79,6 +92,16 @@ if asset_type == "Crypto":
         ticker_symbol = st.sidebar.text_input(
             "Crypto Ticker", value="SOL-USD"
         ).upper().strip()
+elif asset_type == "Oil & Energy":
+    oil_options = list(OIL_TICKERS.keys()) + ["Custom (type below)"]
+    oil_choice = st.sidebar.selectbox("Select Oil/Energy Ticker", options=oil_options)
+    if oil_choice == "Custom (type below)":
+        ticker_symbol = st.sidebar.text_input(
+            "Custom Oil/Energy Ticker (e.g. CL=F)", value="CL=F"
+        ).upper().strip()
+    else:
+        ticker_symbol = OIL_TICKERS[oil_choice]
+        st.sidebar.caption(f"Ticker: `{ticker_symbol}`")
 else:
     ticker_symbol = st.sidebar.text_input("Stock Ticker", value="AAPL").upper().strip()
 
@@ -330,11 +353,15 @@ with tab_trailing:
             help="How many shares/coins you're actually holding in this trade."
         )
 
-    if st.button("↺ Load these from the Trade Parameters calculator above"):
+    def _load_active_trade_from_calculator():
         st.session_state["active_entry_price"] = entry_price if entry_price > 0 else 100.0
         st.session_state["active_original_stop"] = stop_loss_price if stop_loss_price > 0 else 95.0
         st.session_state["active_shares"] = position_shares if sizing_valid else 0
-        st.rerun()
+
+    st.button(
+        "↺ Load these from the Trade Parameters calculator above",
+        on_click=_load_active_trade_from_calculator
+    )
 
     st.markdown("---")
 
