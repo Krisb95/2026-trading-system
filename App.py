@@ -50,7 +50,14 @@ def get_top_100_cryptos():
         return {}
 
 
-OIL_TICKERS = {
+COMMODITY_TICKERS = {
+    "Gold (Futures)": "GC=F",
+    "Silver (Futures)": "SI=F",
+    "Platinum (Futures)": "PL=F",
+    "Palladium (Futures)": "PA=F",
+    "Copper (Futures)": "HG=F",
+    "Gold ETF (GLD)": "GLD",
+    "Silver ETF (SLV)": "SLV",
     "WTI Crude Oil (Futures)": "CL=F",
     "Brent Crude Oil (Futures)": "BZ=F",
     "US Oil Fund ETF (USO)": "USO",
@@ -63,7 +70,7 @@ OIL_TICKERS = {
     "Natural Gas (Futures)": "NG=F",
 }
 
-asset_type = st.sidebar.radio("Asset Type", ["Stock", "Crypto", "Oil & Energy"], horizontal=True)
+asset_type = st.sidebar.radio("Asset Type", ["Stock", "Crypto", "Commodities"], horizontal=True)
 
 if asset_type == "Crypto":
     top_cryptos = get_top_100_cryptos()
@@ -93,15 +100,15 @@ if asset_type == "Crypto":
         ticker_symbol = st.sidebar.text_input(
             "Crypto Ticker", value="SOL-USD"
         ).upper().strip()
-elif asset_type == "Oil & Energy":
-    oil_options = list(OIL_TICKERS.keys()) + ["Custom (type below)"]
-    oil_choice = st.sidebar.selectbox("Select Oil/Energy Ticker", options=oil_options)
-    if oil_choice == "Custom (type below)":
+elif asset_type == "Commodities":
+    commodity_options = list(COMMODITY_TICKERS.keys()) + ["Custom (type below)"]
+    commodity_choice = st.sidebar.selectbox("Select Commodity", options=commodity_options)
+    if commodity_choice == "Custom (type below)":
         ticker_symbol = st.sidebar.text_input(
-            "Custom Oil/Energy Ticker (e.g. CL=F)", value="CL=F"
+            "Custom Commodity Ticker (e.g. GC=F)", value="GC=F"
         ).upper().strip()
     else:
-        ticker_symbol = OIL_TICKERS[oil_choice]
+        ticker_symbol = COMMODITY_TICKERS[commodity_choice]
         st.sidebar.caption(f"Ticker: `{ticker_symbol}`")
 else:
     ticker_symbol = st.sidebar.text_input("Stock Ticker", value="AAPL").upper().strip()
@@ -133,9 +140,13 @@ if ticker_symbol:
             )
             data_fetched = True
         else:
-            st.sidebar.error(f"No pricing data found for '{ticker_symbol}'.")
+            st.sidebar.error(
+                f"No pricing data found for '{ticker_symbol}'. Yahoo Finance may not "
+                f"list this exact symbol, or it briefly returned no data — try again "
+                f"in a moment or double check the ticker."
+            )
     except Exception as e:
-        st.sidebar.error(f"Error fetching ticker data: {e}")
+        st.sidebar.error(f"Error fetching '{ticker_symbol}': {type(e).__name__}: {e}")
 
 
 @st.cache_data(ttl=900)
