@@ -1,6 +1,7 @@
 import streamlit as st
 import yfinance as yf
 import requests
+import plotly.graph_objects as go
 from datetime import datetime
 
 # Page Configuration
@@ -136,6 +137,42 @@ if ticker_symbol:
     except Exception as e:
         st.sidebar.error(f"Error fetching ticker data: {e}")
 
+
+@st.cache_data(ttl=900)
+def get_trend_history(ticker, period):
+    """Fetch historical daily closes for trend detection and charting."""
+    try:
+        data = yf.Ticker(ticker).history(period=period)
+        return data
+    except Exception:
+        return None
+
+
+def suggest_direction(hist_df):
+    """Very simple momentum read: short-term vs longer-term moving average.
+    Returns (direction, pct_change) or (None, None) if not enough data."""
+    if hist_df is None or hist_df.empty or len(hist_df) < 5:
+        return None, None
+    closes = hist_df['Close']
+    pct_change = (closes.iloc[-1] - closes.iloc[0]) / closes.iloc[0] * 100
+    short_window = min(5, len(closes))
+    long_window = min(20, len(closes))
+    sma_short = closes.tail(short_window).mean()
+    sma_long = closes.tail(long_window).mean()
+    direction = "Short" if sma_short < sma_long else "Long"
+    return direction, pct_change
+
+
+trend_history_3mo = get_trend_history(ticker_symbol, "3mo") if ticker_symbol and data_fetched else None
+suggested_direction, trend_pct_3mo = suggest_direction(trend_history_3mo)
+
+# Reset the suggested direction default whenever the ticker changes —
+# the user can still override it manually afterward.
+if st.session_state.get("direction_ticker_ref") != ticker_symbol:
+    st.session_state["trade_direction"] = suggested_direction or "Long"
+    st.session_state["direction_ticker_ref"] = ticker_symbol
+
+
 st.sidebar.markdown("---")
 auto_refresh = st.sidebar.checkbox(
     "🔄 Auto-refresh price",
@@ -158,11 +195,16 @@ if auto_refresh:
 # ---------------------------------------------------------
 
 
-def rate_trade_setup(entry, tp, sl):
+def rate_trade_setup(entry, tp, sl, direction="Long"):
     """Score a trade setup 0-10 using reward:risk and stop-distance sanity.
-    Returns None if the setup isn't valid (TP not above entry, or SL not below entry)."""
-    risk = entry - sl
-    reward = tp - entry
+    Returns None if the setup isn't valid for the given direction."""
+    if direction == "Long":
+        risk = entry - sl
+        reward = tp - entry
+    else:
+        risk = sl - entry
+        reward = entry - tp
+
     if entry <= 0 or risk <= 0 or reward <= 0:
         return None
 
@@ -213,6 +255,22 @@ col_left, col_right = st.columns(2)
 
 with col_left:
     st.subheader("⚙️ Trade Parameters")
+
+    if suggested_direction and trend_pct_3mo is not None:
+        trend_word = "Uptrend" if suggested_direction == "Long" else "Downtrend"
+        st.caption(
+            f"📊 3-month trend: {trend_pct_3mo:+.1f}% ({trend_word}) → "
+            f"Suggests **{suggested_direction.upper()}**. Override below if you disagree."
+        )
+
+    direction = st.radio(
+        "Direction",
+        ["Long", "Short"],
+        key="trade_direction",
+        horizontal=True,
+        help="Long = profit if price rises. Short = profit if price falls."
+    )
+
     entry_price = st.number_input(
         "Entry Price ($)",
         value=float(current_price) if data_fetched else 150.0,
@@ -223,11 +281,20 @@ with col_left:
 
     # --- session_state guards so manual edits to TP/SL aren't silently
     # --- overwritten by the auto-calculated default on the next rerun.
-    if "tp_initialized" not in st.session_state or st.session_state.get("tp_entry_ref") != entry_price:
-        st.session_state["take_profit_target"] = entry_price * 1.10
-        st.session_state["stop_loss_price"] = entry_price * 0.95
+    if (
+        "tp_initialized" not in st.session_state
+        or st.session_state.get("tp_entry_ref") != entry_price
+        or st.session_state.get("tp_direction_ref") != direction
+    ):
+        if direction == "Long":
+            st.session_state["take_profit_target"] = entry_price * 1.10
+            st.session_state["stop_loss_price"] = entry_price * 0.95
+        else:
+            st.session_state["take_profit_target"] = entry_price * 0.90
+            st.session_state["stop_loss_price"] = entry_price * 1.05
         st.session_state["tp_initialized"] = True
         st.session_state["tp_entry_ref"] = entry_price
+        st.session_state["tp_direction_ref"] = direction
 
     take_profit_target = st.number_input(
         "Take-Profit Target ($)",
@@ -243,11 +310,11 @@ with col_left:
     )
 
     st.markdown("##### 📋 Trade Setup Rating")
-    rating = rate_trade_setup(entry_price, take_profit_target, stop_loss_price)
+    rating = rate_trade_setup(entry_price, take_profit_target, stop_loss_price, direction)
     if rating is None:
         st.warning(
-            "⚠️ Take-Profit must be above Entry and Stop-Loss must be below Entry "
-            "to calculate a rating."
+            f"⚠️ For a **{direction}**, Take-Profit and Stop-Loss must be on the correct "
+            f"sides of Entry ({'TP above / SL below' if direction == 'Long' else 'TP below / SL above'})."
         )
     else:
         setup_score, reward_risk_setup, stop_pct_setup = rating
@@ -283,7 +350,7 @@ st.markdown("---")
 #    tabs below can use the results)
 # ---------------------------------------------------------
 risk_amount = account_balance * (risk_percentage / 100)
-risk_per_share = entry_price - stop_loss_price
+risk_per_share = (entry_price - stop_loss_price) if direction == "Long" else (stop_loss_price - entry_price)
 position_shares = 0
 total_cost = 0.0
 potential_profit = 0.0
@@ -293,8 +360,12 @@ sizing_valid = entry_price > 0 and risk_per_share > 0
 if sizing_valid:
     position_shares = int(risk_amount / risk_per_share)
     total_cost = position_shares * entry_price
-    potential_profit = position_shares * (take_profit_target - entry_price)
-    reward_risk_ratio = (take_profit_target - entry_price) / risk_per_share
+    if direction == "Long":
+        potential_profit = position_shares * (take_profit_target - entry_price)
+        reward_risk_ratio = (take_profit_target - entry_price) / risk_per_share
+    else:
+        potential_profit = position_shares * (entry_price - take_profit_target)
+        reward_risk_ratio = (entry_price - take_profit_target) / risk_per_share
 
 
 # ---------------------------------------------------------
@@ -306,9 +377,10 @@ with tab_trailing:
     st.subheader("🔒 Trailing Stop Manager")
     st.caption(
         "Once your trade moves into profit, this tracks a trailing stop that only ever "
-        "moves up (never down) and shows how much profit is currently locked in. "
-        "It re-evaluates on every rerun — turn on auto-refresh in the sidebar to have "
-        "it keep adjusting on its own as the price moves, without you touching anything."
+        "moves in your favor (up for Longs, down for Shorts — never back the other way) "
+        "and shows how much profit is currently locked in. It re-evaluates on every "
+        "rerun — turn on auto-refresh in the sidebar to have it keep adjusting on its "
+        "own as the price moves, without you touching anything."
     )
 
     st.markdown("#### 📌 Active Trade Details")
@@ -324,6 +396,16 @@ with tab_trailing:
         st.session_state["active_original_stop"] = stop_loss_price if stop_loss_price > 0 else 95.0
     if "active_shares" not in st.session_state:
         st.session_state["active_shares"] = position_shares if sizing_valid else 0
+    if "active_direction" not in st.session_state:
+        st.session_state["active_direction"] = direction
+
+    active_direction = st.radio(
+        "Trade Direction",
+        ["Long", "Short"],
+        key="active_direction",
+        horizontal=True,
+        help="Long = you profit as price rises. Short = you profit as price falls."
+    )
 
     ac1, ac2, ac3 = st.columns(3)
     with ac1:
@@ -357,6 +439,7 @@ with tab_trailing:
         st.session_state["active_entry_price"] = entry_price if entry_price > 0 else 100.0
         st.session_state["active_original_stop"] = stop_loss_price if stop_loss_price > 0 else 95.0
         st.session_state["active_shares"] = position_shares if sizing_valid else 0
+        st.session_state["active_direction"] = direction
 
     st.button(
         "↺ Load these from the Trade Parameters calculator above",
@@ -371,7 +454,13 @@ with tab_trailing:
 #     here (outside any tab) so it stays current everywhere, including
 #     the persistent sidebar summary below.
 # ---------------------------------------------------------
-trade_active = data_fetched and current_price > 0 and trade_entry_price > 0 and current_price > trade_entry_price
+trade_active = (
+    data_fetched and current_price > 0 and trade_entry_price > 0
+    and (
+        (active_direction == "Long" and current_price > trade_entry_price)
+        or (active_direction == "Short" and current_price < trade_entry_price)
+    )
+)
 active_stop = None
 locked_profit_per_share = 0.0
 locked_in = False
@@ -382,17 +471,19 @@ if "stop_history" not in st.session_state:
 if "trailing_pct_setting" not in st.session_state:
     st.session_state["trailing_pct_setting"] = 5.0
 
-# Reset the trailing baseline (and history) whenever the ticker or the
-# entered trade's entry price changes — i.e. a genuinely different trade.
+# Reset the trailing baseline (and history) whenever the ticker, direction, or
+# the entered trade's entry price changes — i.e. a genuinely different trade.
 needs_reset = (
     "trailing_stop_level" not in st.session_state
     or st.session_state.get("trailing_stop_ticker") != ticker_symbol
     or st.session_state.get("trailing_stop_entry_ref") != trade_entry_price
+    or st.session_state.get("trailing_stop_direction_ref") != active_direction
 )
 if needs_reset:
     st.session_state["trailing_stop_level"] = trade_original_stop
     st.session_state["trailing_stop_ticker"] = ticker_symbol
     st.session_state["trailing_stop_entry_ref"] = trade_entry_price
+    st.session_state["trailing_stop_direction_ref"] = active_direction
     st.session_state["stop_history"] = []
 
 if trade_entry_price > 0 and data_fetched and current_price > 0:
@@ -401,21 +492,34 @@ if trade_entry_price > 0 and data_fetched and current_price > 0:
         st.session_state["trailing_stop_level"] = trade_original_stop
     else:
         trailing_pct = st.session_state.get("trailing_pct_setting", 5.0)
-
-        proposed_stop = current_price * (1 - trailing_pct / 100)
         previous_stop = st.session_state["trailing_stop_level"]
-        if proposed_stop > previous_stop:
+
+        if active_direction == "Long":
+            proposed_stop = current_price * (1 - trailing_pct / 100)
+            ratchets = proposed_stop > previous_stop
+        else:
+            proposed_stop = current_price * (1 + trailing_pct / 100)
+            ratchets = proposed_stop < previous_stop
+
+        if ratchets:
             st.session_state["trailing_stop_level"] = proposed_stop
-            # Log every time the stop actually ratchets up.
+            locked_at_move = (
+                max(proposed_stop - trade_entry_price, 0) if active_direction == "Long"
+                else max(trade_entry_price - proposed_stop, 0)
+            )
+            # Log every time the stop actually ratchets in the favorable direction.
             st.session_state["stop_history"].append({
                 "Time": datetime.now().strftime("%H:%M:%S"),
                 "Price": f"${current_price:.2f}",
                 "New Stop": f"${proposed_stop:.2f}",
-                "Locked Profit/Share": f"${max(proposed_stop - trade_entry_price, 0):+.2f}",
+                "Locked Profit/Share": f"${locked_at_move:+.2f}",
             })
 
         active_stop = st.session_state["trailing_stop_level"]
-        locked_profit_per_share = active_stop - trade_entry_price
+        if active_direction == "Long":
+            locked_profit_per_share = active_stop - trade_entry_price
+        else:
+            locked_profit_per_share = trade_entry_price - active_stop
         locked_in = locked_profit_per_share > 0
         locked_profit_total = locked_profit_per_share * trade_shares if locked_in else 0.0
 
@@ -425,8 +529,8 @@ if trade_entry_price > 0 and data_fetched and current_price > 0:
     st.sidebar.subheader("🔒 Trailing Stop Status")
     if not trade_active:
         st.sidebar.caption(
-            f"Not yet in profit (entry ${trade_entry_price:.2f}). Trailing starts once "
-            f"price moves above your entry."
+            f"Not yet in profit (entry ${trade_entry_price:.2f}, {active_direction}). "
+            f"Trailing starts once price moves in your favor."
         )
     else:
         st.sidebar.metric("Recommended Stop", f"${active_stop:.2f}")
@@ -441,22 +545,29 @@ with tab_dashboard:
     if entry_price <= 0:
         st.warning("Entry price must be greater than $0.")
     elif data_fetched and current_price > 0:
-        if current_price >= take_profit_target:
+        if direction == "Long":
+            tp_hit = current_price >= take_profit_target
+            sl_hit = current_price <= stop_loss_price
+        else:
+            tp_hit = current_price <= take_profit_target
+            sl_hit = current_price >= stop_loss_price
+
+        if tp_hit:
             st.success(
                 f"🚨 **TAKE-PROFIT TRIGGERED!** Current price (${current_price:.2f}) "
-                f"has reached or passed your target (${take_profit_target:.2f})."
+                f"has reached or passed your {direction} target (${take_profit_target:.2f})."
             )
-        elif current_price <= stop_loss_price:
+        elif sl_hit:
             st.error(
                 f"⚠️ **STOP-LOSS TRIGGERED!** Current price (${current_price:.2f}) "
-                f"has dropped to or below your stop loss (${stop_loss_price:.2f})."
+                f"has hit your {direction} stop loss (${stop_loss_price:.2f})."
             )
         else:
-            dist_tp = ((take_profit_target - current_price) / current_price) * 100
-            dist_sl = ((current_price - stop_loss_price) / current_price) * 100
+            dist_tp = abs(take_profit_target - current_price) / current_price * 100
+            dist_sl = abs(current_price - stop_loss_price) / current_price * 100
             st.info(
-                f"📊 **In Range:** Current price is **${current_price:.2f}** | "
-                f"Take-Profit is **{dist_tp:.2f}%** away | Stop-Loss is **{dist_sl:.2f}%** below."
+                f"📊 **In Range ({direction}):** Current price is **${current_price:.2f}** | "
+                f"Take-Profit is **{dist_tp:.2f}%** away | Stop-Loss is **{dist_sl:.2f}%** away."
             )
     else:
         st.warning("Enter a valid ticker in the sidebar to run live status alerts.")
@@ -467,7 +578,10 @@ with tab_dashboard:
     if entry_price <= 0:
         st.error("Entry price must be greater than $0 to calculate position size.")
     elif risk_per_share <= 0:
-        st.error("Stop-Loss price must be set below the Entry Price to calculate position size.")
+        st.error(
+            f"For a {direction}, your Stop-Loss must be "
+            f"{'below' if direction == 'Long' else 'above'} the Entry Price to size the position."
+        )
     elif position_shares == 0:
         st.warning(
             f"⚠️ Your risk budget (${risk_amount:,.2f}) divided by the per-share risk "
@@ -487,6 +601,60 @@ with tab_dashboard:
                 f"(${account_balance:,.2f}). Consider adjusting leverage or lowering risk."
             )
 
+    st.markdown("---")
+    st.subheader("📈 Price Trend")
+    chart_period_choice = st.selectbox(
+        "Chart Timeframe",
+        ["1 Month", "3 Months", "6 Months", "1 Year"],
+        index=1,
+        key="chart_period_choice"
+    )
+    _period_map = {"1 Month": "1mo", "3 Months": "3mo", "6 Months": "6mo", "1 Year": "1y"}
+    chart_data = get_trend_history(ticker_symbol, _period_map[chart_period_choice]) if ticker_symbol else None
+
+    if chart_data is None or chart_data.empty:
+        st.info("No historical data available to chart for this ticker.")
+    else:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=chart_data.index, y=chart_data['Close'],
+            mode='lines', name='Close Price', line=dict(color='#1f77b4', width=2)
+        ))
+
+        if entry_price > 0:
+            fig.add_hline(
+                y=entry_price, line_dash="dash", line_color="gray",
+                annotation_text="Entry", annotation_position="top left"
+            )
+        if take_profit_target > 0:
+            fig.add_hline(
+                y=take_profit_target, line_dash="dash", line_color="green",
+                annotation_text="Take-Profit", annotation_position="top left"
+            )
+        if stop_loss_price > 0:
+            fig.add_hline(
+                y=stop_loss_price, line_dash="dash", line_color="red",
+                annotation_text="Stop-Loss", annotation_position="bottom left"
+            )
+        if trade_active and active_stop:
+            fig.add_hline(
+                y=active_stop, line_dash="dot", line_color="orange",
+                annotation_text="Trailing Stop", annotation_position="bottom left"
+            )
+
+        fig.update_layout(
+            height=400,
+            margin=dict(l=10, r=10, t=30, b=10),
+            xaxis_title=None,
+            yaxis_title="Price ($)",
+            showlegend=False,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            "Gray = Entry (calculator) · Green = Take-Profit · Red = Stop-Loss · "
+            "Orange dotted = current trailing stop (if a trade is active)."
+        )
+
 with tab_trailing:
     if trade_entry_price <= 0:
         st.warning("Set a valid entry price above to use the trailing stop manager.")
@@ -494,9 +662,9 @@ with tab_trailing:
         st.info("Enter a valid ticker in the sidebar to activate trailing stop management.")
     elif not trade_active:
         st.warning(
-            f"Trade not yet active. Current price (${current_price:.2f}) is at or below "
-            f"your entry price (${trade_entry_price:.2f}). Trailing stop management kicks in "
-            f"once the trade is in profit."
+            f"Trade not yet active. Current price (${current_price:.2f}) hasn't moved in "
+            f"your favor relative to your {active_direction} entry (${trade_entry_price:.2f}). "
+            f"Trailing stop management kicks in once the trade is in profit."
         )
     else:
         trailing_pct = st.slider(
@@ -504,7 +672,7 @@ with tab_trailing:
             min_value=0.5,
             max_value=20.0,
             step=0.5,
-            help="How far below the current price to trail your stop-loss.",
+            help="How far from the current price to trail your stop-loss.",
             key="trailing_pct_setting"
         )
 
@@ -525,9 +693,9 @@ with tab_trailing:
             )
         else:
             st.info(
-                f"Trailing stop is currently at **${active_stop:.2f}**, still below your "
-                f"entry price (${trade_entry_price:.2f}) — no profit locked in yet, but risk is "
-                f"tightening as price rises toward breakeven."
+                f"Trailing stop is currently at **${active_stop:.2f}**, still on the losing "
+                f"side of your entry price (${trade_entry_price:.2f}) — no profit locked in "
+                f"yet, but risk is tightening as price moves toward breakeven."
             )
 
         st.caption(
