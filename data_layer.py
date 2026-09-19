@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 import time
+import math
 
 try:
     from curl_cffi import requests as curl_requests
@@ -42,6 +43,16 @@ class PriceQuote:
     provider: str
     error: Optional[str] = None
     attempts: int = 1
+    interval: str = "1d"                # the bar interval actually returned
+    bar_interval_seconds: int = 86400   # duration of one bar, for freshness math
+    effective_age_seconds: Optional[float] = None  # age AFTER the bar should have closed
+
+
+# Bar intervals we try, in order of preference, mapped to their duration.
+INTERVAL_SECONDS = {
+    "1m": 60, "2m": 120, "5m": 300, "15m": 900, "30m": 1800,
+    "60m": 3600, "1h": 3600, "90m": 5400, "1d": 86400,
+}
 
 
 # Instruments/exchanges where the underlying feed is inherently delayed
@@ -67,31 +78,48 @@ def curl_cffi_is_available() -> bool:
     return _CURL_CFFI_AVAILABLE
 
 
+def effective_age(bar_time_utc: datetime, now_utc: datetime,
+                   bar_interval_seconds: int) -> float:
+    """Age of the data AFTER accounting for the bar's own duration.
+
+    A bar is timestamped at its OPEN, so a bar that is still forming is not
+    stale at all — a daily bar opened 6 hours ago is the current bar, not
+    6-hour-old data. Effective age is therefore measured from when the bar
+    SHOULD have closed (open + interval), floored at zero.
+    """
+    seconds_since_open = (now_utc - bar_time_utc).total_seconds()
+    age = seconds_since_open - bar_interval_seconds
+    return max(0.0, age)
+
+
 def classify_freshness(
     bar_time_utc: Optional[datetime],
     now_utc: datetime,
     asset_class: str,
     live_threshold_seconds: float,
     stale_threshold_seconds: float,
+    bar_interval_seconds: int = 0,
+    is_daily_fallback: bool = False,
 ) -> DataStatus:
-    """Pure function (easy to unit test): decide LIVE/DELAYED/STALE from age.
+    """Decide LIVE/DELAYED/STALE, accounting for the bar interval.
 
-    - If we have no bar_time_utc at all, caller should treat as UNAVAILABLE
-      (this function assumes you already have a bar time).
-    - live_threshold_seconds: below this age, and NOT a known-delayed asset
-      class, => LIVE.
-    - Between live and stale thresholds => DELAYED (still usable, just not
-      instantaneous — this is also the default for equities, since free
-      equity feeds are exchange-delayed by nature, not just "old").
-    - Beyond stale_threshold_seconds => STALE (block trade-readiness).
+    - bar_interval_seconds: duration of one bar. Pass 0 to compare against
+      the raw timestamp (legacy behavior).
+    - is_daily_fallback: True when we could only get daily candles (intraday
+      unavailable). Daily data is never reported as LIVE, because a daily
+      candle can't tell you what happened in the last few minutes.
+    - Equities are never LIVE either: free equity feeds are exchange-delayed
+      by nature, not merely "old".
     """
     if bar_time_utc is None:
         raise ValueError("classify_freshness requires a bar_time_utc")
 
-    age_seconds = (now_utc - bar_time_utc).total_seconds()
-    if age_seconds < 0:
-        # Clock skew guard — treat as freshest bucket rather than error out.
-        age_seconds = 0
+    age_seconds = effective_age(bar_time_utc, now_utc, bar_interval_seconds)
+
+    if is_daily_fallback:
+        # A daily bar that's already closed and more than a day behind is
+        # genuinely stale; otherwise it's usable but explicitly not live.
+        return DataStatus.STALE if age_seconds > 86400 else DataStatus.DELAYED
 
     if age_seconds > stale_threshold_seconds:
         return DataStatus.STALE
@@ -110,18 +138,42 @@ def to_local_display(dt_utc: Optional[datetime], tz) -> str:
     return local.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
-def _attempt_fetch(ticker: str, yf_module, use_browser_session: bool):
-    """One fetch attempt. Returns (history_df_or_None, error_str_or_None)."""
+def _ticker_obj(ticker: str, yf_module):
+    """Build a yfinance Ticker, using the browser-impersonating session when
+    curl_cffi is installed."""
+    session = get_browser_session()
+    if session is not None:
+        try:
+            return yf_module.Ticker(ticker, session=session)
+        except TypeError:
+            # Some yfinance versions/mocks don't accept a session kwarg.
+            return yf_module.Ticker(ticker)
+    return yf_module.Ticker(ticker)
+
+
+def _clean_history(df):
+    """Yahoo frequently returns trailing rows with NaN OHLC (a bar that has
+    been allocated but not yet filled). Those must be dropped, not treated
+    as a price — NaN fails every comparison, so a naive `price <= 0` check
+    lets it straight through and the UI renders '$nan'."""
+    if df is None or df.empty:
+        return df
+    if "Close" not in df.columns:
+        return df.iloc[0:0]
+    return df[df["Close"].notna()]
+
+
+def _attempt_fetch(ticker: str, yf_module, use_browser_session: bool = True,
+                    interval: str = "5m", period: str = "1d"):
+    """One fetch attempt at a given interval. Returns (df_or_None, error_or_None)."""
     try:
-        if use_browser_session:
-            session = get_browser_session()
-            if session is not None:
-                hist = yf_module.Ticker(ticker, session=session).history(period="2d")
-            else:
-                hist = yf_module.Ticker(ticker).history(period="2d")
-        else:
-            hist = yf_module.Ticker(ticker).history(period="2d")
-        return hist, None
+        t = _ticker_obj(ticker, yf_module) if use_browser_session else yf_module.Ticker(ticker)
+        try:
+            hist = t.history(period=period, interval=interval)
+        except TypeError:
+            # Mocks/older signatures that only accept `period`.
+            hist = t.history(period=period)
+        return _clean_history(hist), None
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
 
@@ -148,24 +200,39 @@ def fetch_quote(
                            bar_time_utc=None, status=DataStatus.UNAVAILABLE,
                            provider="yfinance", error="Empty ticker")
 
+    # Try intraday first so freshness is measured against a short bar. Fall
+    # back to daily candles only if intraday returns nothing (market closed,
+    # provider limits, or an instrument with no intraday history).
+    ladder = [("5m", "1d"), ("15m", "5d"), ("1d", "5d")]
+
     last_error = None
     hist = None
     attempts = 0
-    for attempt in range(1, max_retries + 2):  # e.g. max_retries=2 => 3 total attempts
-        attempts = attempt
-        hist, err = _attempt_fetch(ticker, yf_module, use_browser_session=True)
-        if err is None and hist is not None and not hist.empty:
-            last_error = None
-            break
-        last_error = err or "No rows returned"
-        if attempt <= max_retries:
-            time.sleep(retry_backoff_seconds * attempt)  # linear backoff
+    used_interval = "1d"
 
-    if last_error is not None or hist is None or hist.empty:
+    for interval, period in ladder:
+        for attempt in range(1, max_retries + 2):
+            attempts += 1
+            candidate, err = _attempt_fetch(ticker, yf_module, True, interval, period)
+            if err is None and candidate is not None and not candidate.empty:
+                hist = candidate
+                used_interval = interval
+                last_error = None
+                break
+            last_error = err or f"No rows returned at interval {interval}"
+            if attempt <= max_retries:
+                time.sleep(retry_backoff_seconds * attempt)  # linear backoff
+        if hist is not None:
+            break
+
+    if hist is None or hist.empty:
         provider_note = "yfinance (curl_cffi)" if curl_cffi_is_available() else "yfinance"
         return PriceQuote(ticker=ticker, price=None, fetched_at_utc=now_utc,
                            bar_time_utc=None, status=DataStatus.UNAVAILABLE,
                            provider=provider_note, error=last_error, attempts=attempts)
+
+    is_daily_fallback = used_interval == "1d"
+    bar_seconds = INTERVAL_SECONDS.get(used_interval, 86400)
 
     try:
         price = float(hist["Close"].iloc[-1])
@@ -180,16 +247,22 @@ def fetch_quote(
                            provider="yfinance", error=f"Malformed data: {type(e).__name__}: {e}",
                            attempts=attempts)
 
-    if price <= 0:
+    if not math.isfinite(price) or price <= 0:
         return PriceQuote(ticker=ticker, price=None, fetched_at_utc=now_utc,
                            bar_time_utc=bar_time, status=DataStatus.UNAVAILABLE,
-                           provider="yfinance", error=f"Non-positive price returned: {price}",
-                           attempts=attempts)
+                           provider="yfinance",
+                           error=f"Invalid price returned ({price}) — not a usable number.",
+                           attempts=attempts, interval=used_interval,
+                           bar_interval_seconds=bar_seconds)
 
     status = classify_freshness(bar_time, now_utc, asset_class,
-                                 live_threshold_seconds, stale_threshold_seconds)
+                                 live_threshold_seconds, stale_threshold_seconds,
+                                 bar_interval_seconds=bar_seconds,
+                                 is_daily_fallback=is_daily_fallback)
+    age = effective_age(bar_time, now_utc, bar_seconds)
 
     provider_note = "yfinance (curl_cffi)" if curl_cffi_is_available() else "yfinance"
     return PriceQuote(ticker=ticker, price=price, fetched_at_utc=now_utc,
                        bar_time_utc=bar_time, status=status, provider=provider_note,
-                       attempts=attempts)
+                       attempts=attempts, interval=used_interval,
+                       bar_interval_seconds=bar_seconds, effective_age_seconds=age)

@@ -4,7 +4,7 @@ from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
-from data_layer import fetch_quote, classify_freshness, DataStatus
+from data_layer import fetch_quote, classify_freshness, effective_age, DataStatus
 
 
 class FakeTicker:
@@ -12,7 +12,7 @@ class FakeTicker:
         self._hist_df = hist_df
         self._raise_exc = raise_exc
 
-    def history(self, period="2d"):
+    def history(self, period="2d", interval=None):
         if self._raise_exc:
             raise self._raise_exc
         return self._hist_df
@@ -23,7 +23,7 @@ class FakeYFModule:
     def __init__(self, ticker_obj):
         self._ticker_obj = ticker_obj
 
-    def Ticker(self, symbol):
+    def Ticker(self, symbol, session=None):
         return self._ticker_obj
 
 
@@ -58,6 +58,99 @@ class TestClassifyFreshness(unittest.TestCase):
         bar = now - timedelta(seconds=300)
         status = classify_freshness(bar, now, "crypto", live_threshold_seconds=60, stale_threshold_seconds=900)
         self.assertEqual(status, DataStatus.DELAYED)
+
+
+class TestIntervalAwareFreshness(unittest.TestCase):
+    """Regression tests for the bug where a DAILY bar was flagged STALE
+    purely because it is timestamped at its open (e.g. 00:00 UTC), making
+    it look hours old the moment it is created."""
+
+    def test_forming_daily_bar_is_not_stale(self):
+        now = datetime.now(timezone.utc)
+        bar = now - timedelta(hours=1)   # daily bar opened an hour ago
+        status = classify_freshness(bar, now, "crypto",
+                                     live_threshold_seconds=60,
+                                     stale_threshold_seconds=900,
+                                     bar_interval_seconds=86400,
+                                     is_daily_fallback=True)
+        self.assertEqual(status, DataStatus.DELAYED)  # usable, just not LIVE
+
+    def test_daily_bar_more_than_a_day_past_close_is_stale(self):
+        now = datetime.now(timezone.utc)
+        bar = now - timedelta(days=3)
+        status = classify_freshness(bar, now, "crypto",
+                                     live_threshold_seconds=60,
+                                     stale_threshold_seconds=900,
+                                     bar_interval_seconds=86400,
+                                     is_daily_fallback=True)
+        self.assertEqual(status, DataStatus.STALE)
+
+    def test_forming_5m_bar_is_live(self):
+        now = datetime.now(timezone.utc)
+        bar = now - timedelta(minutes=3)  # 5m bar still forming
+        status = classify_freshness(bar, now, "crypto",
+                                     live_threshold_seconds=60,
+                                     stale_threshold_seconds=900,
+                                     bar_interval_seconds=300)
+        self.assertEqual(status, DataStatus.LIVE)
+
+    def test_effective_age_floors_at_zero_for_forming_bar(self):
+        now = datetime.now(timezone.utc)
+        bar = now - timedelta(minutes=2)
+        self.assertEqual(effective_age(bar, now, 300), 0.0)
+
+    def test_effective_age_measures_from_bar_close(self):
+        now = datetime.now(timezone.utc)
+        bar = now - timedelta(minutes=20)  # 5m bar closed 15 min ago
+        self.assertAlmostEqual(effective_age(bar, now, 300), 900, delta=2)
+
+    def test_daily_fallback_never_reports_live(self):
+        now = datetime.now(timezone.utc)
+        bar = now - timedelta(seconds=5)
+        status = classify_freshness(bar, now, "crypto",
+                                     live_threshold_seconds=60,
+                                     stale_threshold_seconds=900,
+                                     bar_interval_seconds=86400,
+                                     is_daily_fallback=True)
+        self.assertNotEqual(status, DataStatus.LIVE)
+
+
+class TestNaNHandling(unittest.TestCase):
+    """Regression tests for the '$nan' bug: NaN fails every comparison, so
+    a naive `price <= 0` check let it through and the UI rendered '$nan'."""
+
+    def test_trailing_nan_row_is_dropped_and_real_price_used(self):
+        now = datetime.now(timezone.utc)
+        df = pd.DataFrame(
+            {"Close": [101.5, float("nan")], "Open": [101.0, float("nan")],
+             "High": [102.0, float("nan")], "Low": [100.0, float("nan")]},
+            index=pd.DatetimeIndex([now - timedelta(minutes=8), now - timedelta(minutes=3)]),
+        )
+        yf_mod = FakeYFModule(FakeTicker(hist_df=df))
+        quote = fetch_quote("AAPL", "stock", yf_mod, max_retries=0)
+        self.assertIsNotNone(quote.price)
+        self.assertAlmostEqual(quote.price, 101.5)
+        self.assertNotEqual(quote.status, DataStatus.UNAVAILABLE)
+
+    def test_all_nan_history_is_unavailable_not_nan_price(self):
+        now = datetime.now(timezone.utc)
+        df = pd.DataFrame(
+            {"Close": [float("nan")], "Open": [float("nan")],
+             "High": [float("nan")], "Low": [float("nan")]},
+            index=pd.DatetimeIndex([now]),
+        )
+        yf_mod = FakeYFModule(FakeTicker(hist_df=df))
+        quote = fetch_quote("AAPL", "stock", yf_mod, max_retries=0)
+        self.assertEqual(quote.status, DataStatus.UNAVAILABLE)
+        self.assertIsNone(quote.price)
+
+    def test_infinite_price_rejected(self):
+        now = datetime.now(timezone.utc)
+        df = make_hist(float("inf"), now)
+        yf_mod = FakeYFModule(FakeTicker(hist_df=df))
+        quote = fetch_quote("WEIRD", "crypto", yf_mod, max_retries=0)
+        self.assertEqual(quote.status, DataStatus.UNAVAILABLE)
+        self.assertIsNone(quote.price)
 
 
 class TestFetchQuote(unittest.TestCase):
@@ -106,7 +199,7 @@ class TestFetchQuote(unittest.TestCase):
         call_count = {"n": 0}
 
         class FlakyTicker:
-            def history(self, period="2d"):
+            def history(self, period="2d", interval=None):
                 call_count["n"] += 1
                 if call_count["n"] == 1:
                     raise ConnectionError("429 Too Many Requests")
@@ -122,7 +215,9 @@ class TestFetchQuote(unittest.TestCase):
         yf_mod = FakeYFModule(FakeTicker(raise_exc=ConnectionError("429 Too Many Requests")))
         quote = fetch_quote("STILLDOWN", "crypto", yf_mod, max_retries=2, retry_backoff_seconds=0.01)
         self.assertEqual(quote.status, DataStatus.UNAVAILABLE)
-        self.assertEqual(quote.attempts, 3)  # 1 initial + 2 retries
+        # 3 interval rungs (5m, 15m, 1d) x 3 attempts each (1 initial + 2 retries)
+        self.assertEqual(quote.attempts, 9)
+        self.assertIn("429", quote.error)
 
 
 if __name__ == "__main__":
