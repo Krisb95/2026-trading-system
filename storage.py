@@ -1,0 +1,194 @@
+"""
+SQLite persistence for the trade journal and open positions.
+
+WHY THIS EXISTS: previously the journal and positions lived in Streamlit
+session state, which is wiped whenever the app restarts, sleeps, or the
+browser tab is closed. That is unacceptable for a trade record.
+
+IMPORTANT CAVEAT ABOUT FREE HOSTING: on Hugging Face Spaces (free tier) the
+container filesystem is EPHEMERAL. This database survives page refreshes,
+reruns and app sleeps, but it is wiped when the Space is rebuilt (i.e. when
+you push new code or restart the container from settings). Treat the CSV
+export as your real backup — export after any session that matters. For
+durable storage you would need HF persistent storage (paid) or an external
+database. This module does not pretend otherwise.
+"""
+
+import sqlite3
+import os
+from contextlib import contextmanager
+from dataclasses import dataclass, asdict, field
+from datetime import datetime, timezone
+from typing import List, Optional, Dict, Any
+import io
+import pandas as pd
+
+DEFAULT_DB_PATH = os.environ.get("TRADING_DB_PATH", "trading_data.db")
+
+JOURNAL_COLUMNS = [
+    "id", "status", "asset", "direction", "leverage", "entry", "size_notional_usd",
+    "margin", "current_pl", "tp", "sl", "updated_tp", "updated_sl",
+    "potential_profit_at_tp", "potential_loss_at_sl", "realized_pnl",
+    "pl_status", "entry_reason", "score_breakdown", "exit_reason",
+    "timestamp_utc", "management_notes",
+]
+
+
+@contextmanager
+def _connect(db_path: str):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
+    """Create tables if they don't exist. Safe to call on every run."""
+    with _connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS journal (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status TEXT DEFAULT 'Open',
+                asset TEXT,
+                direction TEXT,
+                leverage REAL DEFAULT 1.0,
+                entry REAL DEFAULT 0.0,
+                size_notional_usd REAL DEFAULT 0.0,
+                margin REAL DEFAULT 0.0,
+                current_pl REAL DEFAULT 0.0,
+                tp REAL DEFAULT 0.0,
+                sl REAL DEFAULT 0.0,
+                updated_tp REAL,
+                updated_sl REAL,
+                potential_profit_at_tp REAL DEFAULT 0.0,
+                potential_loss_at_sl REAL DEFAULT 0.0,
+                realized_pnl REAL,
+                pl_status TEXT DEFAULT 'Open',
+                entry_reason TEXT DEFAULT '',
+                score_breakdown TEXT DEFAULT '',
+                exit_reason TEXT DEFAULT '',
+                timestamp_utc TEXT,
+                management_notes TEXT DEFAULT ''
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset TEXT,
+                asset_class TEXT,
+                direction TEXT,
+                entry REAL,
+                stop REAL,
+                quantity REAL,
+                contract_multiplier REAL DEFAULT 1.0,
+                opened_utc TEXT
+            )
+        """)
+
+
+# ---------------------------------------------------------------------
+# Journal
+# ---------------------------------------------------------------------
+
+def add_journal_entry(data: Dict[str, Any], db_path: str = DEFAULT_DB_PATH) -> int:
+    """Insert a journal row. Returns its database id."""
+    payload = dict(data)
+    payload.setdefault("timestamp_utc", datetime.now(timezone.utc).isoformat())
+    payload.setdefault("status", "Open")
+    payload.setdefault("pl_status", "Open")
+
+    fields = [k for k in payload if k in JOURNAL_COLUMNS and k != "id"]
+    placeholders = ", ".join("?" for _ in fields)
+    sql = f"INSERT INTO journal ({', '.join(fields)}) VALUES ({placeholders})"
+    with _connect(db_path) as conn:
+        cur = conn.execute(sql, [payload[f] for f in fields])
+        return cur.lastrowid
+
+
+def update_journal_entry(entry_id: int, db_path: str = DEFAULT_DB_PATH, **changes) -> None:
+    """Update named columns on one journal row."""
+    valid = {k: v for k, v in changes.items() if k in JOURNAL_COLUMNS and k != "id"}
+    if not valid:
+        raise ValueError(f"No valid journal columns in {list(changes)}")
+    assignments = ", ".join(f"{k} = ?" for k in valid)
+    with _connect(db_path) as conn:
+        cur = conn.execute(f"UPDATE journal SET {assignments} WHERE id = ?",
+                            list(valid.values()) + [entry_id])
+        if cur.rowcount == 0:
+            raise KeyError(f"No journal entry with id {entry_id}")
+
+
+def close_journal_entry(entry_id: int, realized_pnl: float, exit_reason: str,
+                         db_path: str = DEFAULT_DB_PATH) -> None:
+    pl_status = "Win" if realized_pnl > 0 else ("Loss" if realized_pnl < 0 else "Breakeven")
+    update_journal_entry(entry_id, db_path=db_path, status="Closed",
+                          realized_pnl=realized_pnl, exit_reason=exit_reason,
+                          pl_status=pl_status)
+
+
+def delete_journal_entry(entry_id: int, db_path: str = DEFAULT_DB_PATH) -> None:
+    with _connect(db_path) as conn:
+        conn.execute("DELETE FROM journal WHERE id = ?", (entry_id,))
+
+
+def get_journal_df(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
+    with _connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM journal ORDER BY id").fetchall()
+    if not rows:
+        return pd.DataFrame(columns=JOURNAL_COLUMNS)
+    return pd.DataFrame([dict(r) for r in rows])
+
+
+def journal_to_csv_bytes(db_path: str = DEFAULT_DB_PATH) -> bytes:
+    buf = io.StringIO()
+    get_journal_df(db_path).to_csv(buf, index=False)
+    return buf.getvalue().encode("utf-8")
+
+
+# ---------------------------------------------------------------------
+# Positions
+# ---------------------------------------------------------------------
+
+def add_position(asset: str, asset_class: str, direction: str, entry: float,
+                  stop: float, quantity: float, contract_multiplier: float = 1.0,
+                  db_path: str = DEFAULT_DB_PATH) -> int:
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            """INSERT INTO positions
+               (asset, asset_class, direction, entry, stop, quantity,
+                contract_multiplier, opened_utc)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (asset, asset_class, direction, entry, stop, quantity,
+             contract_multiplier, datetime.now(timezone.utc).isoformat()),
+        )
+        return cur.lastrowid
+
+
+def update_position_stop(position_id: int, new_stop: float,
+                          db_path: str = DEFAULT_DB_PATH) -> None:
+    with _connect(db_path) as conn:
+        cur = conn.execute("UPDATE positions SET stop = ? WHERE id = ?",
+                            (new_stop, position_id))
+        if cur.rowcount == 0:
+            raise KeyError(f"No position with id {position_id}")
+
+
+def delete_position(position_id: int, db_path: str = DEFAULT_DB_PATH) -> None:
+    with _connect(db_path) as conn:
+        conn.execute("DELETE FROM positions WHERE id = ?", (position_id,))
+
+
+def get_positions(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    with _connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM positions ORDER BY id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def clear_all(db_path: str = DEFAULT_DB_PATH) -> None:
+    """Wipe both tables. Used by the explicit reset control in the UI."""
+    with _connect(db_path) as conn:
+        conn.execute("DELETE FROM journal")
+        conn.execute("DELETE FROM positions")
