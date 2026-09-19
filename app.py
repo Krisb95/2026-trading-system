@@ -25,28 +25,41 @@ from backtest import (run_backtest, compute_metrics, split_in_out_sample,
 from portfolio import OpenPosition, summarize_portfolio_risk
 from stops import StopManager, suggest_management_label
 from scanner import fetch_multi_timeframe, analyze_candidate
+from universe import fetch_top_cryptos
 import storage
 
-APP_BUILD = "2026-09-19-hf1"
+APP_BUILD = "2026-09-19-b6 (top-100 crypto, R:R level fix, live entry price)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
-storage.init_db()
+DB_READY = True
+DB_ERROR = None
+try:
+    storage.init_db()
+except Exception as _db_exc:  # pragma: no cover - environment dependent
+    DB_READY = False
+    DB_ERROR = f"{type(_db_exc).__name__}: {_db_exc}"
 
 st.title("📈 Bull Run Strategy V2")
 st.caption(f"Build `{APP_BUILD}` · data persisted to SQLite")
+if not DB_READY:
+    st.error(
+        f"Database could not be initialised, so the Journal and Positions tabs will "
+        f"not save anything this session. Everything else still works.\n\n`{DB_ERROR}`"
+    )
 st.caption(
     "Discretionary trading support tool. Protect capital first — a no-trade decision "
     "is valid. Nothing here executes trades or connects to an exchange. Setup scores "
     "are a checklist quality measure, not a win probability or guarantee."
 )
 
-CRYPTO_TICKERS = {
-    "Bitcoin (BTC)": "BTC-USD", "Ethereum (ETH)": "ETH-USD", "Solana (SOL)": "SOL-USD",
-    "Sui (SUI)": "SUI-USD", "XRP": "XRP-USD", "Cardano (ADA)": "ADA-USD",
-    "Avalanche (AVAX)": "AVAX-USD", "Near (NEAR)": "NEAR-USD", "Dogecoin (DOGE)": "DOGE-USD",
-    "Chainlink (LINK)": "LINK-USD", "Polkadot (DOT)": "DOT-USD",
-}
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_crypto_universe():
+    return fetch_top_cryptos(limit=100)
+
+
+CRYPTO_TICKERS, CRYPTO_IS_LIVE, CRYPTO_NOTE = _load_crypto_universe()
+
 COMMODITY_TICKERS = {
     "Gold (Futures)": "GC=F", "Silver (Futures)": "SI=F", "Platinum (Futures)": "PL=F",
     "Copper (Futures)": "HG=F", "WTI Crude Oil (Futures)": "CL=F",
@@ -70,6 +83,9 @@ except Exception:
 
 st.sidebar.markdown("---")
 st.sidebar.caption(f"curl_cffi installed: **{curl_cffi_is_available()}**")
+st.sidebar.caption(f"Crypto list: {len(CRYPTO_TICKERS)} symbols")
+if not CRYPTO_IS_LIVE:
+    st.sidebar.warning(CRYPTO_NOTE)
 st.sidebar.warning(
     "On free hosting the database is wiped when the Space rebuilds. "
     "Export your journal to CSV after any session that matters."
@@ -194,16 +210,23 @@ with tab_scan:
             h1.metric("Instrument", analysis.ticker)
             h2.metric("1D regime", analysis.regime_1d.title())
             h3.metric("Direction", analysis.direction or "—")
-            h4.metric("Price", f"{analysis.current_price:,.4g}" if analysis.current_price else "—")
+            h4.metric("Price", f"{analysis.current_price:,.6g}" if analysis.current_price else "—")
+            if analysis.price_source:
+                st.caption(
+                    f"Entry price taken from the latest **{analysis.price_source}** close. "
+                    f"If this differs from the Market tab, one of them is a slightly older bar — "
+                    f"always confirm against your broker before entering."
+                )
 
             if analysis.stop is not None and analysis.target is not None:
                 l1, l2, l3 = st.columns(3)
-                l1.metric("Entry", f"{analysis.entry:,.4g}")
-                l2.metric("Structural stop", f"{analysis.stop:,.4g}")
-                l3.metric("Structural target", f"{analysis.target:,.4g}")
+                l1.metric("Entry", f"{analysis.entry:,.6g}")
+                l2.metric("Structural stop", f"{analysis.stop:,.6g}")
+                l3.metric("Structural target", f"{analysis.target:,.6g}")
                 if analysis.reward_risk is not None:
-                    st.caption(f"Derived reward:risk **{analysis.reward_risk:.2f}:1** — "
-                               f"levels from confirmed 4H swings, not invented.")
+                    ok = analysis.reward_risk >= min_rr
+                    (st.success if ok else st.warning)(
+                        f"Reward:risk **{analysis.reward_risk:.2f}:1** — {analysis.level_reason}")
                 if st.button("📋 Send these levels to the Risk tab"):
                     st.session_state.prefill = {
                         "entry": float(analysis.entry), "stop": float(analysis.stop),

@@ -40,7 +40,7 @@ changes appear to do nothing.
 Under the app title you should see:
 
 ```
-Build 2026-09-19-hf1 · data persisted to SQLite
+Build 2026-09-19-b6 ... · data persisted to SQLite
 ```
 
 If that line is missing, the deployed code is not the code you just uploaded.

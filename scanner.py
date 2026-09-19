@@ -54,6 +54,9 @@ class CandidateAnalysis:
     sequence_evidence: Dict[str, EvidenceItem] = field(default_factory=dict)
     key_levels: Dict[str, float] = field(default_factory=dict)
     data_problems: List[str] = field(default_factory=list)
+    level_reason: str = ""
+    price_source: Optional[str] = None
+    price_time = None
 
     def score_dict(self) -> Dict[str, Optional[bool]]:
         return {k: v.value for k, v in self.score_evidence.items()}
@@ -68,14 +71,23 @@ class CandidateAnalysis:
 
 def resample_to_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
     """Build 4H candles from 1H data. The provider has no native 4H interval,
-    so this is a genuine resample — noted in the scope warning above."""
+    so this is a genuine resample — noted in the scope warning above.
+
+    pandas changed its frequency alias casing in 2.2 ('4H' -> '4h'), and each
+    version rejects the other spelling, so both are attempted.
+    """
     if df_1h is None or df_1h.empty:
         return pd.DataFrame()
     agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
     if "Volume" in df_1h.columns:
         agg["Volume"] = "sum"
-    out = df_1h.resample("4h").agg(agg).dropna(subset=["Close"])
-    return out
+    last_error = None
+    for freq in ("4h", "4H"):
+        try:
+            return df_1h.resample(freq).agg(agg).dropna(subset=["Close"])
+        except ValueError as e:
+            last_error = e
+    raise ValueError(f"Could not resample to 4H with either alias: {last_error}")
 
 
 def fetch_multi_timeframe(ticker: str, yf_module, ticker_builder=None) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
@@ -92,7 +104,7 @@ def fetch_multi_timeframe(ticker: str, yf_module, ticker_builder=None) -> Tuple[
             return ticker_builder(sym)
         return yf_module.Ticker(sym)
 
-    specs = [("1d", "1y", "1d"), ("1h", "60d", "1h")]
+    specs = [("1d", "1y", "1d"), ("1h", "60d", "1h"), ("5m", "1d", "5m")]
     for label, period, interval in specs:
         try:
             t = _build(ticker)
@@ -269,6 +281,88 @@ def fib_confluence(df: pd.DataFrame, price: float, direction: str,
                     f"swing pair ({last_low.price:.4g} → {last_high.price:.4g})."), levels
 
 
+def atr_value(df: pd.DataFrame, period: int = 14) -> Optional[float]:
+    """Average True Range, or None if it can't be computed."""
+    if df is None or len(df) < period + 1:
+        return None
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low).abs(), (high - prev_close).abs(),
+                     (low - prev_close).abs()], axis=1).max(axis=1)
+    val = float(tr.rolling(period).mean().iloc[-1])
+    return val if np.isfinite(val) and val > 0 else None
+
+
+def derive_levels(df_4h: pd.DataFrame, entry: float, direction: str,
+                   min_rr: float = 2.0, stop_buffer_atr: float = 0.25
+                   ) -> Tuple[Optional[float], Optional[float], Optional[float], str]:
+    """Pick a structural stop and a target that actually clears min_rr.
+
+    The stop is the nearest confirmed swing beyond entry, pushed out by a
+    fraction of ATR so it sits *past* the level rather than exactly on it
+    (resting precisely on an obvious swing is where stop hunts live).
+
+    The target is NOT simply the nearest opposing swing — doing that forces
+    reward:risk to roughly 1:1 no matter what the chart looks like, which
+    makes the 2:1 requirement unreachable by construction. Instead the
+    candidate levels beyond entry are walked outward and the first one that
+    meets min_rr is chosen. If none qualifies, the furthest real level is
+    returned along with its true (sub-minimum) R:R, so the setup fails the
+    R:R test honestly rather than being handed a fabricated target.
+
+    Returns (stop, target, reward_risk, explanation).
+    """
+    if df_4h is None or df_4h.empty or entry <= 0 or direction not in ("Long", "Short"):
+        return None, None, None, "No usable 4H data or direction for level derivation."
+
+    swings = [s for s in find_swing_points(df_4h, left=2, right=2) if s.confirmed]
+    if not swings:
+        return None, None, None, "No confirmed 4H swing points available."
+
+    atr = atr_value(df_4h) or 0.0
+    buffer = atr * stop_buffer_atr
+
+    if direction == "Long":
+        lows = sorted([s.price for s in swings if s.price < entry], reverse=True)
+        highs = sorted([s.price for s in swings if s.price > entry])
+        if not lows:
+            return None, None, None, "No confirmed swing low below entry to anchor a stop."
+        stop = lows[0] - buffer
+        candidates = highs
+    else:
+        highs = sorted([s.price for s in swings if s.price > entry])
+        lows = sorted([s.price for s in swings if s.price < entry], reverse=True)
+        if not highs:
+            return None, None, None, "No confirmed swing high above entry to anchor a stop."
+        stop = highs[0] + buffer
+        candidates = lows
+
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None, None, None, "Degenerate stop distance (zero risk)."
+
+    if not candidates:
+        return stop, None, None, (
+            f"Stop at {stop:.6g} (nearest confirmed swing plus {stop_buffer_atr:g} ATR buffer), "
+            f"but no confirmed opposing swing beyond entry to use as a target."
+        )
+
+    for level in candidates:
+        rr = abs(level - entry) / risk
+        if rr >= min_rr:
+            return stop, level, rr, (
+                f"Stop {stop:.6g} (nearest swing ±{stop_buffer_atr:g} ATR). Target {level:.6g} is "
+                f"the first confirmed level clearing {min_rr:.1f}:1, giving {rr:.2f}:1."
+            )
+
+    furthest = candidates[-1]
+    rr = abs(furthest - entry) / risk
+    return stop, furthest, rr, (
+        f"Stop {stop:.6g}. No confirmed level reaches {min_rr:.1f}:1 — the furthest available "
+        f"({furthest:.6g}) gives only {rr:.2f}:1, so this setup fails the reward:risk test."
+    )
+
+
 def is_extended(df: pd.DataFrame, price: float, atr_mult: float = 2.5,
                  period: int = 14) -> Tuple[Optional[bool], str]:
     """Flag 'chasing an extended move': price stretched far from its 20-SMA in
@@ -327,9 +421,16 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
     df_1h = frames.get("1h", pd.DataFrame())
 
     price = None
-    for df in (df_1h, df_4h, df_1d):
+    price_source = None
+    price_time = None
+    for label, df in (("5m", frames.get("5m")), ("1h", df_1h), ("4h", df_4h), ("1d", df_1d)):
         if df is not None and not df.empty:
             price = float(df["Close"].iloc[-1])
+            price_source = label
+            try:
+                price_time = df.index[-1].to_pydatetime()
+            except Exception:
+                price_time = None
             break
 
     regime, regime_reason = detect_regime(df_1d)
@@ -350,6 +451,8 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
         ticker=ticker, direction=direction, regime_1d=regime, current_price=price,
         entry=None, stop=None, target=None, reward_risk=None, data_problems=problems,
     )
+    analysis.price_source = price_source
+    analysis.price_time = price_time
 
     if price is None:
         problems.append("No usable price on any timeframe — analysis cannot proceed.")
@@ -359,29 +462,13 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
 
     # --- derive levels from confirmed structure -----------------------
     entry = price
-    stop = None
-    target = None
-    if direction and not df_4h.empty:
-        swings = [s for s in find_swing_points(df_4h, left=2, right=2) if s.confirmed]
-        lows = [s.price for s in swings if s.kind == "low" and s.price < price]
-        highs = [s.price for s in swings if s.kind == "high" and s.price > price]
-        if direction == "Long" and lows:
-            stop = max(lows)                       # nearest confirmed swing low below
-            if highs:
-                target = min(highs)                # nearest confirmed swing high above
-        elif direction == "Short" and highs:
-            stop = min(highs)
-            if lows:
-                target = max(lows)
-
-    rr = None
-    if stop is not None and target is not None and direction:
-        risk = abs(entry - stop)
-        reward = abs(target - entry)
-        if risk > 0:
-            rr = reward / risk
+    stop = target = rr = None
+    level_reason = "No direction — levels not derived."
+    if direction:
+        stop, target, rr, level_reason = derive_levels(df_4h, entry, direction, min_rr=min_rr)
 
     analysis.entry, analysis.stop, analysis.target, analysis.reward_risk = entry, stop, target, rr
+    analysis.level_reason = level_reason
     if stop is not None:
         analysis.key_levels["structural_stop"] = stop
     if target is not None:
@@ -452,8 +539,7 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
     else:
         ev["rr_at_least_2"] = EvidenceItem(
             rr >= min_rr,
-            f"Reward:risk is {rr:.2f}:1 against a {min_rr:.1f}:1 minimum "
-            f"(entry {entry:.4g}, stop {stop:.4g}, target {target:.4g})."
+            f"Reward:risk {rr:.2f}:1 vs {min_rr:.1f}:1 minimum. {level_reason}"
         )
 
     if direction:
