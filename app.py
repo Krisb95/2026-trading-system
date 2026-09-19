@@ -131,11 +131,21 @@ with tab_market:
     m3.metric("Data Status", f"{status_colors[quote.status]} {quote.status.value}")
     m4.metric("Provider", quote.provider)
 
+    age_txt = (f"{quote.effective_age_seconds:,.0f}s past bar close"
+               if quote.effective_age_seconds is not None else "—")
     st.caption(
+        f"Bar interval: **{quote.interval}**  |  "
         f"Bar timestamp: {to_local_display(quote.bar_time_utc, local_tz)}  |  "
         f"Fetched at: {to_local_display(quote.fetched_at_utc, local_tz)}  |  "
-        f"Attempts: {quote.attempts}"
+        f"Effective age: {age_txt}  |  Attempts: {quote.attempts}"
     )
+    if quote.interval == "1d":
+        st.info(
+            "Only daily candles were available for this instrument right now "
+            "(intraday returned nothing — common when a market is closed). "
+            "Daily data is never reported as LIVE, since it can't tell you what "
+            "happened in the last few minutes."
+        )
     if quote.error:
         st.error(f"Fetch issue: {quote.error}")
 
