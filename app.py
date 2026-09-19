@@ -25,12 +25,15 @@ from technical import find_swing_points, label_structure, fib_levels
 from backtest import (run_backtest, compute_metrics, split_in_out_sample,
                        example_sma_crossover_signals)
 from portfolio import OpenPosition, summarize_portfolio_risk
+from scanner import fetch_multi_timeframe, analyze_candidate
 from journal import TradeJournal, JournalEntry
 from stops import StopManager, StopManagementError, ManagementLabel, suggest_management_label
 
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
+
+APP_BUILD = "2026-09-19-b4 (intraday freshness + NaN guard + auto-scanner)"
 
 # ---------------------------------------------------------------------
 # Session state setup
@@ -43,6 +46,7 @@ if "stop_managers" not in st.session_state:
     st.session_state.stop_managers = {}  # keyed by a label the user picks
 
 st.title("📈 Bull Run Strategy V2")
+st.caption(f"Build: `{APP_BUILD}`")
 st.caption(
     "Discretionary trading support tool. Protect capital first — a no-trade "
     "decision is valid. Nothing here executes trades or connects to an "
@@ -158,29 +162,117 @@ with tab_market:
 # TAB: Candidate Scanner (score + readiness + entry sequence checklist)
 # ---------------------------------------------------------------------
 with tab_candidate:
-    st.subheader("Setup score & readiness")
+    st.subheader("Candidate scanner")
     st.caption(
+        "Analyses real 1D / 4H / 1H structure and fills the checklist for you. "
         "Score measures checklist confluence only — not a win probability. "
         "Readiness is judged separately: a high score never auto-promotes a setup to READY."
     )
 
-    st.markdown("##### Entry sequence checklist")
-    seq_evidence = {}
-    seq_cols = st.columns(2)
-    for i, (key, description) in enumerate(ENTRY_SEQUENCE_STAGES):
-        with seq_cols[i % 2]:
-            seq_evidence[key] = st.checkbox(description, key=f"seq_{key}")
+    scan_mode = st.radio(
+        "Evidence source",
+        ["Auto-scan from market data", "Manual checklist"],
+        horizontal=True, key="scan_mode",
+        help="Auto-scan derives every item from actual candles. You can still override anything.",
+    )
 
-    st.markdown("##### Confluence scoring evidence")
-    score_evidence = {}
-    sc1, sc2 = st.columns(2)
-    with sc1:
-        for key, points, label in POSITIVE_COMPONENTS:
-            score_evidence[key] = st.checkbox(f"{label} (+{points})", key=f"score_{key}")
-    with sc2:
-        for key, points, label in NEGATIVE_COMPONENTS:
-            score_evidence[key] = st.checkbox(f"{label} ({points})", key=f"score_{key}")
+    if scan_mode == "Auto-scan from market data":
+        sc1, sc2, sc3 = st.columns([2, 1, 1])
+        with sc1:
+            scan_type = st.radio("Asset type", ["Crypto", "Stock", "Commodity"],
+                                  horizontal=True, key="scan_asset_type")
+            if scan_type == "Crypto":
+                scan_choice = st.selectbox("Symbol", list(CRYPTO_TICKERS.keys()), key="scan_crypto")
+                scan_ticker = CRYPTO_TICKERS[scan_choice]
+            elif scan_type == "Commodity":
+                scan_choice = st.selectbox("Symbol", list(COMMODITY_TICKERS.keys()), key="scan_comm")
+                scan_ticker = COMMODITY_TICKERS[scan_choice]
+            else:
+                scan_ticker = st.text_input("Stock ticker", value="AAPL", key="scan_stock").upper().strip()
+        with sc2:
+            dir_choice = st.selectbox("Direction", ["Auto", "Long", "Short"], key="scan_dir")
+        with sc3:
+            min_rr = st.number_input("Min R:R", min_value=1.0, value=2.0, step=0.5, key="scan_minrr")
 
+        if st.button("🔍 Scan this instrument", use_container_width=True):
+            with st.spinner(f"Analysing {scan_ticker} across 1D / 4H / 1H..."):
+                frames, problems = fetch_multi_timeframe(scan_ticker, yf)
+                analysis = analyze_candidate(
+                    scan_ticker, frames,
+                    direction_override=None if dir_choice == "Auto" else dir_choice,
+                    min_rr=min_rr, data_problems=problems,
+                )
+                st.session_state.analysis = analysis
+
+        analysis = st.session_state.get("analysis")
+        if analysis is None:
+            st.info("Pick an instrument and hit Scan to auto-derive the checklist.")
+            score_evidence, seq_evidence = {}, {}
+        else:
+            for p in analysis.data_problems:
+                st.warning(f"Data gap: {p}")
+
+            hc1, hc2, hc3, hc4 = st.columns(4)
+            hc1.metric("Instrument", analysis.ticker)
+            hc2.metric("1D regime", analysis.regime_1d.title())
+            hc3.metric("Direction", analysis.direction or "—")
+            hc4.metric("Price", f"{analysis.current_price:,.4g}" if analysis.current_price else "—")
+
+            if analysis.stop is not None and analysis.target is not None:
+                lc1, lc2, lc3 = st.columns(3)
+                lc1.metric("Entry (current)", f"{analysis.entry:,.4g}")
+                lc2.metric("Structural stop", f"{analysis.stop:,.4g}")
+                lc3.metric("Structural target", f"{analysis.target:,.4g}")
+                if analysis.reward_risk is not None:
+                    st.caption(f"Derived reward:risk = **{analysis.reward_risk:.2f}:1** "
+                               f"(levels taken from confirmed 4H swings, not invented)")
+            else:
+                st.warning("Could not derive a full entry/stop/target from confirmed structure.")
+
+            st.markdown("##### Auto-derived evidence (override any of it)")
+            score_evidence, seq_evidence = {}, {}
+            for key, points, label in POSITIVE_COMPONENTS + NEGATIVE_COMPONENTS:
+                item = analysis.score_evidence.get(key)
+                auto_val = item.value if item else None
+                icon = {True: "✅", False: "❌", None: "❔"}[auto_val]
+                default = bool(auto_val)
+                score_evidence[key] = st.checkbox(
+                    f"{icon} {label} ({points:+d})", value=default, key=f"auto_score_{key}",
+                    help=item.reason if item else "Not evaluated.",
+                )
+                if item:
+                    st.caption(f"　↳ {item.reason}")
+
+            with st.expander("Entry sequence detail"):
+                for key, description in ENTRY_SEQUENCE_STAGES:
+                    item = analysis.sequence_evidence.get(key)
+                    auto_val = item.value if item else None
+                    icon = {True: "✅", False: "❌", None: "❔"}[auto_val]
+                    seq_evidence[key] = st.checkbox(
+                        f"{icon} {description}", value=bool(auto_val), key=f"auto_seq_{key}",
+                        help=item.reason if item else "Not evaluated.",
+                    )
+                    if item:
+                        st.caption(f"　↳ {item.reason}")
+    else:
+        st.markdown("##### Entry sequence checklist")
+        seq_evidence = {}
+        seq_cols = st.columns(2)
+        for i, (key, description) in enumerate(ENTRY_SEQUENCE_STAGES):
+            with seq_cols[i % 2]:
+                seq_evidence[key] = st.checkbox(description, key=f"seq_{key}")
+
+        st.markdown("##### Confluence scoring evidence")
+        score_evidence = {}
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            for key, points, label in POSITIVE_COMPONENTS:
+                score_evidence[key] = st.checkbox(f"{label} (+{points})", key=f"score_{key}")
+        with mc2:
+            for key, points, label in NEGATIVE_COMPONENTS:
+                score_evidence[key] = st.checkbox(f"{label} ({points})", key=f"score_{key}")
+
+    # --- score + readiness (shared by both modes) ---------------------
     result = score_setup(score_evidence)
     st.markdown("---")
     rc1, rc2 = st.columns([1, 2])
@@ -190,10 +282,12 @@ with tab_candidate:
     if result.label != "A+":
         missing = weakest_components(result)
         if missing:
-            st.caption("What's weakest: " + "; ".join(f"{li.label} (+{li.points_possible} unclaimed)" for li in missing))
+            st.caption("What's weakest: " + "; ".join(
+                f"{li.label} (+{li.points_possible} unclaimed)" for li in missing))
 
     st.markdown("##### Readiness")
-    data_ok = st.session_state.last_quote is not None and st.session_state.last_quote.status in (DataStatus.LIVE, DataStatus.DELAYED)
+    data_ok = st.session_state.get("last_quote") is not None and \
+        st.session_state.last_quote.status in (DataStatus.LIVE, DataStatus.DELAYED)
     risk_checks_pass = st.checkbox("Risk checks pass (position sized, within risk budget)", key="risk_checks_pass")
     invalidation_hit = st.checkbox("Structural invalidation has occurred", key="invalidation_hit")
     user_marked_active = st.checkbox("I have manually entered this trade", key="user_marked_active")
@@ -210,6 +304,12 @@ with tab_candidate:
     readiness = determine_readiness(readiness_inputs)
     st.metric("Readiness", f"{display_label(readiness)} ({readiness.value})")
     st.caption(READINESS_DESCRIPTIONS[readiness])
+
+    if not data_ok:
+        st.caption(
+            "Note: readiness shows DATA ERROR because no usable quote has been fetched yet. "
+            "Fetch the instrument on the Market & Data Health tab first."
+        )
 
     if readiness in (Readiness.CONDITIONAL, Readiness.NOT_READY):
         missing_stages = missing_entry_sequence_stages(seq_evidence)
