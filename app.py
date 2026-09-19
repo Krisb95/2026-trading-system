@@ -28,7 +28,7 @@ from scanner import fetch_multi_timeframe, analyze_candidate
 from universe import fetch_top_cryptos
 import storage
 
-APP_BUILD = "2026-09-19-b6 (top-100 crypto, R:R level fix, live entry price)"
+APP_BUILD = "2026-09-19-b7 (fixes frozen evidence checkboxes + score breakdown)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -198,6 +198,11 @@ with tab_scan:
                     scan_ticker, frames,
                     direction_override=None if dir_choice == "Auto" else dir_choice,
                     min_rr=min_rr, data_problems=problems)
+                # Bump the scan id so the evidence checkboxes below get FRESH
+                # widget keys. Streamlit ignores `value=` for a key that already
+                # exists in session state, so reusing keys would freeze the
+                # checkboxes (and therefore the score) at the first scan's result.
+                st.session_state.scan_id = st.session_state.get("scan_id", 0) + 1
 
         analysis = st.session_state.get("analysis")
         if analysis is None:
@@ -238,13 +243,23 @@ with tab_scan:
             else:
                 st.warning("Could not derive a full entry/stop/target from confirmed structure.")
 
-            st.markdown("##### Auto-derived evidence")
+            sid = st.session_state.get("scan_id", 0)
+            auto_result = score_setup(analysis.score_dict())
+            st.markdown(
+                f"##### Auto-derived evidence · scanner says "
+                f"**{auto_result.normalized_score:.1f}/10 ({auto_result.label})**"
+            )
+            st.caption(
+                "Ticking or unticking below overrides the scanner; the score at the "
+                "bottom reflects your edits, this one does not."
+            )
             for key, points, label in POSITIVE_COMPONENTS + NEGATIVE_COMPONENTS:
                 item = analysis.score_evidence.get(key)
                 val = item.value if item else None
                 icon = {True: "✅", False: "❌", None: "❔"}[val]
                 score_evidence[key] = st.checkbox(
-                    f"{icon} {label} ({points:+d})", value=bool(val), key=f"as_{key}")
+                    f"{icon} {label} ({points:+d})", value=bool(val),
+                    key=f"as_{sid}_{key}")
                 if item:
                     st.caption(f"　↳ {item.reason}")
 
@@ -254,7 +269,7 @@ with tab_scan:
                     val = item.value if item else None
                     icon = {True: "✅", False: "❌", None: "❔"}[val]
                     seq_evidence[key] = st.checkbox(
-                        f"{icon} {desc}", value=bool(val), key=f"aq_{key}")
+                        f"{icon} {desc}", value=bool(val), key=f"aq_{sid}_{key}")
                     if item:
                         st.caption(f"　↳ {item.reason}")
     else:
@@ -284,6 +299,26 @@ with tab_scan:
         if missing:
             st.caption("Weakest: " + "; ".join(
                 f"{li.label} (+{li.points_possible} unclaimed)" for li in missing))
+
+    with st.expander("📊 Score breakdown — where every point went"):
+        earned = sum(li.points_awarded for li in result.breakdown if li.points_awarded > 0)
+        available = sum(li.points_possible for li in result.breakdown if li.points_possible > 0)
+        st.caption(f"Earned **{earned}** of **{available}** positive points.")
+        rows = []
+        for li in result.breakdown:
+            rows.append({
+                "Component": li.label,
+                "Worth": f"{li.points_possible:+d}",
+                "Earned": f"{li.points_awarded:+d}",
+                "Evidence": {True: "yes", False: "no", None: "could not evaluate"}[li.evidence],
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "The two-point items (regime alignment, liquidity sweep + reclaim) are the "
+            "difference between a C and an A+. If they never fire, 4–5/10 is the "
+            "structural ceiling — that is the scoring working as designed, not a fault, "
+            "but it is worth reading their reasons above to see whether you agree."
+        )
 
     st.markdown("##### Readiness")
     q = st.session_state.get("quote")
