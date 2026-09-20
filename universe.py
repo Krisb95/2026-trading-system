@@ -62,16 +62,35 @@ FALLBACK_CRYPTO: Dict[str, str] = {
     "Ethereum Classic (ETC)": "ETC-USD",
 }
 
+# CoinGecko ids for the fallback list, so the CoinGecko data source still works
+# when the live universe fetch failed.
+FALLBACK_CG_IDS: Dict[str, str] = {
+    "Bitcoin (BTC)": "bitcoin", "Ethereum (ETH)": "ethereum", "BNB (BNB)": "binancecoin",
+    "Solana (SOL)": "solana", "XRP (XRP)": "ripple", "Cardano (ADA)": "cardano",
+    "Dogecoin (DOGE)": "dogecoin", "Tron (TRX)": "tron",
+    "Avalanche (AVAX)": "avalanche-2", "Chainlink (LINK)": "chainlink",
+    "Polkadot (DOT)": "polkadot", "Sui (SUI)": "sui", "Litecoin (LTC)": "litecoin",
+    "Bitcoin Cash (BCH)": "bitcoin-cash", "Near (NEAR)": "near",
+    "Aptos (APT)": "aptos", "Uniswap (UNI)": "uniswap", "Stellar (XLM)": "stellar",
+    "Hedera (HBAR)": "hedera-hashgraph", "Cosmos (ATOM)": "cosmos",
+    "Filecoin (FIL)": "filecoin", "Arbitrum (ARB)": "arbitrum",
+    "Optimism (OP)": "optimism", "Injective (INJ)": "injective-protocol",
+    "Sei (SEI)": "sei-network", "Render (RENDER)": "render-token",
+    "Immutable (IMX)": "immutable-x", "Algorand (ALGO)": "algorand",
+    "VeChain (VET)": "vechain", "Ethereum Classic (ETC)": "ethereum-classic",
+}
+
 
 def fetch_top_cryptos(limit: int = 100, timeout: int = 10
-                       ) -> Tuple[Dict[str, str], bool, str]:
+                       ) -> Tuple[Dict[str, str], Dict[str, str], bool, str]:
     """Fetch the top `limit` coins by market cap.
 
-    Returns (mapping, is_live, note):
-      mapping  -> {"Bitcoin (BTC)": "BTC-USD", ...}
-      is_live  -> True if the data came from the API, False if it is the
-                  static fallback
-      note     -> human-readable explanation, always populated
+    Returns (mapping, coingecko_ids, is_live, note):
+      mapping        -> {"Bitcoin (BTC)": "BTC-USD", ...} Yahoo tickers
+      coingecko_ids  -> {"Bitcoin (BTC)": "bitcoin", ...} used as a data
+                        fallback for coins Yahoo does not list (e.g. HYPE)
+      is_live        -> True if from the API, False if the static fallback
+      note           -> human-readable explanation, always populated
     """
     try:
         response = requests.get(
@@ -91,25 +110,30 @@ def fetch_top_cryptos(limit: int = 100, timeout: int = 10
             raise ValueError("Empty or malformed response")
 
         mapping: Dict[str, str] = {}
+        cg_ids: Dict[str, str] = {}
         skipped = 0
         for coin in coins:
             symbol = str(coin.get("symbol", "")).upper().strip()
             name = str(coin.get("name", "")).strip()
+            coin_id = str(coin.get("id", "")).strip()
             if not symbol or not name:
                 continue
             if symbol in EXCLUDED_SYMBOLS:
                 skipped += 1
                 continue
-            mapping[f"{name} ({symbol})"] = f"{symbol}-USD"
+            label = f"{name} ({symbol})"
+            mapping[label] = f"{symbol}-USD"
+            if coin_id:
+                cg_ids[label] = coin_id
 
         if not mapping:
             raise ValueError("No usable symbols after filtering")
 
         note = (f"Live top {len(mapping)} by market cap from CoinGecko"
                 + (f" ({skipped} stablecoins/wrapped assets excluded)." if skipped else "."))
-        return mapping, True, note
+        return mapping, cg_ids, True, note
 
     except Exception as e:
         note = (f"Could not reach CoinGecko ({type(e).__name__}) — showing a static list of "
                 f"{len(FALLBACK_CRYPTO)} majors instead. This is NOT a live top-100.")
-        return dict(FALLBACK_CRYPTO), False, note
+        return dict(FALLBACK_CRYPTO), dict(FALLBACK_CG_IDS), False, note

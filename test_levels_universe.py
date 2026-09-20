@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 from scanner import derive_levels, atr_value
-from universe import fetch_top_cryptos, FALLBACK_CRYPTO, EXCLUDED_SYMBOLS
+from universe import fetch_top_cryptos, FALLBACK_CRYPTO, FALLBACK_CG_IDS, EXCLUDED_SYMBOLS
 
 
 def ohlc(closes, spread=0.5, freq="4h"):
@@ -105,13 +105,41 @@ class TestCryptoUniverse(unittest.TestCase):
 
         universe.requests.get = boom
         try:
-            mapping, is_live, note = fetch_top_cryptos()
+            mapping, cg_ids, is_live, note = fetch_top_cryptos()
         finally:
             universe.requests.get = original
 
         self.assertFalse(is_live)
         self.assertIn("NOT a live top-100", note)
         self.assertEqual(mapping, FALLBACK_CRYPTO)
+
+    def test_live_response_returns_coingecko_ids_for_fallback(self):
+        import universe
+        original = universe.requests.get
+
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self):
+                return [{"symbol": "hype", "name": "Hyperliquid", "id": "hyperliquid"}]
+
+        universe.requests.get = lambda *a, **k: FakeResp()
+        try:
+            mapping, cg_ids, is_live, note = fetch_top_cryptos()
+        finally:
+            universe.requests.get = original
+        self.assertEqual(mapping["Hyperliquid (HYPE)"], "HYPE-USD")
+        self.assertEqual(cg_ids["Hyperliquid (HYPE)"], "hyperliquid")
+
+    def test_fallback_includes_coingecko_ids(self):
+        import universe
+        original = universe.requests.get
+        universe.requests.get = lambda *a, **k: (_ for _ in ()).throw(ConnectionError("x"))
+        try:
+            mapping, cg_ids, is_live, note = fetch_top_cryptos()
+        finally:
+            universe.requests.get = original
+        self.assertEqual(cg_ids, FALLBACK_CG_IDS)
+        self.assertEqual(cg_ids["Bitcoin (BTC)"], "bitcoin")
 
     def test_live_response_is_mapped_to_yahoo_tickers(self):
         import universe
@@ -123,14 +151,14 @@ class TestCryptoUniverse(unittest.TestCase):
 
             def json(self):
                 return [
-                    {"symbol": "btc", "name": "Bitcoin"},
-                    {"symbol": "eth", "name": "Ethereum"},
-                    {"symbol": "usdt", "name": "Tether"},   # excluded stablecoin
+                    {"symbol": "btc", "name": "Bitcoin", "id": "bitcoin"},
+                    {"symbol": "eth", "name": "Ethereum", "id": "ethereum"},
+                    {"symbol": "usdt", "name": "Tether", "id": "tether"},  # excluded
                 ]
 
         universe.requests.get = lambda *a, **k: FakeResp()
         try:
-            mapping, is_live, note = fetch_top_cryptos()
+            mapping, cg_ids, is_live, note = fetch_top_cryptos()
         finally:
             universe.requests.get = original
 
@@ -160,7 +188,7 @@ class TestCryptoUniverse(unittest.TestCase):
 
         universe.requests.get = lambda *a, **k: FakeResp()
         try:
-            mapping, is_live, note = fetch_top_cryptos()
+            mapping, cg_ids, is_live, note = fetch_top_cryptos()
         finally:
             universe.requests.get = original
 

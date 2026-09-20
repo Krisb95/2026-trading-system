@@ -26,9 +26,10 @@ from portfolio import OpenPosition, summarize_portfolio_risk
 from stops import StopManager, suggest_management_label
 from scanner import fetch_multi_timeframe, analyze_candidate
 from universe import fetch_top_cryptos
+import coingecko
 import storage
 
-APP_BUILD = "2026-09-19-b7 (fixes frozen evidence checkboxes + score breakdown)"
+APP_BUILD = "2026-09-20-b9 (CoinGecko primary for crypto)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -58,7 +59,7 @@ def _load_crypto_universe():
     return fetch_top_cryptos(limit=100)
 
 
-CRYPTO_TICKERS, CRYPTO_IS_LIVE, CRYPTO_NOTE = _load_crypto_universe()
+CRYPTO_TICKERS, CRYPTO_CG_IDS, CRYPTO_IS_LIVE, CRYPTO_NOTE = _load_crypto_universe()
 
 COMMODITY_TICKERS = {
     "Gold (Futures)": "GC=F", "Silver (Futures)": "SI=F", "Platinum (Futures)": "PL=F",
@@ -80,6 +81,22 @@ try:
 except Exception:
     st.sidebar.error(f"'{tz_name}' is not a valid IANA timezone — using UTC.")
     local_tz = timezone.utc
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Data source")
+crypto_source = st.sidebar.radio(
+    "Crypto prices from",
+    ["CoinGecko (recommended)", "Yahoo Finance"],
+    key="crypto_source",
+    help=("CoinGecko covers every top-100 coin including ones Yahoo lacks (HYPE), and "
+          "gives native 4H candles. Yahoo gives true daily OHLC but misses newer coins. "
+          "Whichever you pick, the other is used automatically if it returns nothing."),
+)
+CRYPTO_PREFERS_CG = crypto_source.startswith("CoinGecko")
+st.sidebar.caption(
+    "Stocks and commodities always use Yahoo Finance — CoinGecko has no equities "
+    "or futures data."
+)
 
 st.sidebar.markdown("---")
 st.sidebar.caption(f"curl_cffi installed: **{curl_cffi_is_available()}**")
@@ -106,13 +123,17 @@ with tab_market:
         asset_type = st.radio("Asset type", ["Crypto", "Stock", "Commodity"],
                                horizontal=True, key="mkt_type")
         if asset_type == "Crypto":
-            ticker = CRYPTO_TICKERS[st.selectbox("Symbol", list(CRYPTO_TICKERS), key="mkt_c")]
+            _label = st.selectbox("Symbol", list(CRYPTO_TICKERS), key="mkt_c")
+            ticker = CRYPTO_TICKERS[_label]
+            cg_id = CRYPTO_CG_IDS.get(_label)
             asset_class = "crypto"
         elif asset_type == "Commodity":
             ticker = COMMODITY_TICKERS[st.selectbox("Symbol", list(COMMODITY_TICKERS), key="mkt_o")]
+            cg_id = None
             asset_class = "commodity"
         else:
             ticker = st.text_input("Stock ticker", value="AAPL", key="mkt_s").upper().strip()
+            cg_id = None
             asset_class = "stock"
     with c2:
         st.write("")
@@ -121,10 +142,54 @@ with tab_market:
 
     if do_fetch or st.session_state.get("quote_ticker") != ticker:
         with st.spinner(f"Fetching {ticker}…"):
-            st.session_state.quote = fetch_quote(
-                ticker, asset_class, yf,
-                live_threshold_seconds=live_threshold,
-                stale_threshold_seconds=stale_threshold, max_retries=2)
+            from data_layer import PriceQuote
+            now = datetime.now(timezone.utc)
+            q = None
+            st.session_state.fallback_note = None
+
+            def _cg_quote():
+                """Build a PriceQuote from CoinGecko spot, or None."""
+                price, updated, err = coingecko.fetch_spot_price(cg_id)
+                if price is None:
+                    return None, err
+                status = DataStatus.LIVE
+                age = None
+                if updated is not None:
+                    age = (now - updated).total_seconds()
+                    status = (DataStatus.LIVE if age <= live_threshold
+                              else DataStatus.DELAYED if age <= stale_threshold
+                              else DataStatus.STALE)
+                return PriceQuote(ticker=ticker, price=price, fetched_at_utc=now,
+                                   bar_time_utc=updated, status=status,
+                                   provider="CoinGecko (spot)", interval="spot",
+                                   bar_interval_seconds=0,
+                                   effective_age_seconds=age), None
+
+            use_cg_first = (asset_class == "crypto" and CRYPTO_PREFERS_CG and cg_id)
+
+            if use_cg_first:
+                q, cg_err = _cg_quote()
+                if q is None:
+                    q = fetch_quote(ticker, asset_class, yf,
+                                     live_threshold_seconds=live_threshold,
+                                     stale_threshold_seconds=stale_threshold, max_retries=2)
+                    st.session_state.fallback_note = (
+                        f"CoinGecko failed ({cg_err}) — fell back to Yahoo Finance.")
+            else:
+                q = fetch_quote(ticker, asset_class, yf,
+                                 live_threshold_seconds=live_threshold,
+                                 stale_threshold_seconds=stale_threshold, max_retries=2)
+                if q.status == DataStatus.UNAVAILABLE and cg_id:
+                    cg_q, cg_err = _cg_quote()
+                    if cg_q is not None:
+                        q = cg_q
+                        st.session_state.fallback_note = (
+                            f"Yahoo Finance has no data for {ticker} — used CoinGecko instead.")
+                    else:
+                        st.session_state.fallback_note = (
+                            f"Yahoo has no data for {ticker} and CoinGecko also failed: {cg_err}")
+
+            st.session_state.quote = q
             st.session_state.quote_ticker = ticker
 
     quote = st.session_state.get("quote")
@@ -147,6 +212,8 @@ with tab_market:
             f"Effective age: {age} · Attempts: {quote.attempts}"
         )
 
+        if st.session_state.get("fallback_note"):
+            st.info(st.session_state.fallback_note)
         if quote.error:
             st.error(f"Fetch issue: {quote.error}")
         if quote.interval == "1d":
@@ -181,11 +248,15 @@ with tab_scan:
             stype = st.radio("Asset type", ["Crypto", "Stock", "Commodity"],
                               horizontal=True, key="scan_type")
             if stype == "Crypto":
-                scan_ticker = CRYPTO_TICKERS[st.selectbox("Symbol", list(CRYPTO_TICKERS), key="scan_c")]
+                _slabel = st.selectbox("Symbol", list(CRYPTO_TICKERS), key="scan_c")
+                scan_ticker = CRYPTO_TICKERS[_slabel]
+                scan_cg_id = CRYPTO_CG_IDS.get(_slabel)
             elif stype == "Commodity":
                 scan_ticker = COMMODITY_TICKERS[st.selectbox("Symbol", list(COMMODITY_TICKERS), key="scan_o")]
+                scan_cg_id = None
             else:
                 scan_ticker = st.text_input("Stock ticker", value="AAPL", key="scan_s").upper().strip()
+                scan_cg_id = None
         with s2:
             dir_choice = st.selectbox("Direction", ["Auto", "Long", "Short"], key="scan_dir")
         with s3:
@@ -193,7 +264,24 @@ with tab_scan:
 
         if st.button("🔍 Scan", use_container_width=True):
             with st.spinner(f"Analysing {scan_ticker} across 1D / 4H / 1H…"):
-                frames, problems = fetch_multi_timeframe(scan_ticker, yf)
+                use_cg_first = (stype == "Crypto" and CRYPTO_PREFERS_CG and scan_cg_id)
+                frames, problems = {}, []
+
+                if use_cg_first:
+                    frames, problems = coingecko.build_frames_v2(scan_cg_id)
+                    problems = [f"Candles from CoinGecko (4H is native, not resampled)."] + problems
+                    if all(f is None or f.empty for f in frames.values()):
+                        frames, problems = fetch_multi_timeframe(scan_ticker, yf)
+                        problems = ["CoinGecko returned nothing — fell back to Yahoo Finance."] + problems
+                else:
+                    frames, problems = fetch_multi_timeframe(scan_ticker, yf)
+                    if all(f is None or f.empty for f in frames.values()) and scan_cg_id:
+                        cg_frames, cg_problems = coingecko.build_frames_v2(scan_cg_id)
+                        if any(f is not None and not f.empty for f in cg_frames.values()):
+                            frames = cg_frames
+                            problems = ([f"Yahoo Finance has no data for {scan_ticker}; "
+                                          f"using CoinGecko candles instead."] + cg_problems)
+
                 st.session_state.analysis = analyze_candidate(
                     scan_ticker, frames,
                     direction_override=None if dir_choice == "Auto" else dir_choice,
