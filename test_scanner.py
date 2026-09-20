@@ -220,3 +220,51 @@ class TestAnalyzeCandidate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRegimeFallbackWhenDailyMissing(unittest.TestCase):
+    """A rate-limited daily request previously cascaded into: regime unknown
+    -> no direction -> every check unevaluated -> 0.0/10. The 4H frame should
+    carry the regime read instead, clearly labelled as weaker."""
+
+    def _trending_4h(self):
+        # A zigzag, not a straight line: linspace has no swing points at all,
+        # so every structural check would be unevaluable for reasons that have
+        # nothing to do with the regime fallback being tested here.
+        return ohlc_from_closes(zigzag(n_legs=14, rising=True),
+                                 start="2026-06-01", freq="4h")
+
+    def test_missing_daily_falls_back_to_4h_regime(self):
+        frames = {"1d": pd.DataFrame(), "4h": self._trending_4h(),
+                   "1h": self._trending_4h()}
+        result = analyze_candidate("TEST", frames)
+        self.assertNotEqual(result.regime_1d, "unknown")
+        self.assertIsNotNone(result.direction)
+
+    def test_fallback_is_disclosed_not_hidden(self):
+        frames = {"1d": pd.DataFrame(), "4h": self._trending_4h(),
+                   "1h": self._trending_4h()}
+        result = analyze_candidate("TEST", frames)
+        joined = " ".join(result.data_problems).lower()
+        self.assertIn("inferred from 4h", joined)
+
+    def test_regime_reason_flags_the_weaker_read(self):
+        frames = {"1d": pd.DataFrame(), "4h": self._trending_4h(),
+                   "1h": self._trending_4h()}
+        result = analyze_candidate("TEST", frames)
+        item = result.score_evidence.get("regime_alignment_1d_4h")
+        self.assertIn("Daily data unavailable", item.reason)
+
+    def test_score_is_not_zero_when_only_daily_is_missing(self):
+        from scoring import score_setup
+        frames = {"1d": pd.DataFrame(), "4h": self._trending_4h(),
+                   "1h": self._trending_4h()}
+        result = analyze_candidate("TEST", frames)
+        scored = score_setup(result.score_dict())
+        self.assertGreater(scored.normalized_score, 0.0)
+
+    def test_no_fallback_when_4h_also_too_short(self):
+        frames = {"1d": pd.DataFrame(), "4h": ohlc_from_closes([1, 2, 3]),
+                   "1h": pd.DataFrame()}
+        result = analyze_candidate("TEST", frames)
+        self.assertEqual(result.regime_1d, "unknown")

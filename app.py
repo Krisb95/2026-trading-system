@@ -29,7 +29,7 @@ from universe import fetch_top_cryptos
 import coingecko
 import storage
 
-APP_BUILD = "2026-09-20-b9 (CoinGecko primary for crypto)"
+APP_BUILD = "2026-09-20-b10 (rate-limit backoff, caching, regime fallback)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -57,6 +57,20 @@ st.caption(
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_crypto_universe():
     return fetch_top_cryptos(limit=100)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_cg_frames(coin_id: str):
+    """CoinGecko frames, cached for 5 minutes. Its free tier rate-limits hard
+    (HTTP 429), and a scan costs three calls, so repeat scans of the same coin
+    must not re-hit the API."""
+    return coingecko.build_frames_v2(coin_id)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_cg_spot(coin_id: str):
+    """CoinGecko spot price, cached for 60 seconds."""
+    return coingecko.fetch_spot_price(coin_id)
 
 
 CRYPTO_TICKERS, CRYPTO_CG_IDS, CRYPTO_IS_LIVE, CRYPTO_NOTE = _load_crypto_universe()
@@ -149,7 +163,7 @@ with tab_market:
 
             def _cg_quote():
                 """Build a PriceQuote from CoinGecko spot, or None."""
-                price, updated, err = coingecko.fetch_spot_price(cg_id)
+                price, updated, err = _cached_cg_spot(cg_id)
                 if price is None:
                     return None, err
                 status = DataStatus.LIVE
@@ -268,15 +282,33 @@ with tab_scan:
                 frames, problems = {}, []
 
                 if use_cg_first:
-                    frames, problems = coingecko.build_frames_v2(scan_cg_id)
-                    problems = [f"Candles from CoinGecko (4H is native, not resampled)."] + problems
+                    frames, problems = _cached_cg_frames(scan_cg_id)
+                    problems = ["Candles from CoinGecko (4H is native, not resampled)."] + problems
                     if all(f is None or f.empty for f in frames.values()):
                         frames, problems = fetch_multi_timeframe(scan_ticker, yf)
                         problems = ["CoinGecko returned nothing — fell back to Yahoo Finance."] + problems
+                    else:
+                        # Partial failure (commonly a rate-limited daily call):
+                        # fill only the missing frames from Yahoo instead of
+                        # discarding the good CoinGecko candles we already have.
+                        missing = [k for k, f in frames.items() if f is None or f.empty]
+                        if missing:
+                            y_frames, _y_problems = fetch_multi_timeframe(scan_ticker, yf)
+                            filled = []
+                            for k in missing:
+                                yf_frame = y_frames.get(k)
+                                if yf_frame is not None and not yf_frame.empty:
+                                    frames[k] = yf_frame
+                                    filled.append(k)
+                            if filled:
+                                problems.append(
+                                    f"Gap-filled {', '.join(filled)} from Yahoo Finance after "
+                                    f"CoinGecko failed on those timeframes — this scan mixes "
+                                    f"two data sources.")
                 else:
                     frames, problems = fetch_multi_timeframe(scan_ticker, yf)
                     if all(f is None or f.empty for f in frames.values()) and scan_cg_id:
-                        cg_frames, cg_problems = coingecko.build_frames_v2(scan_cg_id)
+                        cg_frames, cg_problems = _cached_cg_frames(scan_cg_id)
                         if any(f is not None and not f.empty for f in cg_frames.values()):
                             frames = cg_frames
                             problems = ([f"Yahoo Finance has no data for {scan_ticker}; "

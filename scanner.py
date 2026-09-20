@@ -434,6 +434,20 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
             break
 
     regime, regime_reason = detect_regime(df_1d)
+    if regime == "unknown" and df_4h is not None and len(df_4h) >= 60:
+        # Daily data missing (e.g. a rate-limited request). Rather than letting
+        # that cascade into "no direction -> everything unevaluated -> 0/10",
+        # read the higher-timeframe bias from 4H and say so plainly. This is a
+        # weaker read than a true daily regime and is labelled as such.
+        alt_regime, alt_reason = detect_regime(df_4h)
+        if alt_regime != "unknown":
+            regime = alt_regime
+            regime_reason = (f"[Daily data unavailable — regime inferred from 4H instead, "
+                              f"which is a weaker read.] {alt_reason}")
+            problems.append(
+                "1D candles were unavailable, so the regime was inferred from 4H. "
+                "Treat the regime-alignment component with extra caution."
+            )
     dir_4h, dir_4h_reason = structure_direction(df_4h)
     dir_1h, dir_1h_reason = structure_direction(df_1h)
 

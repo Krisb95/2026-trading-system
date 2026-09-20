@@ -23,8 +23,58 @@ The free API is rate-limited (roughly 5-15 calls/minute). Callers should cache.
 
 from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple, List
+import time
 import pandas as pd
 import requests
+
+# CoinGecko's free tier is tightly rate limited and answers 429 when exceeded.
+# Requests are spaced out and retried with exponential backoff rather than
+# letting a single 429 knock out a whole frame (which previously cascaded into
+# "regime unknown" -> no direction -> every check unevaluated -> 0.0/10).
+_MIN_SECONDS_BETWEEN_CALLS = 1.2
+_last_call_at = {"t": 0.0}
+
+# Overridable so tests can disable real sleeping (a retry storm with genuine
+# backoff makes the suite take minutes).
+_RETRY_SETTINGS = {"max_retries": 3, "backoff": 2.0}
+
+
+def configure_retries(max_retries: int = 3, backoff: float = 2.0,
+                       min_spacing: float = 1.2) -> None:
+    """Tune rate-limit handling. Tests set these to zero for speed."""
+    global _MIN_SECONDS_BETWEEN_CALLS
+    _RETRY_SETTINGS["max_retries"] = max_retries
+    _RETRY_SETTINGS["backoff"] = backoff
+    _MIN_SECONDS_BETWEEN_CALLS = min_spacing
+
+
+def _throttled_get(url, params, timeout, max_retries=None, backoff=None):
+    """GET with inter-call spacing and 429-aware exponential backoff."""
+    max_retries = _RETRY_SETTINGS["max_retries"] if max_retries is None else max_retries
+    backoff = _RETRY_SETTINGS["backoff"] if backoff is None else backoff
+    last_error = None
+    for attempt in range(max_retries + 1):
+        wait = _MIN_SECONDS_BETWEEN_CALLS - (time.time() - _last_call_at["t"])
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            _last_call_at["t"] = time.time()
+            if resp.status_code == 429:
+                last_error = "429 Too Many Requests (CoinGecko free-tier rate limit)"
+                if attempt < max_retries:
+                    time.sleep(backoff ** (attempt + 1))
+                    continue
+                return None, last_error
+            resp.raise_for_status()
+            return resp, None
+        except Exception as e:
+            _last_call_at["t"] = time.time()
+            last_error = f"{type(e).__name__}: {e}"
+            if attempt < max_retries:
+                time.sleep(backoff ** (attempt + 1))
+                continue
+    return None, last_error
 
 OHLC_URL = "https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
 MARKET_CHART_URL = "https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
@@ -56,12 +106,11 @@ def fetch_ohlc(coin_id: str, days: int = 30, timeout: int = 10
     label, _seconds = GRANULARITY_BY_DAYS[days]
 
     try:
-        resp = requests.get(
+        resp, err = _throttled_get(
             OHLC_URL.format(coin_id=coin_id),
-            params={"vs_currency": "usd", "days": days},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
+            {"vs_currency": "usd", "days": days}, timeout)
+        if resp is None:
+            return None, label, err
         rows = resp.json()
         if not isinstance(rows, list) or not rows:
             return None, label, "CoinGecko returned no candles."
@@ -87,13 +136,12 @@ def fetch_spot_price(coin_id: str, timeout: int = 10
     honestly rather than assumed.
     """
     try:
-        resp = requests.get(
+        resp, err = _throttled_get(
             PRICE_URL,
-            params={"ids": coin_id, "vs_currencies": "usd",
-                    "include_last_updated_at": "true"},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
+            {"ids": coin_id, "vs_currencies": "usd",
+             "include_last_updated_at": "true"}, timeout)
+        if resp is None:
+            return None, None, err
         data = resp.json()
         entry = data.get(coin_id)
         if not entry or "usd" not in entry:
@@ -176,12 +224,11 @@ def fetch_price_series(coin_id: str, days: int, timeout: int = 15
                         ) -> Tuple[Optional[pd.Series], Optional[str]]:
     """Fetch a timestamped price series. Returns (series, error)."""
     try:
-        resp = requests.get(
+        resp, err = _throttled_get(
             MARKET_CHART_URL.format(coin_id=coin_id),
-            params={"vs_currency": "usd", "days": days},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
+            {"vs_currency": "usd", "days": days}, timeout)
+        if resp is None:
+            return None, err
         data = resp.json()
         points = data.get("prices") if isinstance(data, dict) else None
         if not points:

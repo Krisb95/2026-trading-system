@@ -7,11 +7,15 @@ import pandas as pd
 import coingecko
 from coingecko import fetch_ohlc, fetch_spot_price, build_frames, GRANULARITY_BY_DAYS
 
+# Disable real sleeping so retry/backoff logic does not slow the suite.
+coingecko.configure_retries(max_retries=0, backoff=0.0, min_spacing=0.0)
+
 
 class FakeResp:
-    def __init__(self, payload, raise_exc=None):
+    def __init__(self, payload, raise_exc=None, status_code=200):
         self._payload = payload
         self._raise = raise_exc
+        self.status_code = status_code
 
     def raise_for_status(self):
         if self._raise:
@@ -225,3 +229,67 @@ class TestBuildFramesV2(unittest.TestCase):
         series, err = coingecko.fetch_price_series("bitcoin", days=1)
         self.assertIsNone(series)
         self.assertIsNotNone(err)
+
+
+class TestRateLimitHandling(unittest.TestCase):
+    """429 is CoinGecko's free-tier rate limit. It must be retried and then
+    reported clearly, never silently turned into 'no data'."""
+
+    def setUp(self):
+        self.original = coingecko.requests.get
+        coingecko.configure_retries(max_retries=2, backoff=0.0, min_spacing=0.0)
+
+    def tearDown(self):
+        coingecko.requests.get = self.original
+        coingecko.configure_retries(max_retries=0, backoff=0.0, min_spacing=0.0)
+
+    def test_429_is_retried_then_reported(self):
+        calls = {"n": 0}
+
+        def _get(*a, **k):
+            calls["n"] += 1
+            return FakeResp({}, status_code=429)
+
+        coingecko.requests.get = _get
+        df, label, err = fetch_ohlc("bitcoin", days=30)
+        self.assertIsNone(df)
+        self.assertIn("429", err)
+        self.assertEqual(calls["n"], 3)  # 1 initial + 2 retries
+
+    def test_429_then_success_recovers(self):
+        calls = {"n": 0}
+        rows = [[1758000000000, 1.0, 2.0, 0.5, 1.5]]
+
+        def _get(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return FakeResp({}, status_code=429)
+            return FakeResp(rows)
+
+        coingecko.requests.get = _get
+        df, label, err = fetch_ohlc("bitcoin", days=30)
+        self.assertIsNone(err)
+        self.assertEqual(len(df), 1)
+
+    def test_rate_limit_message_is_human_readable(self):
+        coingecko.requests.get = lambda *a, **k: FakeResp({}, status_code=429)
+        price, updated, err = fetch_spot_price("bitcoin")
+        self.assertIsNone(price)
+        self.assertIn("rate limit", err.lower())
+
+    def test_partial_failure_still_returns_good_frames(self):
+        """A rate-limited daily call must not discard working 4H candles."""
+        base = 1758000000000
+
+        def _get(url, params=None, **k):
+            if "/ohlc" in url:
+                rows = [[base + i * 14400000, 10.0 + i, 12.0 + i, 9.0 + i, 11.0 + i]
+                        for i in range(40)]
+                return FakeResp(rows)
+            return FakeResp({}, status_code=429)   # market_chart is limited
+
+        coingecko.requests.get = _get
+        frames, problems = coingecko.build_frames_v2("hyperliquid")
+        self.assertFalse(frames["4h"].empty)       # good data preserved
+        self.assertTrue(frames["1d"].empty)        # failed frame is empty
+        self.assertTrue(any("429" in p or "rate limit" in p.lower() for p in problems))
