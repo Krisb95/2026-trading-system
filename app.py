@@ -27,9 +27,10 @@ from stops import StopManager, suggest_management_label
 from scanner import fetch_multi_timeframe, analyze_candidate, scan_universe
 from universe import fetch_top_cryptos
 import coingecko
+import exchanges
 import storage
 
-APP_BUILD = "2026-09-20-b11 (universe ranking + API key support)"
+APP_BUILD = "2026-09-20-b12 (Binance/Kraken exchange data)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -57,6 +58,19 @@ st.caption(
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_crypto_universe():
     return fetch_top_cryptos(limit=100)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_exchange_frames(ticker: str):
+    """Exchange candles, cached briefly. Exchanges tolerate far more traffic
+    than CoinGecko, so this cache is about responsiveness, not rate limits."""
+    r = exchanges.build_frames(ticker)
+    return r.frames, r.source, r.problems
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_exchange_spot(ticker: str):
+    return exchanges.fetch_spot(ticker)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -109,13 +123,17 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("Data source")
 crypto_source = st.sidebar.radio(
     "Crypto prices from",
-    ["CoinGecko (recommended)", "Yahoo Finance"],
+    ["Exchange (recommended)", "CoinGecko", "Yahoo Finance"],
     key="crypto_source",
-    help=("CoinGecko covers every top-100 coin including ones Yahoo lacks (HYPE), and "
-          "gives native 4H candles. Yahoo gives true daily OHLC but misses newer coins. "
-          "Whichever you pick, the other is used automatically if it returns nothing."),
+    help=("Exchange uses Binance, falling back to Kraken. It gives true OHLCV at every "
+          "interval with no meaningful rate limit — the best option. CoinGecko covers "
+          "more obscure coins but rate-limits hard and has no true daily OHLC. Yahoo "
+          "misses newer listings. Sources fall back to each other automatically."),
 )
-CRYPTO_PREFERS_CG = crypto_source.startswith("CoinGecko")
+CRYPTO_SOURCE = ("exchange" if crypto_source.startswith("Exchange")
+                 else "coingecko" if crypto_source.startswith("CoinGecko")
+                 else "yahoo")
+CRYPTO_PREFERS_CG = CRYPTO_SOURCE == "coingecko"
 st.sidebar.caption(
     "Stocks and commodities always use Yahoo Finance — CoinGecko has no equities "
     "or futures data."
@@ -195,9 +213,31 @@ with tab_market:
                                    bar_interval_seconds=0,
                                    effective_age_seconds=age), None
 
+            use_exchange_first = (asset_class == "crypto" and CRYPTO_SOURCE == "exchange")
             use_cg_first = (asset_class == "crypto" and CRYPTO_PREFERS_CG and cg_id)
 
-            if use_cg_first:
+            if use_exchange_first:
+                px, src, ex_err = _cached_exchange_spot(ticker)
+                if px is not None:
+                    q = PriceQuote(ticker=ticker, price=px, fetched_at_utc=now,
+                                    bar_time_utc=now, status=DataStatus.LIVE,
+                                    provider=f"{src} (spot)", interval="spot",
+                                    bar_interval_seconds=0, effective_age_seconds=0.0)
+                else:
+                    # Exchange failed — try CoinGecko, then Yahoo.
+                    q, cg_err = (_cg_quote() if cg_id else (None, "no CoinGecko id"))
+                    if q is None:
+                        q = fetch_quote(ticker, asset_class, yf,
+                                         live_threshold_seconds=live_threshold,
+                                         stale_threshold_seconds=stale_threshold,
+                                         max_retries=2)
+                        st.session_state.fallback_note = (
+                            f"Exchanges unavailable ({ex_err}) and CoinGecko failed "
+                            f"({cg_err}) — fell back to Yahoo Finance.")
+                    else:
+                        st.session_state.fallback_note = (
+                            f"Exchanges unavailable ({ex_err}) — used CoinGecko instead.")
+            elif use_cg_first:
                 q, cg_err = _cg_quote()
                 if q is None:
                     q = fetch_quote(ticker, asset_class, yf,
@@ -292,22 +332,34 @@ with tab_scan:
         uni_min_rr = u3.number_input("Min R:R", min_value=1.0, value=2.0,
                                       step=0.5, key="uni_rr")
 
-        est = universe_size * 1.4
-        st.caption(f"Roughly {est:.0f}s for {universe_size} coins "
-                   f"(calls are deliberately spaced to avoid rate limits).")
+        per_coin = 0.3 if CRYPTO_SOURCE == "exchange" else 1.4
+        est = universe_size * per_coin
+        st.caption(
+            f"Roughly {est:.0f}s for {universe_size} coins using "
+            f"{'exchange data (fast — no meaningful rate limit)' if CRYPTO_SOURCE == 'exchange' else 'CoinGecko (calls spaced to avoid 429s)'}."
+        )
 
         if st.button("🔎 Scan universe", use_container_width=True):
             labels = list(CRYPTO_TICKERS)[:universe_size]
-            instruments = [(lbl, CRYPTO_TICKERS[lbl], CRYPTO_CG_IDS.get(lbl))
-                           for lbl in labels if CRYPTO_CG_IDS.get(lbl)]
+            instruments = [(lbl, CRYPTO_TICKERS[lbl],
+                             (CRYPTO_TICKERS[lbl], CRYPTO_CG_IDS.get(lbl)))
+                           for lbl in labels]
 
             bar = st.progress(0.0, text="Starting…")
 
-            def _loader(coin_id):
-                df, _label, err = coingecko.fetch_ohlc(coin_id, days=30)
-                if df is None or df.empty:
-                    return {}, [err or "no data"]
-                return {"4h": df, "1d": pd.DataFrame(), "1h": pd.DataFrame()}, []
+            def _loader(payload):
+                ticker, coin_id = payload
+                if CRYPTO_SOURCE == "exchange":
+                    df, err = exchanges.fetch_binance_klines(ticker, "4h")
+                    if df is None:
+                        df, err = exchanges.fetch_kraken_ohlc(ticker, "4h")
+                    if df is not None and not df.empty:
+                        return {"4h": df, "1d": pd.DataFrame(), "1h": pd.DataFrame()}, []
+                if coin_id:
+                    df, _label, err = coingecko.fetch_ohlc(coin_id, days=30)
+                    if df is not None and not df.empty:
+                        return {"4h": df, "1d": pd.DataFrame(), "1h": pd.DataFrame()}, []
+                return {}, [err or "no data"]
 
             def _progress(i, total, label):
                 bar.progress(min(i / max(total, 1), 1.0), text=f"{i}/{total} · {label}")
@@ -380,10 +432,27 @@ with tab_scan:
 
         if st.button("🔍 Scan", use_container_width=True):
             with st.spinner(f"Analysing {scan_ticker} across 1D / 4H / 1H…"):
+                use_exchange_first = (stype == "Crypto" and CRYPTO_SOURCE == "exchange")
                 use_cg_first = (stype == "Crypto" and CRYPTO_PREFERS_CG and scan_cg_id)
                 frames, problems = {}, []
 
-                if use_cg_first:
+                if use_exchange_first:
+                    frames, ex_source, problems = _cached_exchange_frames(scan_ticker)
+                    if ex_source:
+                        problems = ([f"True OHLCV candles from {ex_source} "
+                                      f"(all timeframes native, nothing resampled)."]
+                                    + list(problems))
+                    else:
+                        # Neither exchange lists it — fall back to CoinGecko.
+                        if scan_cg_id:
+                            frames, cg_problems = _cached_cg_frames(scan_cg_id)
+                            problems = ([f"{scan_ticker} is not listed on Binance or Kraken "
+                                          f"— using CoinGecko candles instead."] + cg_problems)
+                        if not frames or all(f is None or f.empty for f in frames.values()):
+                            frames, y_problems = fetch_multi_timeframe(scan_ticker, yf)
+                            problems = ["Exchanges and CoinGecko both failed — "
+                                        "fell back to Yahoo Finance."] + y_problems
+                elif use_cg_first:
                     frames, problems = _cached_cg_frames(scan_cg_id)
                     problems = ["Candles from CoinGecko (4H is native, not resampled)."] + problems
                     if all(f is None or f.empty for f in frames.values()):
