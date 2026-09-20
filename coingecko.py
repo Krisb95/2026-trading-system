@@ -23,6 +23,7 @@ The free API is rate-limited (roughly 5-15 calls/minute). Callers should cache.
 
 from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple, List
+import os
 import time
 import pandas as pd
 import requests
@@ -37,6 +38,24 @@ _last_call_at = {"t": 0.0}
 # Overridable so tests can disable real sleeping (a retry storm with genuine
 # backoff makes the suite take minutes).
 _RETRY_SETTINGS = {"max_retries": 3, "backoff": 2.0}
+
+# A free CoinGecko "demo" API key raises the rate limit substantially
+# (roughly 30 calls/min vs ~5-15 anonymous). Set it via the COINGECKO_API_KEY
+# environment variable or Streamlit secrets. Everything works without one —
+# you just hit 429s sooner.
+_API_KEY = {"value": os.environ.get("COINGECKO_API_KEY", "").strip()}
+
+
+def set_api_key(key: str) -> None:
+    _API_KEY["value"] = (key or "").strip()
+
+
+def has_api_key() -> bool:
+    return bool(_API_KEY["value"])
+
+
+def _auth_headers():
+    return {"x-cg-demo-api-key": _API_KEY["value"]} if _API_KEY["value"] else {}
 
 
 def configure_retries(max_retries: int = 3, backoff: float = 2.0,
@@ -58,7 +77,8 @@ def _throttled_get(url, params, timeout, max_retries=None, backoff=None):
         if wait > 0:
             time.sleep(wait)
         try:
-            resp = requests.get(url, params=params, timeout=timeout)
+            resp = requests.get(url, params=params, timeout=timeout,
+                                 headers=_auth_headers())
             _last_call_at["t"] = time.time()
             if resp.status_code == 429:
                 last_error = "429 Too Many Requests (CoinGecko free-tier rate limit)"

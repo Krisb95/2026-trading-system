@@ -601,3 +601,90 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
     analysis.sequence_evidence = seq
 
     return analysis
+
+
+# ---------------------------------------------------------------------
+# Universe scanning: rank many instruments instead of analysing one.
+#
+# HONEST TRADE-OFF: a full multi-timeframe analysis costs three API calls per
+# instrument, so scanning 90 coins would need ~270 calls and be rate-limited
+# into uselessness. A universe scan therefore fetches ONLY the 4H frame (one
+# call each) and reads the regime from it. That means:
+#
+#   * "1D/4H regime alignment" is judged from 4H alone — a weaker read
+#   * "Entry confirmation (1H)" cannot be evaluated at all, so that point is
+#     never awarded and the practical ceiling is 9/10, not 10/10
+#
+# Ranked results are a SHORTLIST, not a verdict. Re-run a full single-instrument
+# scan on anything that looks interesting before acting on it.
+# ---------------------------------------------------------------------
+
+@dataclass
+class RankedCandidate:
+    ticker: str
+    label: str
+    direction: Optional[str]
+    score: float
+    grade: str
+    regime: str
+    price: Optional[float]
+    stop: Optional[float]
+    target: Optional[float]
+    reward_risk: Optional[float]
+    note: str = ""
+    error: Optional[str] = None
+
+
+def scan_universe(instruments, frame_loader, min_rr: float = 2.0,
+                   direction_override: Optional[str] = None,
+                   progress_callback=None):
+    """Score a list of instruments and return them ranked, best first.
+
+    instruments:    list of (label, ticker, fetch_key) tuples
+    frame_loader:   callable(fetch_key) -> (frames_dict, problems_list)
+    progress_callback: optional callable(index, total, label)
+
+    Instruments that fail to load are returned with an error rather than being
+    silently dropped — a coin missing from the list because its fetch failed
+    would be indistinguishable from one that scored badly.
+    """
+    from scoring import score_setup
+
+    results = []
+    total = len(instruments)
+    for i, (label, ticker, fetch_key) in enumerate(instruments):
+        if progress_callback:
+            progress_callback(i, total, label)
+        try:
+            frames, problems = frame_loader(fetch_key)
+            if not frames or all(f is None or f.empty for f in frames.values()):
+                results.append(RankedCandidate(
+                    ticker=ticker, label=label, direction=None, score=0.0, grade="—",
+                    regime="unknown", price=None, stop=None, target=None,
+                    reward_risk=None, error="No data returned."))
+                continue
+
+            analysis = analyze_candidate(ticker, frames,
+                                          direction_override=direction_override,
+                                          min_rr=min_rr, data_problems=problems)
+            scored = score_setup(analysis.score_dict())
+            results.append(RankedCandidate(
+                ticker=ticker, label=label, direction=analysis.direction,
+                score=scored.normalized_score, grade=scored.label,
+                regime=analysis.regime_1d, price=analysis.current_price,
+                stop=analysis.stop, target=analysis.target,
+                reward_risk=analysis.reward_risk,
+                note=analysis.level_reason))
+        except Exception as e:
+            results.append(RankedCandidate(
+                ticker=ticker, label=label, direction=None, score=0.0, grade="—",
+                regime="unknown", price=None, stop=None, target=None,
+                reward_risk=None, error=f"{type(e).__name__}: {e}"))
+
+    if progress_callback:
+        progress_callback(total, total, "done")
+
+    # Rank by score, then by reward:risk as a tiebreak. Failures sort last.
+    results.sort(key=lambda r: (r.error is None, r.score, r.reward_risk or 0),
+                  reverse=True)
+    return results

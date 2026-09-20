@@ -268,3 +268,87 @@ class TestRegimeFallbackWhenDailyMissing(unittest.TestCase):
                    "1h": pd.DataFrame()}
         result = analyze_candidate("TEST", frames)
         self.assertEqual(result.regime_1d, "unknown")
+
+
+class TestUniverseScan(unittest.TestCase):
+    """Ranked shortlist across many instruments."""
+
+    def _good_frames(self, rising=True):
+        df = ohlc_from_closes(zigzag(n_legs=14, rising=rising),
+                               start="2026-06-01", freq="4h")
+        return {"4h": df, "1d": pd.DataFrame(), "1h": pd.DataFrame()}, []
+
+    def test_returns_one_result_per_instrument(self):
+        from scanner import scan_universe
+        insts = [("Bitcoin (BTC)", "BTC-USD", "bitcoin"),
+                 ("Ethereum (ETH)", "ETH-USD", "ethereum")]
+        out = scan_universe(insts, lambda k: self._good_frames())
+        self.assertEqual(len(out), 2)
+
+    def test_results_are_sorted_best_first(self):
+        from scanner import scan_universe
+        insts = [(f"C{i}", f"C{i}-USD", f"c{i}") for i in range(4)]
+
+        def loader(key):
+            # Alternate trending vs flat so scores genuinely differ.
+            if key in ("c0", "c2"):
+                return self._good_frames()
+            return {"4h": ohlc_from_closes([100] * 80, start="2026-06-01", freq="4h"),
+                     "1d": pd.DataFrame(), "1h": pd.DataFrame()}, []
+
+        out = scan_universe(insts, loader)
+        scores = [r.score for r in out if r.error is None]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_failed_instruments_are_reported_not_dropped(self):
+        from scanner import scan_universe
+        insts = [("Good", "G-USD", "good"), ("Bad", "B-USD", "bad")]
+
+        def loader(key):
+            if key == "bad":
+                raise ConnectionError("429")
+            return self._good_frames()
+
+        out = scan_universe(insts, loader)
+        self.assertEqual(len(out), 2)
+        errored = [r for r in out if r.error]
+        self.assertEqual(len(errored), 1)
+        self.assertIn("429", errored[0].error)
+
+    def test_empty_frames_reported_as_no_data(self):
+        from scanner import scan_universe
+        insts = [("Empty", "E-USD", "empty")]
+        out = scan_universe(insts, lambda k: ({"4h": pd.DataFrame()}, []))
+        self.assertEqual(out[0].error, "No data returned.")
+
+    def test_failures_sort_last(self):
+        from scanner import scan_universe
+        insts = [("Bad", "B-USD", "bad"), ("Good", "G-USD", "good")]
+
+        def loader(key):
+            if key == "bad":
+                raise ValueError("boom")
+            return self._good_frames()
+
+        out = scan_universe(insts, loader)
+        self.assertIsNone(out[0].error)
+        self.assertIsNotNone(out[-1].error)
+
+    def test_progress_callback_is_invoked(self):
+        from scanner import scan_universe
+        seen = []
+        insts = [("A", "A-USD", "a"), ("B", "B-USD", "b")]
+        scan_universe(insts, lambda k: self._good_frames(),
+                       progress_callback=lambda i, t, l: seen.append((i, t)))
+        self.assertEqual(seen[-1], (2, 2))
+
+    def test_direction_override_is_passed_through(self):
+        from scanner import scan_universe
+        insts = [("A", "A-USD", "a")]
+        out = scan_universe(insts, lambda k: self._good_frames(),
+                             direction_override="Short")
+        self.assertEqual(out[0].direction, "Short")
+
+    def test_empty_instrument_list_is_safe(self):
+        from scanner import scan_universe
+        self.assertEqual(scan_universe([], lambda k: self._good_frames()), [])

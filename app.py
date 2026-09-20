@@ -24,12 +24,12 @@ from backtest import (run_backtest, compute_metrics, split_in_out_sample,
                        example_sma_crossover_signals)
 from portfolio import OpenPosition, summarize_portfolio_risk
 from stops import StopManager, suggest_management_label
-from scanner import fetch_multi_timeframe, analyze_candidate
+from scanner import fetch_multi_timeframe, analyze_candidate, scan_universe
 from universe import fetch_top_cryptos
 import coingecko
 import storage
 
-APP_BUILD = "2026-09-20-b10 (rate-limit backoff, caching, regime fallback)"
+APP_BUILD = "2026-09-20-b11 (universe ranking + API key support)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -96,6 +96,15 @@ except Exception:
     st.sidebar.error(f"'{tz_name}' is not a valid IANA timezone — using UTC.")
     local_tz = timezone.utc
 
+# A free CoinGecko demo key raises the rate limit a lot. Optional.
+_cg_key = ""
+try:
+    _cg_key = st.secrets.get("COINGECKO_API_KEY", "")
+except Exception:
+    _cg_key = ""
+if _cg_key:
+    coingecko.set_api_key(_cg_key)
+
 st.sidebar.markdown("---")
 st.sidebar.subheader("Data source")
 crypto_source = st.sidebar.radio(
@@ -115,6 +124,13 @@ st.sidebar.caption(
 st.sidebar.markdown("---")
 st.sidebar.caption(f"curl_cffi installed: **{curl_cffi_is_available()}**")
 st.sidebar.caption(f"Crypto list: {len(CRYPTO_TICKERS)} symbols")
+if coingecko.has_api_key():
+    st.sidebar.caption("CoinGecko API key: **set** (higher rate limit)")
+else:
+    st.sidebar.caption(
+        "CoinGecko API key: not set — free anonymous limits apply, so rapid "
+        "scanning will hit 429s. A free demo key in Streamlit secrets "
+        "(`COINGECKO_API_KEY`) raises this substantially.")
 if not CRYPTO_IS_LIVE:
     st.sidebar.warning(CRYPTO_NOTE)
 st.sidebar.warning(
@@ -251,12 +267,98 @@ with tab_scan:
         "overridable — ❔ means it could not be evaluated and scores zero rather than guessing."
     )
 
-    mode = st.radio("Evidence source", ["Auto-scan", "Manual checklist"],
-                     horizontal=True, key="scan_mode")
+    mode = st.radio("Mode",
+                     ["Rank the universe", "Auto-scan one instrument", "Manual checklist"],
+                     key="scan_mode",
+                     help="Rank the universe scores many coins and shortlists the best; "
+                          "the other modes analyse a single instrument in full depth.")
 
     score_evidence, seq_evidence = {}, {}
 
-    if mode == "Auto-scan":
+    if mode == "Rank the universe":
+        st.caption(
+            "Scores many instruments and shortlists the best. To stay inside rate "
+            "limits this uses **4H candles only** — so 1H entry confirmation cannot be "
+            "evaluated (capping scores at 9/10) and the regime is read from 4H rather "
+            "than daily. Treat results as a shortlist, then run a full single-instrument "
+            "scan on anything promising."
+        )
+
+        u1, u2, u3 = st.columns(3)
+        universe_size = u1.selectbox("How many coins", [10, 20, 30, 50],
+                                      index=1, key="uni_size",
+                                      help="More coins means more API calls and a longer wait.")
+        uni_direction = u2.selectbox("Direction", ["Auto", "Long", "Short"], key="uni_dir")
+        uni_min_rr = u3.number_input("Min R:R", min_value=1.0, value=2.0,
+                                      step=0.5, key="uni_rr")
+
+        est = universe_size * 1.4
+        st.caption(f"Roughly {est:.0f}s for {universe_size} coins "
+                   f"(calls are deliberately spaced to avoid rate limits).")
+
+        if st.button("🔎 Scan universe", use_container_width=True):
+            labels = list(CRYPTO_TICKERS)[:universe_size]
+            instruments = [(lbl, CRYPTO_TICKERS[lbl], CRYPTO_CG_IDS.get(lbl))
+                           for lbl in labels if CRYPTO_CG_IDS.get(lbl)]
+
+            bar = st.progress(0.0, text="Starting…")
+
+            def _loader(coin_id):
+                df, _label, err = coingecko.fetch_ohlc(coin_id, days=30)
+                if df is None or df.empty:
+                    return {}, [err or "no data"]
+                return {"4h": df, "1d": pd.DataFrame(), "1h": pd.DataFrame()}, []
+
+            def _progress(i, total, label):
+                bar.progress(min(i / max(total, 1), 1.0), text=f"{i}/{total} · {label}")
+
+            with st.spinner("Scanning…"):
+                ranked = scan_universe(
+                    instruments, _loader, min_rr=uni_min_rr,
+                    direction_override=None if uni_direction == "Auto" else uni_direction,
+                    progress_callback=_progress)
+            bar.empty()
+            st.session_state.ranked = ranked
+
+        ranked = st.session_state.get("ranked")
+        if ranked:
+            ok = [r for r in ranked if r.error is None]
+            failed = [r for r in ranked if r.error is not None]
+
+            st.markdown(f"##### Results · {len(ok)} scored, {len(failed)} failed")
+            if ok:
+                table = pd.DataFrame([{
+                    "Instrument": r.label,
+                    "Score": f"{r.score:.1f}",
+                    "Grade": r.grade,
+                    "Dir": r.direction or "—",
+                    "Regime": r.regime.title(),
+                    "Price": f"{r.price:,.6g}" if r.price else "—",
+                    "Stop": f"{r.stop:,.6g}" if r.stop else "—",
+                    "Target": f"{r.target:,.6g}" if r.target else "—",
+                    "R:R": f"{r.reward_risk:.2f}" if r.reward_risk else "—",
+                } for r in ok])
+                st.dataframe(table, use_container_width=True, hide_index=True)
+
+                tradeable = [r for r in ok if r.grade in ("A+", "B")]
+                if tradeable:
+                    st.success(
+                        f"{len(tradeable)} setup(s) at grade B or better: "
+                        + ", ".join(f"{r.label} ({r.grade}, {r.score:.1f})" for r in tradeable[:5])
+                    )
+                else:
+                    st.info(
+                        "Nothing reached grade B. Per the rulebook, C setups are not traded — "
+                        "a no-trade decision is valid and common."
+                    )
+            if failed:
+                with st.expander(f"⚠️ {len(failed)} instrument(s) could not be scored"):
+                    for r in failed:
+                        st.caption(f"**{r.label}** — {r.error}")
+
+        score_evidence, seq_evidence = {}, {}
+
+    elif mode == "Auto-scan one instrument":
         s1, s2, s3 = st.columns([2, 1, 1])
         with s1:
             stype = st.radio("Asset type", ["Crypto", "Stock", "Commodity"],
