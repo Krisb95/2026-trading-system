@@ -32,6 +32,7 @@ import numpy as np
 
 from technical import (find_swing_points, label_structure, find_equal_levels,
                         fib_levels, SwingPoint)
+from formatting import format_price as _fp
 
 
 @dataclass
@@ -155,12 +156,12 @@ def detect_regime(df_1d: pd.DataFrame) -> Tuple[str, str]:
     ma_bearish = price < sma20 < sma50
 
     if ma_bullish and bullish_structure >= bearish_structure:
-        return "bullish", (f"Price {price:.4g} above SMA20 {sma20:.4g} above SMA50 {sma50:.4g}, "
+        return "bullish", (f"Price {_fp(price)} above SMA20 {_fp(sma20)} above SMA50 {_fp(sma50)}, "
                             f"with {bullish_structure}/{len(recent)} recent swings higher.")
     if ma_bearish and bearish_structure >= bullish_structure:
-        return "bearish", (f"Price {price:.4g} below SMA20 {sma20:.4g} below SMA50 {sma50:.4g}, "
+        return "bearish", (f"Price {_fp(price)} below SMA20 {_fp(sma20)} below SMA50 {_fp(sma50)}, "
                             f"with {bearish_structure}/{len(recent)} recent swings lower.")
-    return "ranging", (f"No clean MA stack (price {price:.4g}, SMA20 {sma20:.4g}, SMA50 {sma50:.4g}) "
+    return "ranging", (f"No clean MA stack (price {_fp(price)}, SMA20 {_fp(sma20)}, SMA50 {_fp(sma50)}) "
                         f"or mixed swing structure — treat as ranging/transitioning.")
 
 
@@ -227,12 +228,12 @@ def detect_sweep_and_reclaim(df: pd.DataFrame, direction: str,
         pierced = window["Low"].min() < level
         reclaimed = float(window["Close"].iloc[-1]) > level
         if pierced and reclaimed:
-            return True, (f"Low {window['Low'].min():.4g} pierced prior swing low {level:.4g}, "
-                           f"and price closed back above at {window['Close'].iloc[-1]:.4g} — reclaim confirmed.")
+            return True, (f"Low {_fp(window['Low'].min())} pierced prior swing low {_fp(level)}, "
+                           f"and price closed back above at {_fp(window['Close'].iloc[-1])} — reclaim confirmed.")
         if pierced and not reclaimed:
-            return False, (f"Level {level:.4g} was pierced but price has NOT closed back above it "
-                            f"(last close {window['Close'].iloc[-1]:.4g}) — no reclaim, so no points.")
-        return False, f"No sweep of prior swing low {level:.4g} in the last {lookback} bars."
+            return False, (f"Level {_fp(level)} was pierced but price has NOT closed back above it "
+                            f"(last close {_fp(window['Close'].iloc[-1])}) — no reclaim, so no points.")
+        return False, f"No sweep of prior swing low {_fp(level)} in the last {lookback} bars."
     else:
         levels = [s.price for s in swings if s.kind == "high"]
         if not levels:
@@ -241,12 +242,12 @@ def detect_sweep_and_reclaim(df: pd.DataFrame, direction: str,
         pierced = window["High"].max() > level
         rejected = float(window["Close"].iloc[-1]) < level
         if pierced and rejected:
-            return True, (f"High {window['High'].max():.4g} pierced prior swing high {level:.4g}, "
-                           f"and price closed back below at {window['Close'].iloc[-1]:.4g} — rejection confirmed.")
+            return True, (f"High {_fp(window['High'].max())} pierced prior swing high {_fp(level)}, "
+                           f"and price closed back below at {_fp(window['Close'].iloc[-1])} — rejection confirmed.")
         if pierced and not rejected:
-            return False, (f"Level {level:.4g} was pierced but price has NOT closed back below it "
-                            f"(last close {window['Close'].iloc[-1]:.4g}) — no rejection, so no points.")
-        return False, f"No sweep of prior swing high {level:.4g} in the last {lookback} bars."
+            return False, (f"Level {_fp(level)} was pierced but price has NOT closed back below it "
+                            f"(last close {_fp(window['Close'].iloc[-1])}) — no rejection, so no points.")
+        return False, f"No sweep of prior swing high {_fp(level)} in the last {lookback} bars."
 
 
 def fib_confluence(df: pd.DataFrame, price: float, direction: str,
@@ -275,10 +276,10 @@ def fib_confluence(df: pd.DataFrame, price: float, direction: str,
             if lvl > 0 and abs(lvl - price) / price <= tolerance_pct]
     if near:
         name, lvl = min(near, key=lambda x: abs(x[1] - price))
-        return True, (f"Price {price:.4g} is within {tolerance_pct:.1%} of {name} at {lvl:.4g} "
-                       f"(anchored on swing low {last_low.price:.4g} / high {last_high.price:.4g})."), levels
-    return False, (f"Price {price:.4g} is not near any Fibonacci level from the latest confirmed "
-                    f"swing pair ({last_low.price:.4g} → {last_high.price:.4g})."), levels
+        return True, (f"Price {_fp(price)} is within {tolerance_pct:.1%} of {name} at {_fp(lvl)} "
+                       f"(anchored on swing low {_fp(last_low.price)} / high {_fp(last_high.price)})."), levels
+    return False, (f"Price {_fp(price)} is not near any Fibonacci level from the latest confirmed "
+                    f"swing pair ({_fp(last_low.price)} → {_fp(last_high.price)})."), levels
 
 
 def atr_value(df: pd.DataFrame, period: int = 14) -> Optional[float]:
@@ -343,7 +344,7 @@ def derive_levels(df_4h: pd.DataFrame, entry: float, direction: str,
 
     if not candidates:
         return stop, None, None, (
-            f"Stop at {stop:.6g} (nearest confirmed swing plus {stop_buffer_atr:g} ATR buffer), "
+            f"Stop at {_fp(stop)} (nearest confirmed swing plus {stop_buffer_atr:g} ATR buffer), "
             f"but no confirmed opposing swing beyond entry to use as a target."
         )
 
@@ -351,15 +352,15 @@ def derive_levels(df_4h: pd.DataFrame, entry: float, direction: str,
         rr = abs(level - entry) / risk
         if rr >= min_rr:
             return stop, level, rr, (
-                f"Stop {stop:.6g} (nearest swing ±{stop_buffer_atr:g} ATR). Target {level:.6g} is "
+                f"Stop {_fp(stop)} (nearest swing ±{stop_buffer_atr:g} ATR). Target {_fp(level)} is "
                 f"the first confirmed level clearing {min_rr:.1f}:1, giving {rr:.2f}:1."
             )
 
     furthest = candidates[-1]
     rr = abs(furthest - entry) / risk
     return stop, furthest, rr, (
-        f"Stop {stop:.6g}. No confirmed level reaches {min_rr:.1f}:1 — the furthest available "
-        f"({furthest:.6g}) gives only {rr:.2f}:1, so this setup fails the reward:risk test."
+        f"Stop {_fp(stop)}. No confirmed level reaches {min_rr:.1f}:1 — the furthest available "
+        f"({_fp(furthest)}) gives only {rr:.2f}:1, so this setup fails the reward:risk test."
     )
 
 
@@ -379,7 +380,7 @@ def is_extended(df: pd.DataFrame, price: float, atr_mult: float = 2.5,
         return None, "ATR unavailable — cannot judge extension."
     distance_atr = abs(price - sma20) / atr
     if distance_atr >= atr_mult:
-        return True, (f"Price is {distance_atr:.1f} ATR from its 20-SMA ({sma20:.4g}) — "
+        return True, (f"Price is {distance_atr:.1f} ATR from its 20-SMA ({_fp(sma20)}) — "
                        f"that is an extended move; entering here is chasing.")
     return False, f"Price is {distance_atr:.1f} ATR from its 20-SMA — not extended."
 
@@ -402,7 +403,7 @@ def opposing_liquidity_ahead(df: pd.DataFrame, price: float, target: Optional[fl
     if blocking:
         nearest = min(blocking, key=lambda c: abs(c["price_avg"] - price))
         return True, (f"A cluster of {nearest['touches']} equal {nearest['kind']}s sits at "
-                       f"{nearest['price_avg']:.4g}, between entry and target — price may stall there.")
+                       f"{_fp(nearest['price_avg'])}, between entry and target — price may stall there.")
     return False, "No clustered opposing liquidity between entry and target."
 
 
@@ -506,7 +507,7 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
     elif sr:
         lvl, touches = sr
         ev["support_resistance"] = EvidenceItem(
-            True, f"Price is within 2% of a confirmed 4H level at {lvl:.4g} ({touches} touch(es))."
+            True, f"Price is within 2% of a confirmed 4H level at {_fp(lvl)} ({touches} touch(es))."
         )
     else:
         ev["support_resistance"] = EvidenceItem(
@@ -543,7 +544,7 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
         )
     else:
         ev["invalidation_defined"] = EvidenceItem(
-            True, f"Structural invalidation at {stop:.4g} (nearest confirmed 4H swing)."
+            True, f"Structural invalidation at {_fp(stop)} (nearest confirmed 4H swing)."
         )
 
     if rr is None:

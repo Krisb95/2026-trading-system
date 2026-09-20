@@ -34,6 +34,14 @@ JOURNAL_COLUMNS = [
 ]
 
 
+def _ensure_columns(conn, table: str, columns: Dict[str, str]) -> None:
+    """Add any missing columns to an existing table (a lightweight migration)."""
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, decl in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
 @contextmanager
 def _connect(db_path: str):
     conn = sqlite3.connect(db_path)
@@ -84,9 +92,23 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 stop REAL,
                 quantity REAL,
                 contract_multiplier REAL DEFAULT 1.0,
-                opened_utc TEXT
+                opened_utc TEXT,
+                target REAL,
+                leverage REAL DEFAULT 1.0,
+                notes TEXT DEFAULT ''
             )
         """)
+        # Columns added after the first release. Existing databases are
+        # migrated in place rather than dropped, so a schema change never
+        # silently destroys someone's open positions.
+        _ensure_columns(conn, "positions", {
+            "target": "REAL",
+            "leverage": "REAL DEFAULT 1.0",
+            "fee_rate": "REAL DEFAULT 0.0",
+            "slippage_pct": "REAL DEFAULT 0.0",
+            "entry_reason": "TEXT DEFAULT ''",
+            "notes": "TEXT DEFAULT ''",
+        })
 
 
 # ---------------------------------------------------------------------
@@ -152,19 +174,40 @@ def journal_to_csv_bytes(db_path: str = DEFAULT_DB_PATH) -> bytes:
 # Positions
 # ---------------------------------------------------------------------
 
+POSITION_EDITABLE = {"stop", "target", "quantity", "leverage", "fee_rate",
+                      "slippage_pct", "entry", "notes", "entry_reason"}
+
+
 def add_position(asset: str, asset_class: str, direction: str, entry: float,
                   stop: float, quantity: float, contract_multiplier: float = 1.0,
-                  db_path: str = DEFAULT_DB_PATH) -> int:
+                  target: Optional[float] = None, leverage: float = 1.0,
+                  fee_rate: float = 0.0, slippage_pct: float = 0.0,
+                  entry_reason: str = "", db_path: str = DEFAULT_DB_PATH) -> int:
     with _connect(db_path) as conn:
         cur = conn.execute(
             """INSERT INTO positions
                (asset, asset_class, direction, entry, stop, quantity,
-                contract_multiplier, opened_utc)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                contract_multiplier, opened_utc, target, leverage, fee_rate,
+                slippage_pct, entry_reason, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')""",
             (asset, asset_class, direction, entry, stop, quantity,
-             contract_multiplier, datetime.now(timezone.utc).isoformat()),
+             contract_multiplier, datetime.now(timezone.utc).isoformat(),
+             target, leverage, fee_rate, slippage_pct, entry_reason),
         )
         return cur.lastrowid
+
+
+def update_position(position_id: int, db_path: str = DEFAULT_DB_PATH, **changes) -> None:
+    """Edit an open position (stop, target, size, costs, notes)."""
+    valid = {k: v for k, v in changes.items() if k in POSITION_EDITABLE}
+    if not valid:
+        raise ValueError(f"No editable position fields in {list(changes)}")
+    assignments = ", ".join(f"{k} = ?" for k in valid)
+    with _connect(db_path) as conn:
+        cur = conn.execute(f"UPDATE positions SET {assignments} WHERE id = ?",
+                            list(valid.values()) + [position_id])
+        if cur.rowcount == 0:
+            raise KeyError(f"No position with id {position_id}")
 
 
 def update_position_stop(position_id: int, new_stop: float,

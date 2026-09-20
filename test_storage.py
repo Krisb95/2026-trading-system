@@ -131,3 +131,137 @@ class TestInitAndReset(StorageTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPositionFieldsAndMigration(StorageTestBase):
+    def test_new_fields_persist(self):
+        pid = add_position("BTC-USD", "crypto", "Long", 80000, 78000, 0.1,
+                            target=85000, leverage=3.0, fee_rate=0.0006,
+                            slippage_pct=0.0005, entry_reason="4H sweep reclaim",
+                            db_path=self.db)
+        row = get_positions(self.db)[0]
+        self.assertEqual(row["target"], 85000)
+        self.assertEqual(row["leverage"], 3.0)
+        self.assertAlmostEqual(row["fee_rate"], 0.0006)
+        self.assertEqual(row["entry_reason"], "4H sweep reclaim")
+
+    def test_update_position_edits_stop_and_target(self):
+        from storage import update_position
+        pid = add_position("BTC-USD", "crypto", "Long", 80000, 78000, 0.1,
+                            target=85000, db_path=self.db)
+        update_position(pid, db_path=self.db, stop=79000, target=90000)
+        row = get_positions(self.db)[0]
+        self.assertEqual(row["stop"], 79000)
+        self.assertEqual(row["target"], 90000)
+
+    def test_update_rejects_non_editable_field(self):
+        from storage import update_position
+        pid = add_position("BTC-USD", "crypto", "Long", 80000, 78000, 0.1, db_path=self.db)
+        with self.assertRaises(ValueError):
+            update_position(pid, db_path=self.db, asset="ETH-USD")
+
+    def test_update_missing_position_raises(self):
+        from storage import update_position
+        with self.assertRaises(KeyError):
+            update_position(9999, db_path=self.db, stop=1)
+
+    def test_migration_adds_columns_to_old_schema(self):
+        """An existing database created before these columns existed must be
+        upgraded in place, not wiped."""
+        import sqlite3, os, tempfile
+        fd, old_db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(old_db)
+        conn = sqlite3.connect(old_db)
+        conn.execute("""CREATE TABLE positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, asset TEXT, asset_class TEXT,
+            direction TEXT, entry REAL, stop REAL, quantity REAL,
+            contract_multiplier REAL DEFAULT 1.0, opened_utc TEXT)""")
+        conn.execute("INSERT INTO positions (asset, entry, stop, quantity) "
+                      "VALUES ('BTC-USD', 100, 90, 1)")
+        conn.commit()
+        conn.close()
+
+        init_db(old_db)                      # should migrate, not destroy
+        rows = get_positions(old_db)
+        self.assertEqual(len(rows), 1)       # original row survived
+        self.assertIn("target", rows[0])     # new column present
+        self.assertEqual(rows[0]["asset"], "BTC-USD")
+        os.unlink(old_db)
+
+    def test_defaults_when_optional_fields_omitted(self):
+        pid = add_position("ETH-USD", "crypto", "Long", 3000, 2900, 1.0, db_path=self.db)
+        row = get_positions(self.db)[0]
+        self.assertIsNone(row["target"])
+        self.assertEqual(row["leverage"], 1.0)
+
+
+class TestPositionEditing(StorageTestBase):
+    """Positions gained target/leverage/notes and full editing."""
+
+    def test_add_with_target_and_leverage(self):
+        pid = add_position("BTC-USD", "crypto", "Long", 50000, 48000, 0.1,
+                            target=55000, leverage=3.0, entry_reason="4H reclaim",
+                            db_path=self.db)
+        row = get_positions(self.db)[0]
+        self.assertEqual(row["target"], 55000)
+        self.assertEqual(row["leverage"], 3.0)
+        self.assertEqual(row["entry_reason"], "4H reclaim")
+
+    def test_update_stop_and_target(self):
+        from storage import update_position
+        pid = add_position("BTC-USD", "crypto", "Long", 50000, 48000, 0.1,
+                            target=55000, db_path=self.db)
+        update_position(pid, db_path=self.db, stop=49000, target=56000)
+        row = get_positions(self.db)[0]
+        self.assertEqual(row["stop"], 49000)
+        self.assertEqual(row["target"], 56000)
+
+    def test_update_quantity_and_entry_for_scale_in(self):
+        from storage import update_position
+        pid = add_position("BTC-USD", "crypto", "Long", 50000, 48000, 0.1, db_path=self.db)
+        update_position(pid, db_path=self.db, entry=51000, quantity=0.2)
+        row = get_positions(self.db)[0]
+        self.assertEqual(row["entry"], 51000)
+        self.assertAlmostEqual(row["quantity"], 0.2)
+
+    def test_update_rejects_unknown_field(self):
+        from storage import update_position
+        pid = add_position("BTC-USD", "crypto", "Long", 50000, 48000, 0.1, db_path=self.db)
+        with self.assertRaises(ValueError):
+            update_position(pid, db_path=self.db, bogus=1)
+
+    def test_update_missing_position_raises(self):
+        from storage import update_position
+        with self.assertRaises(KeyError):
+            update_position(9999, db_path=self.db, stop=1)
+
+    def test_target_may_be_absent(self):
+        add_position("BTC-USD", "crypto", "Long", 50000, 48000, 0.1, db_path=self.db)
+        self.assertIsNone(get_positions(self.db)[0]["target"])
+
+
+class TestSchemaMigration(StorageTestBase):
+    """An existing database created before target/leverage/notes existed must
+    gain those columns rather than crashing with 'no such column'."""
+
+    def test_migration_adds_missing_columns(self):
+        import sqlite3, os, tempfile
+        fd, old_db = tempfile.mkstemp(suffix=".db")
+        os.close(fd); os.unlink(old_db)
+        conn = sqlite3.connect(old_db)
+        conn.execute("""CREATE TABLE positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, asset TEXT, asset_class TEXT,
+            direction TEXT, entry REAL, stop REAL, quantity REAL,
+            contract_multiplier REAL DEFAULT 1.0, opened_utc TEXT)""")
+        conn.execute("INSERT INTO positions (asset, entry, stop, quantity) "
+                      "VALUES ('OLD-USD', 1.0, 0.9, 5)")
+        conn.commit(); conn.close()
+
+        init_db(old_db)   # should migrate, not fail
+        rows = get_positions(old_db)
+        self.assertEqual(len(rows), 1)          # pre-existing row survived
+        self.assertEqual(rows[0]["asset"], "OLD-USD")
+        self.assertIn("target", rows[0])
+        self.assertIn("leverage", rows[0])
+        os.unlink(old_db)

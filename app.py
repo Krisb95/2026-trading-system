@@ -24,13 +24,16 @@ from backtest import (run_backtest, compute_metrics, split_in_out_sample,
                        example_sma_crossover_signals)
 from portfolio import OpenPosition, summarize_portfolio_risk
 from stops import StopManager, suggest_management_label
+from position_math import PositionSnapshot, analyse_scale_in, ScaleVerdict
 from scanner import fetch_multi_timeframe, analyze_candidate, scan_universe
 from universe import fetch_top_cryptos
 import coingecko
 import exchanges
+import venues as venues_mod
 import storage
+from formatting import format_price
 
-APP_BUILD = "2026-09-20-b12 (Binance/Kraken exchange data)"
+APP_BUILD = "2026-09-20-b15 (venue filter, small-price text fix)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -87,7 +90,13 @@ def _cached_cg_spot(coin_id: str):
     return coingecko.fetch_spot_price(coin_id)
 
 
-CRYPTO_TICKERS, CRYPTO_CG_IDS, CRYPTO_IS_LIVE, CRYPTO_NOTE = _load_crypto_universe()
+CRYPTO_TICKERS_ALL, CRYPTO_CG_IDS, CRYPTO_IS_LIVE, CRYPTO_NOTE = _load_crypto_universe()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_venue_listings():
+    listings = venues_mod.fetch_listings()
+    return listings.bybit, listings.hyperliquid, listings.problems
 
 COMMODITY_TICKERS = {
     "Gold (Futures)": "GC=F", "Silver (Futures)": "SI=F", "Platinum (Futures)": "PL=F",
@@ -120,6 +129,32 @@ if _cg_key:
     coingecko.set_api_key(_cg_key)
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("Tradable universe")
+venue_mode = st.sidebar.radio(
+    "Restrict coins to",
+    ["Bybit or Hyperliquid", "Bybit AND Hyperliquid", "All top-100"],
+    key="venue_mode",
+    help="Market-cap rank includes exchange tokens (WBT, OKB) and wrapped assets you "
+         "cannot trade as perpetuals. Filtering to your venues keeps the scan actionable.")
+
+if venue_mode == "All top-100":
+    CRYPTO_TICKERS = dict(CRYPTO_TICKERS_ALL)
+    VENUE_TAGS = {}
+    st.sidebar.caption(f"{len(CRYPTO_TICKERS)} coins (unfiltered).")
+else:
+    _by, _hl, _vprob = _load_venue_listings()
+    _listings = venues_mod.VenueListings(bybit=_by, hyperliquid=_hl, problems=_vprob)
+    CRYPTO_TICKERS, VENUE_TAGS, _vnotes = venues_mod.filter_universe(
+        CRYPTO_TICKERS_ALL, _listings,
+        require_both=(venue_mode == "Bybit AND Hyperliquid"))
+    st.sidebar.caption(f"Bybit: {len(_by)} perps · Hyperliquid: {len(_hl)} perps")
+    for _n in _vnotes:
+        if "NOT applied" in _n or "narrower" in _n:
+            st.sidebar.warning(_n)
+        else:
+            st.sidebar.caption(_n)
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("Data source")
 crypto_source = st.sidebar.radio(
     "Crypto prices from",
@@ -141,7 +176,7 @@ st.sidebar.caption(
 
 st.sidebar.markdown("---")
 st.sidebar.caption(f"curl_cffi installed: **{curl_cffi_is_available()}**")
-st.sidebar.caption(f"Crypto list: {len(CRYPTO_TICKERS)} symbols")
+st.sidebar.caption(f"Scannable crypto: {len(CRYPTO_TICKERS)} symbols")
 if coingecko.has_api_key():
     st.sidebar.caption("CoinGecko API key: **set** (higher rate limit)")
 else:
@@ -270,7 +305,7 @@ with tab_market:
                  DataStatus.STALE: "🟠", DataStatus.UNAVAILABLE: "🔴"}
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Instrument", quote.ticker)
-        m2.metric("Price", f"${quote.price:,.4f}" if quote.price else "—")
+        m2.metric("Price", f"${format_price(quote.price)}" if quote.price else "—")
         m3.metric("Status", f"{icons[quote.status]} {quote.status.value}")
         m4.metric("Interval", quote.interval)
 
@@ -381,13 +416,14 @@ with tab_scan:
             if ok:
                 table = pd.DataFrame([{
                     "Instrument": r.label,
+                    "Venue": "/".join(VENUE_TAGS.get(r.label, [])) or "—",
                     "Score": f"{r.score:.1f}",
                     "Grade": r.grade,
                     "Dir": r.direction or "—",
                     "Regime": r.regime.title(),
-                    "Price": f"{r.price:,.6g}" if r.price else "—",
-                    "Stop": f"{r.stop:,.6g}" if r.stop else "—",
-                    "Target": f"{r.target:,.6g}" if r.target else "—",
+                    "Price": format_price(r.price),
+                    "Stop": format_price(r.stop),
+                    "Target": format_price(r.target),
                     "R:R": f"{r.reward_risk:.2f}" if r.reward_risk else "—",
                 } for r in ok])
                 st.dataframe(table, use_container_width=True, hide_index=True)
@@ -506,7 +542,7 @@ with tab_scan:
             h1.metric("Instrument", analysis.ticker)
             h2.metric("1D regime", analysis.regime_1d.title())
             h3.metric("Direction", analysis.direction or "—")
-            h4.metric("Price", f"{analysis.current_price:,.6g}" if analysis.current_price else "—")
+            h4.metric("Price", format_price(analysis.current_price))
             if analysis.price_source:
                 st.caption(
                     f"Entry price taken from the latest **{analysis.price_source}** close. "
@@ -516,9 +552,9 @@ with tab_scan:
 
             if analysis.stop is not None and analysis.target is not None:
                 l1, l2, l3 = st.columns(3)
-                l1.metric("Entry", f"{analysis.entry:,.6g}")
-                l2.metric("Structural stop", f"{analysis.stop:,.6g}")
-                l3.metric("Structural target", f"{analysis.target:,.6g}")
+                l1.metric("Entry", format_price(analysis.entry))
+                l2.metric("Structural stop", format_price(analysis.stop))
+                l3.metric("Structural target", format_price(analysis.target))
                 if analysis.reward_risk is not None:
                     ok = analysis.reward_risk >= min_rr
                     (st.success if ok else st.warning)(
@@ -642,69 +678,242 @@ with tab_scan:
 # ---------------------------------------------------------------------
 with tab_positions:
     st.subheader("Open positions")
-    st.caption("Stored in the database — survives refreshes and app sleeps.")
+    st.caption(
+        "Live P/L, editable stop and target, scale-in checks, and one-click "
+        "closing into the journal. Stored in the database, so it survives refreshes."
+    )
 
-    with st.form("add_pos"):
-        p1, p2, p3, p4 = st.columns(4)
-        pa = p1.text_input("Asset")
-        pc = p2.selectbox("Class", ["crypto", "stock", "commodity", "forex"])
-        pd_ = p3.selectbox("Direction", ["Long", "Short"])
-        pq = p4.number_input("Quantity", min_value=0.0, step=0.01)
-        p5, p6 = st.columns(2)
-        pe = p5.number_input("Entry", min_value=0.0, step=0.01)
-        ps = p6.number_input("Stop", min_value=0.0, step=0.01)
-        if st.form_submit_button("Add position") and pa and pe > 0:
-            storage.add_position(pa, pc, pd_, pe, ps, pq)
-            st.success(f"Added {pd_} {pa}")
-            st.rerun()
+    pos_equity = st.number_input(
+        "Account equity ($) — used for risk percentages",
+        min_value=0.0, value=10000.0, step=100.0, key="pos_equity")
+    pos_max_risk = st.number_input(
+        "Max risk per trade (% of equity)", min_value=0.1, max_value=100.0,
+        value=1.0, step=0.1, key="pos_max_risk")
+
+    with st.expander("➕ Add a position"):
+        with st.form("add_pos"):
+            p1, p2, p3 = st.columns(3)
+            pa = p1.text_input("Asset (e.g. BTC-USD)")
+            pc = p2.selectbox("Class", ["crypto", "stock", "commodity", "forex"])
+            pdir = p3.selectbox("Direction", ["Long", "Short"])
+            p4, p5, p6 = st.columns(3)
+            pe = p4.number_input("Entry", min_value=0.0, format="%.8f")
+            ps = p5.number_input("Stop", min_value=0.0, format="%.8f")
+            pt = p6.number_input("Target (0 = none)", min_value=0.0, format="%.8f")
+            p7, p8 = st.columns(2)
+            pq = p7.number_input("Quantity", min_value=0.0, format="%.8f")
+            plev = p8.number_input("Leverage", min_value=1.0, value=1.0, step=0.5)
+            pnotes = st.text_area("Entry reason / notes")
+            if st.form_submit_button("Add position") and pa and pe > 0 and pq > 0:
+                storage.add_position(pa, pc, pdir, pe, ps, pq, target=pt or None,
+                                      leverage=plev, entry_reason=pnotes)
+                st.success(f"Added {pdir} {pa}")
+                st.rerun()
 
     rows = storage.get_positions()
     if not rows:
-        st.info("No open positions.")
+        st.info("No open positions. Add one above, or send levels from the Scanner.")
     else:
         positions = [OpenPosition(asset=r["asset"], asset_class=r["asset_class"],
                                    direction=r["direction"], entry=r["entry"],
                                    stop=r["stop"], quantity=r["quantity"],
-                                   contract_multiplier=r["contract_multiplier"])
+                                   contract_multiplier=r["contract_multiplier"] or 1.0)
                      for r in rows]
         summary = summarize_portfolio_risk(positions)
-        st.metric("Total open risk (to stops)", f"${summary.total_open_risk:,.2f}")
+        s1, s2 = st.columns(2)
+        s1.metric("Total open risk (to stops)", f"${summary.total_open_risk:,.2f}")
+        pct = (summary.total_open_risk / pos_equity * 100) if pos_equity else 0
+        s2.metric("As % of equity", f"{pct:.2f}%")
+        if pct > pos_max_risk * 3:
+            st.warning(
+                f"Total open risk is {pct:.1f}% of equity across {len(rows)} positions. "
+                f"Individually sized trades can still add up to concentrated exposure."
+            )
         for w in summary.concentration_warnings:
             st.warning(w)
 
-        for r, pos in zip(rows, positions):
-            with st.expander(f"{pos.direction} {pos.asset} · entry {pos.entry:g} · stop {pos.stop:g}"):
-                px = st.number_input("Current price", min_value=0.0, key=f"px{r['id']}")
-                inval = st.checkbox("Invalidation hit?", key=f"iv{r['id']}")
-                breach = st.checkbox("Risk rule breached?", key=f"rb{r['id']}")
-                tighten = st.checkbox("Structure supports tightening?", key=f"st{r['id']}")
+        st.markdown("---")
 
-                if px > 0:
-                    sm = StopManager(direction=pos.direction, entry=pos.entry,
-                                      current_stop=pos.stop, current_target=pos.stop)
-                    r_mult = sm.current_r_multiple(px)
-                    label = suggest_management_label(pos.direction, inval, breach, tighten, r_mult)
-                    a, b = st.columns(2)
-                    a.metric("Suggested action", label.value)
-                    b.metric("Current R", f"{r_mult:+.2f}R")
-                    if sm.suggest_transition_to_trailing(px):
-                        st.info("Past ~1.5R — consider moving to a structure-based trailing stop.")
-
-                new_stop = st.number_input("Move stop to", min_value=0.0,
-                                            value=float(pos.stop), key=f"ns{r['id']}")
-                cc1, cc2 = st.columns(2)
-                if cc1.button("Update stop", key=f"us{r['id']}"):
-                    tightening = (new_stop > pos.stop if pos.direction == "Long"
-                                   else new_stop < pos.stop)
-                    if not tightening:
-                        st.error("Refused — that widens risk. Never move a stop further from entry.")
-                    else:
-                        storage.update_position_stop(r["id"], new_stop)
-                        st.success("Stop updated.")
+        for r in rows:
+            pid = r["id"]
+            header = (f"{r['direction']} {r['asset']} · entry {format_price(r['entry'])} "
+                      f"· stop {format_price(r['stop'])}")
+            with st.expander(header):
+                # --- current price: auto-fetch for crypto, else manual ----
+                pxkey = f"px_{pid}"
+                cprice = st.session_state.get(pxkey, 0.0)
+                fc1, fc2 = st.columns([2, 1])
+                cprice = fc1.number_input("Current price", min_value=0.0,
+                                           value=float(cprice), format="%.8f",
+                                           key=f"cp_{pid}")
+                if fc2.button("↻ Fetch", key=f"fetch_{pid}"):
+                    px, src, err = exchanges.fetch_spot(r["asset"])
+                    if px is not None:
+                        st.session_state[f"cp_{pid}"] = float(px)
+                        st.success(f"{src}: {format_price(px)}")
                         st.rerun()
-                if cc2.button("Remove position", key=f"rm{r['id']}"):
-                    storage.delete_position(r["id"])
+                    else:
+                        st.error(f"Could not fetch: {err}")
+
+                snap = None
+                if cprice > 0:
+                    snap = PositionSnapshot(
+                        direction=r["direction"], entry=r["entry"], stop=r["stop"],
+                        target=r["target"], quantity=r["quantity"],
+                        current_price=cprice,
+                        contract_multiplier=r["contract_multiplier"] or 1.0)
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Unrealised P/L", f"${snap.unrealised_pl:,.2f}",
+                              f"{snap.unrealised_pct:+.2f}%")
+                    m2.metric("Current R", f"{snap.r_multiple:+.2f}R")
+                    m3.metric("If stop hit",
+                              f"${snap.loss_at_stop:,.2f}",
+                              "profit locked" if snap.loss_at_stop > 0 else "loss")
+                    if snap.profit_at_target is not None:
+                        m4.metric("If target hit", f"${snap.profit_at_target:,.2f}",
+                                  f"R:R {snap.reward_risk:.2f}" if snap.reward_risk else None)
+
+                    label = suggest_management_label(
+                        r["direction"], invalidation_hit=False, risk_rule_breached=False,
+                        structure_supports_tightening=False, r_multiple=snap.r_multiple)
+                    if snap.stop_is_protecting_profit:
+                        st.success(
+                            f"Stop is beyond entry — at least "
+                            f"${snap.loss_at_stop:,.2f} is locked in if it triggers.")
+                    elif snap.r_multiple >= 1.5:
+                        st.info(
+                            f"Up {snap.r_multiple:.2f}R. The rulebook suggests considering a "
+                            f"structure-based trailing stop past ~1.5R — only if real "
+                            f"structure supports it, not to escape normal noise.")
+                    st.caption(f"Suggested review label: **{label.value}** "
+                               f"(a prompt to think, not an instruction)")
+                else:
+                    st.caption("Enter or fetch a current price to see live P/L.")
+
+                # --- edit stop / target / size -----------------------------
+                st.markdown("##### Adjust levels")
+                e1, e2, e3 = st.columns(3)
+                new_stop = e1.number_input("Stop", min_value=0.0,
+                                            value=float(r["stop"]), format="%.8f",
+                                            key=f"ns_{pid}")
+                new_target = e2.number_input("Target (0 = none)", min_value=0.0,
+                                              value=float(r["target"] or 0.0),
+                                              format="%.8f", key=f"nt_{pid}")
+                new_qty = e3.number_input("Quantity", min_value=0.0,
+                                           value=float(r["quantity"]), format="%.8f",
+                                           key=f"nq_{pid}")
+
+                if st.button("Save changes", key=f"save_{pid}"):
+                    widening = (new_stop < r["stop"] if r["direction"] == "Long"
+                                else new_stop > r["stop"])
+                    if widening:
+                        st.error(
+                            f"Refused: moving the stop from {format_price(r['stop'])} to "
+                            f"{format_price(new_stop)} increases risk. Never move a stop "
+                            f"further from entry. Close the trade instead if the thesis broke."
+                        )
+                    else:
+                        storage.update_position(pid, stop=new_stop,
+                                                 target=new_target or None,
+                                                 quantity=new_qty)
+                        st.success("Updated.")
+                        st.rerun()
+
+                # --- scale in ---------------------------------------------
+                st.markdown("##### Add capital to this position")
+                a1, a2 = st.columns(2)
+                add_qty = a1.number_input("Quantity to add", min_value=0.0,
+                                           format="%.8f", key=f"aq_{pid}")
+                add_px = a2.number_input("At price", min_value=0.0,
+                                          value=float(cprice or r["entry"]),
+                                          format="%.8f", key=f"ap_{pid}")
+                preplanned = st.checkbox(
+                    "This addition was planned before entering the trade",
+                    key=f"pp_{pid}",
+                    help="The rulebook only permits adding to a losing position when "
+                         "that was decided in advance.")
+
+                if st.button("Assess adding", key=f"assess_{pid}"):
+                    if snap is None:
+                        st.error("Enter a current price first — the check needs to know "
+                                 "whether the position is in profit.")
+                    elif add_qty <= 0:
+                        st.error("Enter a quantity to add.")
+                    else:
+                        res = analyse_scale_in(snap, add_qty, add_px, pos_equity,
+                                                max_risk_pct=pos_max_risk,
+                                                preplanned=preplanned)
+                        box = {ScaleVerdict.ALLOWED: st.success,
+                               ScaleVerdict.CAUTION: st.warning,
+                               ScaleVerdict.BLOCKED: st.error}[res.verdict]
+                        box(f"**{res.verdict.value}**")
+                        for reason in res.reasons:
+                            st.caption(f"• {reason}")
+                        q1, q2, q3 = st.columns(3)
+                        q1.metric("New avg entry", format_price(res.new_average_entry))
+                        q2.metric("New total risk", f"${res.new_total_risk:,.2f}",
+                                  f"{res.new_risk_pct_of_equity:.2f}% of equity")
+                        if res.new_reward_risk is not None:
+                            q3.metric("New R:R", f"{res.new_reward_risk:.2f}")
+
+                        if res.verdict is not ScaleVerdict.BLOCKED:
+                            if st.button("Apply this addition", key=f"apply_{pid}"):
+                                storage.update_position(
+                                    pid, entry=res.new_average_entry,
+                                    quantity=res.new_quantity)
+                                st.success("Position updated with the new average entry.")
+                                st.rerun()
+
+                # --- close into journal ------------------------------------
+                st.markdown("##### Close this trade")
+                c1, c2 = st.columns(2)
+                exit_px = c1.number_input("Exit price", min_value=0.0,
+                                           value=float(cprice or r["entry"]),
+                                           format="%.8f", key=f"ex_{pid}")
+                exit_reason = c2.text_input("Exit reason", key=f"er_{pid}",
+                                             placeholder="Target hit / stopped / thesis broke")
+                if exit_px > 0:
+                    preview = PositionSnapshot(
+                        direction=r["direction"], entry=r["entry"], stop=r["stop"],
+                        target=r["target"], quantity=r["quantity"],
+                        current_price=exit_px,
+                        contract_multiplier=r["contract_multiplier"] or 1.0)
+                    realised = preview.realised_pl(exit_px)
+                    st.caption(f"Realised P/L at that exit: **${realised:,.2f}**")
+
+                if st.button("✅ Close and log to journal", key=f"close_{pid}"):
+                    if exit_px <= 0:
+                        st.error("Enter an exit price.")
+                    else:
+                        preview = PositionSnapshot(
+                            direction=r["direction"], entry=r["entry"], stop=r["stop"],
+                            target=r["target"], quantity=r["quantity"],
+                            current_price=exit_px,
+                            contract_multiplier=r["contract_multiplier"] or 1.0)
+                        realised = preview.realised_pl(exit_px)
+                        jid = storage.add_journal_entry({
+                            "asset": r["asset"], "direction": r["direction"],
+                            "leverage": r["leverage"] or 1.0, "entry": r["entry"],
+                            "sl": r["stop"], "tp": r["target"] or 0.0,
+                            "size_notional_usd": preview.notional,
+                            "potential_profit_at_tp": preview.profit_at_target or 0.0,
+                            "potential_loss_at_sl": preview.loss_at_stop,
+                            "entry_reason": r["entry_reason"] or "",
+                            "status": "Closed", "realized_pnl": realised,
+                            "exit_reason": exit_reason or "Closed from Positions tab",
+                            "pl_status": ("Win" if realised > 0 else
+                                          "Loss" if realised < 0 else "Breakeven"),
+                        })
+                        storage.delete_position(pid)
+                        st.success(f"Logged to journal as entry #{jid} "
+                                   f"(realised ${realised:,.2f}) and removed from positions.")
+                        st.rerun()
+
+                if st.button("🗑 Remove without logging", key=f"rm_{pid}"):
+                    storage.delete_position(pid)
                     st.rerun()
+
 
 # ---------------------------------------------------------------------
 # TAB: Risk calculator

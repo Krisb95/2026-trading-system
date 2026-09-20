@@ -193,3 +193,109 @@ def calculate_risk(
         instrument_type=spec.instrument_type,
         warnings=warnings,
     )
+
+
+# ---------------------------------------------------------------------
+# Live position P&L
+#
+# Distinct from calculate_risk() above: that sizes a NEW trade from an account
+# risk budget. This values an EXISTING position where the quantity is already
+# known and fixed.
+# ---------------------------------------------------------------------
+
+@dataclass
+class PositionPnL:
+    notional: float
+    margin_required: float
+    unrealized_pnl: Optional[float]      # None when no current price is known
+    unrealized_r: Optional[float]
+    potential_profit_at_target: Optional[float]
+    potential_loss_at_stop: float
+    round_trip_costs: float
+    net_profit_at_target: Optional[float]
+    net_loss_at_stop: float
+    reward_risk: Optional[float]
+    risk_per_unit: float
+    warnings: list = field(default_factory=list)
+
+
+def position_pnl(entry: float, stop: float, quantity: float, direction: str,
+                  target: Optional[float] = None, current_price: Optional[float] = None,
+                  contract_multiplier: float = 1.0, leverage: float = 1.0,
+                  fee_rate: float = 0.0, slippage_pct: float = 0.0) -> PositionPnL:
+    """Value an open position: unrealized P&L now, plus outcomes at stop/target.
+
+    Reward:risk here is NET of estimated round-trip costs, because a trade that
+    looks like 2:1 gross can fall below that once fees and slippage are paid —
+    which matters when the rulebook sets a 2:1 minimum.
+    """
+    direction = direction.capitalize()
+    if direction not in ("Long", "Short"):
+        raise InvalidRiskInputError(f"direction must be 'Long' or 'Short', got {direction!r}")
+    if entry <= 0:
+        raise InvalidRiskInputError("entry must be positive")
+    if quantity < 0:
+        raise InvalidRiskInputError("quantity cannot be negative")
+    if leverage <= 0:
+        raise InvalidRiskInputError("leverage must be positive")
+
+    warnings = []
+    unit = quantity * contract_multiplier
+    notional = entry * unit
+    margin_required = notional / leverage
+    costs = notional * (fee_rate + slippage_pct)
+
+    if direction == "Long":
+        risk_per_unit = entry - stop
+        if risk_per_unit <= 0:
+            warnings.append("Stop is at or above entry for a Long — this locks in a loss "
+                             "rather than limiting one.")
+        reward_per_unit = (target - entry) if target else None
+    else:
+        risk_per_unit = stop - entry
+        if risk_per_unit <= 0:
+            warnings.append("Stop is at or below entry for a Short — this locks in a loss "
+                             "rather than limiting one.")
+        reward_per_unit = (entry - target) if target else None
+
+    gross_loss_at_stop = abs(risk_per_unit) * unit
+    net_loss_at_stop = gross_loss_at_stop + costs
+
+    potential_profit = net_profit = reward_risk = None
+    if reward_per_unit is not None:
+        potential_profit = reward_per_unit * unit
+        net_profit = potential_profit - costs
+        if net_loss_at_stop > 0:
+            reward_risk = net_profit / net_loss_at_stop
+        if reward_per_unit <= 0:
+            warnings.append("Target is on the wrong side of entry for this direction.")
+
+    unrealized = unrealized_r = None
+    if current_price is not None and current_price > 0:
+        move = (current_price - entry) if direction == "Long" else (entry - current_price)
+        unrealized = move * unit
+        if risk_per_unit > 0:
+            unrealized_r = move / risk_per_unit
+
+    return PositionPnL(
+        notional=notional, margin_required=margin_required,
+        unrealized_pnl=unrealized, unrealized_r=unrealized_r,
+        potential_profit_at_target=potential_profit,
+        potential_loss_at_stop=gross_loss_at_stop,
+        round_trip_costs=costs,
+        net_profit_at_target=net_profit, net_loss_at_stop=net_loss_at_stop,
+        reward_risk=reward_risk, risk_per_unit=abs(risk_per_unit),
+        warnings=warnings,
+    )
+
+
+def realized_pnl(entry: float, exit_price: float, quantity: float, direction: str,
+                  contract_multiplier: float = 1.0, fee_rate: float = 0.0,
+                  slippage_pct: float = 0.0) -> float:
+    """Net realized P&L for a closed trade, after round-trip costs."""
+    direction = direction.capitalize()
+    unit = quantity * contract_multiplier
+    move = (exit_price - entry) if direction == "Long" else (entry - exit_price)
+    gross = move * unit
+    costs = (entry * unit) * (fee_rate + slippage_pct)
+    return gross - costs
