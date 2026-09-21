@@ -56,6 +56,8 @@ class CandidateAnalysis:
     key_levels: Dict[str, float] = field(default_factory=dict)
     data_problems: List[str] = field(default_factory=list)
     level_reason: str = ""
+    entry_plan: Optional["EntryPlan"] = None
+    entry_is_planned: bool = False   # True when entry came from a zone, not spot
     price_source: Optional[str] = None
     price_time = None
 
@@ -477,13 +479,28 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
 
     # --- derive levels from confirmed structure -----------------------
     entry = price
+    entry_plan = None
+    entry_is_planned = False
     stop = target = rr = None
     level_reason = "No direction — levels not derived."
+
     if direction:
+        # Prefer a PLANNED entry at a confluence zone over entering at market.
+        # Reward:risk measured from the zone is the reward:risk the setup
+        # actually offers; measured from spot it is just an accident of timing.
+        entry_plan = derive_entry_zone(df_4h, price, direction)
+        if entry_plan is not None and entry_plan.status in (ENTRY_AT_ZONE, ENTRY_APPROACHING):
+            entry = entry_plan.reference
+            entry_is_planned = True
         stop, target, rr, level_reason = derive_levels(df_4h, entry, direction, min_rr=min_rr)
 
     analysis.entry, analysis.stop, analysis.target, analysis.reward_risk = entry, stop, target, rr
     analysis.level_reason = level_reason
+    analysis.entry_plan = entry_plan
+    analysis.entry_is_planned = entry_is_planned
+    if entry_plan is not None:
+        analysis.key_levels["entry_zone_low"] = entry_plan.zone_low
+        analysis.key_levels["entry_zone_high"] = entry_plan.zone_high
     if stop is not None:
         analysis.key_levels["structural_stop"] = stop
     if target is not None:
@@ -564,18 +581,22 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
         ev["opposing_liquidity_ahead"] = EvidenceItem(None, "No direction — cannot check the path.")
 
     extended, ext_reason = is_extended(df_4h, price)
-    ev["chasing_extended_move"] = EvidenceItem(extended, ext_reason)
+    if entry_plan is not None and entry_plan.status == ENTRY_MISSED:
+        ev["chasing_extended_move"] = EvidenceItem(
+            True, f"Price has already run through the entry zone. {ext_reason}")
+    else:
+        ev["chasing_extended_move"] = EvidenceItem(extended, ext_reason)
 
     analysis.score_evidence = ev
 
     # --- entry-sequence evidence --------------------------------------
     seq: Dict[str, EvidenceItem] = {}
-    seq["location"] = EvidenceItem(
-        bool(ev["support_resistance"].value) or bool(ev["fib_confluence"].value),
-        "At a confirmed level and/or Fibonacci confluence."
-        if (ev["support_resistance"].value or ev["fib_confluence"].value)
-        else "Price is not at a meaningful level or Fib confluence."
-    )
+    if entry_plan is None:
+        seq["location"] = EvidenceItem(
+            False, "No confluence zone could be derived from confirmed structure.")
+    else:
+        seq["location"] = EvidenceItem(
+            entry_plan.status == ENTRY_AT_ZONE, entry_plan.rationale)
     seq["liquidity_event"] = EvidenceItem(
         bool(ev["liquidity_sweep_reclaim"].value),
         ev["liquidity_sweep_reclaim"].reason
@@ -634,6 +655,7 @@ class RankedCandidate:
     reward_risk: Optional[float]
     note: str = ""
     error: Optional[str] = None
+    entry_status: Optional[str] = None
 
 
 def scan_universe(instruments, frame_loader, min_rr: float = 2.0,
@@ -675,7 +697,9 @@ def scan_universe(instruments, frame_loader, min_rr: float = 2.0,
                 regime=analysis.regime_1d, price=analysis.current_price,
                 stop=analysis.stop, target=analysis.target,
                 reward_risk=analysis.reward_risk,
-                note=analysis.level_reason))
+                note=analysis.level_reason,
+                entry_status=(analysis.entry_plan.status
+                              if analysis.entry_plan else None)))
         except Exception as e:
             results.append(RankedCandidate(
                 ticker=ticker, label=label, direction=None, score=0.0, grade="—",
@@ -689,3 +713,160 @@ def scan_universe(instruments, frame_loader, min_rr: float = 2.0,
     results.sort(key=lambda r: (r.error is None, r.score, r.reward_risk or 0),
                   reverse=True)
     return results
+
+
+# ---------------------------------------------------------------------
+# Entry zones
+#
+# The strategy is "wait for price to reach a location, then confirm" — not
+# "enter at whatever the market is right now". Entering at market takes
+# whatever reward:risk happens to exist at this second; entering at a planned
+# level takes the reward:risk the setup actually offers.
+#
+# An entry zone is built from CONFLUENCE: a confirmed swing level that also
+# coincides with a Fibonacci retracement and/or an equal-high/low cluster is
+# stronger than any one of those alone. Confluence count is reported so a
+# one-source zone is never presented as though it were three.
+# ---------------------------------------------------------------------
+
+ENTRY_AT_ZONE = "AT_ZONE"
+ENTRY_APPROACHING = "APPROACHING"
+ENTRY_FAR = "FAR"
+ENTRY_MISSED = "MISSED"
+
+
+@dataclass
+class EntryPlan:
+    zone_low: float
+    zone_high: float
+    reference: float               # midpoint — used for R:R maths
+    status: str                    # AT_ZONE / APPROACHING / FAR / MISSED
+    order_type: str                # "Market" / "Limit" / "Wait" / "None"
+    distance_pct: float            # current price to the nearest zone edge
+    distance_atr: float
+    confluence: int                # how many independent sources agree
+    sources: List[str] = field(default_factory=list)
+    rationale: str = ""
+
+
+def _fib_levels_for(df: pd.DataFrame, direction: str) -> Dict[str, float]:
+    swings = [s for s in find_swing_points(df, left=2, right=2) if s.confirmed]
+    highs = [s for s in swings if s.kind == "high"]
+    lows = [s for s in swings if s.kind == "low"]
+    if not highs or not lows:
+        return {}
+    last_high = max(highs, key=lambda s: s.index)
+    last_low = max(lows, key=lambda s: s.index)
+    if last_high.price <= last_low.price:
+        return {}
+    try:
+        return fib_levels(last_low.price, last_high.price, direction)
+    except ValueError:
+        return {}
+
+
+def derive_entry_zone(df_4h: pd.DataFrame, current_price: float, direction: str,
+                       zone_atr: float = 0.35, approach_atr: float = 3.0,
+                       confluence_tolerance: float = 0.01) -> Optional[EntryPlan]:
+    """Find the best confluence level to enter FROM, rather than entering at market.
+
+    For a Long this looks BELOW current price (you want to buy a pullback into
+    support); for a Short, ABOVE it. Levels already passed through are not
+    offered — if price has traded through the zone the setup is MISSED, which
+    is information, not a reason to enter late.
+    """
+    if df_4h is None or df_4h.empty or current_price <= 0 or direction not in ("Long", "Short"):
+        return None
+
+    atr = atr_value(df_4h)
+    if not atr:
+        return None
+
+    swings = [s for s in find_swing_points(df_4h, left=2, right=2) if s.confirmed]
+    if not swings:
+        return None
+
+    clusters = find_equal_levels(swings, tolerance_pct=0.003)
+    fibs = _fib_levels_for(df_4h, direction)
+
+    # Candidate levels on the correct side of price.
+    candidates: Dict[float, List[str]] = {}
+
+    def _add(price_level: float, source: str):
+        if price_level <= 0:
+            return
+        on_correct_side = (price_level < current_price if direction == "Long"
+                           else price_level > current_price)
+        if not on_correct_side:
+            return
+        for existing in list(candidates):
+            if abs(existing - price_level) / existing <= confluence_tolerance:
+                candidates[existing].append(source)
+                return
+        candidates[price_level] = [source]
+
+    wanted_kind = "low" if direction == "Long" else "high"
+    for s in swings:
+        if s.kind == wanted_kind:
+            _add(s.price, "confirmed swing")
+    for c in clusters:
+        if c["kind"] == wanted_kind and c["touches"] >= 2:
+            _add(c["price_avg"], f"equal {wanted_kind}s x{c['touches']}")
+    for name, level in fibs.items():
+        if name.startswith("retr_"):
+            _add(level, f"fib {name.replace('retr_', '')}")
+
+    if not candidates:
+        return None
+
+    # Prefer the most confluent zone; break ties by proximity to price.
+    best_level = max(candidates,
+                      key=lambda lv: (len(set(candidates[lv])),
+                                      -abs(lv - current_price)))
+    sources = sorted(set(candidates[best_level]))
+    confluence = len(sources)
+
+    half = atr * zone_atr
+    zone_low, zone_high = best_level - half, best_level + half
+
+    if zone_low <= current_price <= zone_high:
+        status, order_type = ENTRY_AT_ZONE, "Market"
+        distance = 0.0
+    else:
+        nearest_edge = zone_high if current_price > zone_high else zone_low
+        distance = abs(current_price - nearest_edge)
+        within_reach = distance <= atr * approach_atr
+        if direction == "Long":
+            passed_through = current_price < zone_low
+        else:
+            passed_through = current_price > zone_high
+        if passed_through:
+            status, order_type = ENTRY_MISSED, "None"
+        elif within_reach:
+            status, order_type = ENTRY_APPROACHING, "Limit"
+        else:
+            status, order_type = ENTRY_FAR, "Wait"
+
+    distance_pct = distance / current_price * 100 if current_price else 0.0
+    distance_atr = distance / atr if atr else 0.0
+
+    if status == ENTRY_AT_ZONE:
+        rationale = (f"Price is inside the zone {_fp(zone_low)}–{_fp(zone_high)} "
+                      f"({confluence} source(s): {', '.join(sources)}). Confirmation on the "
+                      f"entry timeframe is what turns this into a trade.")
+    elif status == ENTRY_APPROACHING:
+        rationale = (f"Zone {_fp(zone_low)}–{_fp(zone_high)} sits {distance_pct:.2f}% "
+                      f"({distance_atr:.1f} ATR) away — a resting limit order is the "
+                      f"appropriate instrument, not a market buy here.")
+    elif status == ENTRY_FAR:
+        rationale = (f"Nearest zone is {distance_pct:.2f}% ({distance_atr:.1f} ATR) away. "
+                      f"Too far to be actionable — this is a watchlist item, not a trade.")
+    else:
+        rationale = (f"Price has already traded through the zone "
+                      f"{_fp(zone_low)}–{_fp(zone_high)}. The location is spent; chasing "
+                      f"it now is exactly the extended entry the rulebook warns against.")
+
+    return EntryPlan(zone_low=zone_low, zone_high=zone_high, reference=best_level,
+                      status=status, order_type=order_type, distance_pct=distance_pct,
+                      distance_atr=distance_atr, confluence=confluence,
+                      sources=sources, rationale=rationale)

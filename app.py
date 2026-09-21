@@ -33,7 +33,7 @@ import venues as venues_mod
 import storage
 from formatting import format_price
 
-APP_BUILD = "2026-09-20-b15 (venue filter, small-price text fix)"
+APP_BUILD = "2026-09-20-b16 (planned entry zones)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -425,6 +425,7 @@ with tab_scan:
                     "Stop": format_price(r.stop),
                     "Target": format_price(r.target),
                     "R:R": f"{r.reward_risk:.2f}" if r.reward_risk else "—",
+                    "Entry": r.entry_status or "—",
                 } for r in ok])
                 st.dataframe(table, use_container_width=True, hide_index=True)
 
@@ -549,6 +550,26 @@ with tab_scan:
                     f"If this differs from the Market tab, one of them is a slightly older bar — "
                     f"always confirm against your broker before entering."
                 )
+
+            plan = analysis.entry_plan
+            if plan is not None:
+                badge = {"AT_ZONE": "🟢 AT ZONE", "APPROACHING": "🟡 APPROACHING",
+                         "FAR": "⚪ TOO FAR", "MISSED": "🔴 MISSED"}[plan.status]
+                st.markdown(f"##### Entry plan · {badge} · order type: **{plan.order_type}**")
+                z1, z2, z3 = st.columns(3)
+                z1.metric("Entry zone",
+                          f"{format_price(plan.zone_low)} – {format_price(plan.zone_high)}")
+                z2.metric("Distance to zone", f"{plan.distance_pct:.2f}%",
+                          f"{plan.distance_atr:.1f} ATR")
+                z3.metric("Confluence", f"{plan.confluence} source(s)")
+                st.caption(f"{plan.rationale}  \nSources: {', '.join(plan.sources)}")
+                if plan.confluence == 1:
+                    st.caption("⚠️ Only one source supports this level — weaker than a "
+                               "zone where a swing, a Fib level and equal highs/lows agree.")
+                if analysis.entry_is_planned:
+                    st.caption("Reward:risk below is measured from the **planned entry**, "
+                               "not from the current price.")
+            st.markdown("---")
 
             if analysis.stop is not None and analysis.target is not None:
                 l1, l2, l3 = st.columns(3)

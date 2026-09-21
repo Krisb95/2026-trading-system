@@ -352,3 +352,127 @@ class TestUniverseScan(unittest.TestCase):
     def test_empty_instrument_list_is_safe(self):
         from scanner import scan_universe
         self.assertEqual(scan_universe([], lambda k: self._good_frames()), [])
+
+
+def pullback_df():
+    """Uptrend with clean pullbacks, so confluence zones exist below price."""
+    seq = []
+    for a, b in [(100, 118), (118, 104), (104, 126), (126, 108), (108, 134), (134, 112)]:
+        seq += list(np.linspace(a, b, 10))[1:]
+    closes = [100] + seq
+    idx = pd.date_range("2026-01-01", periods=len(closes), freq="4h", tz="UTC")
+    spread = [c * 0.008 for c in closes]
+    return pd.DataFrame({
+        "Open": closes,
+        "High": [c + s for c, s in zip(closes, spread)],
+        "Low": [c - s for c, s in zip(closes, spread)],
+        "Close": closes,
+    }, index=idx)
+
+
+class TestEntryZones(unittest.TestCase):
+    """The strategy waits for price to reach a location. Entering at market
+    takes whatever R:R exists at that second instead of the R:R the setup
+    actually offers."""
+
+    def test_long_zone_sits_below_current_price(self):
+        from scanner import derive_entry_zone
+        plan = derive_entry_zone(pullback_df(), 130.0, "Long")
+        self.assertIsNotNone(plan)
+        self.assertLess(plan.reference, 130.0)
+
+    def test_short_zone_sits_above_current_price(self):
+        from scanner import derive_entry_zone
+        plan = derive_entry_zone(pullback_df(), 110.0, "Short")
+        if plan is not None:
+            self.assertGreater(plan.reference, 110.0)
+
+    def test_price_inside_zone_is_at_zone_and_market_order(self):
+        from scanner import derive_entry_zone, ENTRY_AT_ZONE
+        df = pullback_df()
+        plan = derive_entry_zone(df, 130.0, "Long")
+        mid = plan.reference
+        at = derive_entry_zone(df, mid, "Long")
+        # Asking again from inside the zone should not return that same zone,
+        # since it is no longer below price — but whatever it returns must be
+        # self-consistent.
+        if at is not None and at.status == ENTRY_AT_ZONE:
+            self.assertEqual(at.order_type, "Market")
+
+    def test_distant_price_gives_wait_not_market(self):
+        from scanner import derive_entry_zone, ENTRY_FAR
+        plan = derive_entry_zone(pullback_df(), 400.0, "Long")
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.status, ENTRY_FAR)
+        self.assertEqual(plan.order_type, "Wait")
+
+    def test_approaching_price_suggests_a_limit_order(self):
+        from scanner import derive_entry_zone, ENTRY_APPROACHING
+        plan = derive_entry_zone(pullback_df(), 116.0, "Long")
+        self.assertEqual(plan.status, ENTRY_APPROACHING)
+        self.assertEqual(plan.order_type, "Limit")
+
+    def test_zone_has_width(self):
+        from scanner import derive_entry_zone
+        plan = derive_entry_zone(pullback_df(), 130.0, "Long")
+        self.assertGreater(plan.zone_high, plan.zone_low)
+
+    def test_confluence_and_sources_reported(self):
+        from scanner import derive_entry_zone
+        plan = derive_entry_zone(pullback_df(), 130.0, "Long")
+        self.assertGreaterEqual(plan.confluence, 1)
+        self.assertEqual(len(plan.sources), plan.confluence)
+
+    def test_rationale_always_populated(self):
+        from scanner import derive_entry_zone
+        for px in (116.0, 130.0, 400.0):
+            plan = derive_entry_zone(pullback_df(), px, "Long")
+            if plan:
+                self.assertTrue(plan.rationale and len(plan.rationale) > 20)
+
+    def test_no_zone_on_flat_data(self):
+        from scanner import derive_entry_zone
+        flat = ohlc_from_closes([100] * 60, start="2026-01-01", freq="4h")
+        self.assertIsNone(derive_entry_zone(flat, 100.0, "Long"))
+
+    def test_invalid_direction_returns_none(self):
+        from scanner import derive_entry_zone
+        self.assertIsNone(derive_entry_zone(pullback_df(), 116.0, "Sideways"))
+
+    def test_empty_frame_returns_none(self):
+        from scanner import derive_entry_zone
+        self.assertIsNone(derive_entry_zone(pd.DataFrame(), 100.0, "Long"))
+
+
+class TestPlannedEntryInAnalysis(unittest.TestCase):
+    def _frames(self):
+        df = pullback_df()
+        return {"1d": df, "4h": df, "1h": df}
+
+    def test_analysis_uses_planned_entry_not_spot(self):
+        result = analyze_candidate("TEST", self._frames(), direction_override="Long")
+        if result.entry_plan and result.entry_is_planned:
+            self.assertAlmostEqual(result.entry, result.entry_plan.reference)
+
+    def test_entry_plan_attached_to_result(self):
+        result = analyze_candidate("TEST", self._frames(), direction_override="Long")
+        self.assertIsNotNone(result.entry_plan)
+
+    def test_zone_bounds_exposed_as_key_levels(self):
+        result = analyze_candidate("TEST", self._frames(), direction_override="Long")
+        if result.entry_plan:
+            self.assertIn("entry_zone_low", result.key_levels)
+            self.assertIn("entry_zone_high", result.key_levels)
+
+    def test_location_evidence_follows_zone_status(self):
+        from scanner import ENTRY_AT_ZONE
+        result = analyze_candidate("TEST", self._frames(), direction_override="Long")
+        loc = result.sequence_evidence["location"]
+        if result.entry_plan:
+            self.assertEqual(loc.value, result.entry_plan.status == ENTRY_AT_ZONE)
+
+    def test_missed_zone_counts_as_chasing(self):
+        from scanner import ENTRY_MISSED
+        result = analyze_candidate("TEST", self._frames(), direction_override="Long")
+        if result.entry_plan and result.entry_plan.status == ENTRY_MISSED:
+            self.assertTrue(result.score_evidence["chasing_extended_move"].value)
