@@ -399,12 +399,15 @@ class TestEntryZones(unittest.TestCase):
         if at is not None and at.status == ENTRY_AT_ZONE:
             self.assertEqual(at.order_type, "Market")
 
-    def test_distant_price_gives_wait_not_market(self):
+    def test_distant_zone_is_a_distant_limit_not_a_market_order(self):
+        """A far zone is still the planned entry — a resting limit that may
+        take time to fill — never a reason to enter at market."""
         from scanner import derive_entry_zone, ENTRY_FAR
         plan = derive_entry_zone(pullback_df(), 400.0, "Long")
         self.assertIsNotNone(plan)
         self.assertEqual(plan.status, ENTRY_FAR)
-        self.assertEqual(plan.order_type, "Wait")
+        self.assertNotEqual(plan.order_type, "Market")
+        self.assertIn("Limit", plan.order_type)
 
     def test_approaching_price_suggests_a_limit_order(self):
         from scanner import derive_entry_zone, ENTRY_APPROACHING
@@ -476,3 +479,104 @@ class TestPlannedEntryInAnalysis(unittest.TestCase):
         result = analyze_candidate("TEST", self._frames(), direction_override="Long")
         if result.entry_plan and result.entry_plan.status == ENTRY_MISSED:
             self.assertTrue(result.score_evidence["chasing_extended_move"].value)
+
+
+
+def extended_uptrend_df():
+    """Uptrend currently extended well above its pullback levels (SOL-like)."""
+    seq = [80]
+    for a, b in [(80, 95), (95, 86), (86, 104), (104, 93), (93, 115), (115, 101), (101, 124)]:
+        seq += list(np.linspace(a, b, 10))[1:]
+    idx = pd.date_range("2026-01-01", periods=len(seq), freq="4h", tz="UTC")
+    sp = [x * 0.008 for x in seq]
+    return pd.DataFrame({"Open": seq, "High": [x + s for x, s in zip(seq, sp)],
+                          "Low": [x - s for x, s in zip(seq, sp)], "Close": seq}, index=idx)
+
+
+class TestBetterThanMarketEntries(unittest.TestCase):
+    """Regression tests for the reported bug: the entry shown was the live
+    price even when the plan said to wait for a zone."""
+
+    def _analyse(self):
+        df = extended_uptrend_df()
+        return analyze_candidate("SOL-USD", {"1d": df, "4h": df, "1h": df, "5m": df},
+                                  direction_override="Long")
+
+    def test_entry_is_not_the_live_price(self):
+        a = self._analyse()
+        self.assertTrue(a.entry_is_planned)
+        self.assertNotAlmostEqual(a.entry, a.current_price, places=2)
+
+    def test_long_entry_is_below_live_price(self):
+        a = self._analyse()
+        self.assertLess(a.entry, a.current_price)
+
+    def test_planned_entry_beats_market_reward_risk(self):
+        from scanner import derive_levels
+        a = self._analyse()
+        _, _, market_rr, _ = derive_levels(extended_uptrend_df(), a.current_price,
+                                            "Long", min_rr=2.0)
+        self.assertGreater(a.reward_risk, market_rr)
+
+    def test_chosen_zone_clears_minimum_rr_when_one_exists(self):
+        a = self._analyse()
+        self.assertGreaterEqual(a.reward_risk, 2.0)
+
+    def test_deeper_zone_chosen_when_nearest_fails_rr(self):
+        a = self._analyse()
+        self.assertIn("deeper zone was chosen", a.level_reason)
+
+    def test_alternatives_are_exposed(self):
+        a = self._analyse()
+        self.assertTrue(len(a.alternative_zones) >= 1)
+        self.assertNotIn(a.entry_plan, a.alternative_zones)
+
+    def test_stop_uses_a_swing_low_not_an_old_high(self):
+        from technical import find_swing_points
+        df = extended_uptrend_df()
+        a = self._analyse()
+        lows = [s.price for s in find_swing_points(df, 2, 2)
+                if s.confirmed and s.kind == "low"]
+        # stop = a confirmed swing low minus a small ATR buffer
+        self.assertTrue(any(abs(a.stop - lo) / lo < 0.02 for lo in lows))
+
+
+class TestRecentExtreme(unittest.TestCase):
+    def test_long_extreme_is_the_live_high(self):
+        from scanner import recent_extreme
+        df = extended_uptrend_df()
+        self.assertAlmostEqual(recent_extreme(df, "Long"), df["High"].iloc[-10:].max(), places=4)
+
+    def test_fibs_anchor_on_current_leg(self):
+        from scanner import _fib_levels_for
+        fibs = _fib_levels_for(extended_uptrend_df(), "Long")
+        self.assertTrue(fibs)
+        # 0.382 of the ~101 -> ~125 leg sits near 115-116, not on the older leg
+        self.assertTrue(113 < fibs["retr_0.382"] < 118)
+
+    def test_empty_frame_safe(self):
+        from scanner import recent_extreme
+        self.assertIsNone(recent_extreme(pd.DataFrame(), "Long"))
+
+
+class TestZoneRanking(unittest.TestCase):
+    def test_confluence_can_outweigh_small_distance(self):
+        from scanner import rank_zones, EntryPlan, ENTRY_APPROACHING
+        near_weak = EntryPlan(99, 101, 100, ENTRY_APPROACHING, "Limit", 1.0, 1.0, 1, ["a"])
+        far_strong = EntryPlan(94, 96, 95, ENTRY_APPROACHING, "Limit", 5.0, 2.5, 3,
+                                ["a", "b", "c"])
+        self.assertIs(rank_zones([near_weak, far_strong])[0], far_strong)
+
+    def test_very_distant_zone_does_not_win_over_reachable_one(self):
+        from scanner import rank_zones, EntryPlan, ENTRY_APPROACHING, ENTRY_FAR
+        near = EntryPlan(99, 101, 100, ENTRY_APPROACHING, "Limit", 1.0, 1.0, 1, ["a"])
+        remote = EntryPlan(40, 42, 41, ENTRY_FAR, "Limit (distant)", 60.0, 20.0, 4,
+                            ["a", "b", "c", "d"])
+        self.assertIs(rank_zones([near, remote], max_distance_atr=8.0)[0], near)
+
+    def test_missed_zones_sort_last(self):
+        from scanner import rank_zones, EntryPlan, ENTRY_APPROACHING, ENTRY_MISSED
+        ok = EntryPlan(99, 101, 100, ENTRY_APPROACHING, "Limit", 1.0, 1.0, 1, ["a"])
+        missed = EntryPlan(109, 111, 110, ENTRY_MISSED, "None", 0.0, 0.0, 5,
+                            ["a", "b", "c", "d", "e"])
+        self.assertIs(rank_zones([missed, ok])[-1], missed)

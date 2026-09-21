@@ -33,7 +33,7 @@ import venues as venues_mod
 import storage
 from formatting import format_price
 
-APP_BUILD = "2026-09-20-b16 (planned entry zones)"
+APP_BUILD = "2026-09-20-b17 (entries better than market)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -566,9 +566,21 @@ with tab_scan:
                 if plan.confluence == 1:
                     st.caption("⚠️ Only one source supports this level — weaker than a "
                                "zone where a swing, a Fib level and equal highs/lows agree.")
-                if analysis.entry_is_planned:
-                    st.caption("Reward:risk below is measured from the **planned entry**, "
-                               "not from the current price.")
+                if analysis.entry_is_planned and analysis.current_price:
+                    gap = (analysis.current_price - analysis.entry) / analysis.current_price * 100
+                    st.info(
+                        f"Planned entry **{format_price(analysis.entry)}** vs live "
+                        f"**{format_price(analysis.current_price)}** "
+                        f"({abs(gap):.1f}% {'better' if (gap > 0) == (analysis.direction == 'Long') else 'worse'}). "
+                        f"Stop, target and reward:risk below are all measured from the "
+                        f"planned entry, not the live price.")
+                if analysis.alternative_zones:
+                    with st.expander(f"Other candidate zones ({len(analysis.alternative_zones)})"):
+                        for z in analysis.alternative_zones:
+                            st.caption(
+                                f"**{format_price(z.zone_low)} – {format_price(z.zone_high)}** · "
+                                f"{z.status} · {z.distance_pct:.2f}% away · "
+                                f"{z.confluence} source(s): {', '.join(z.sources)}")
             st.markdown("---")
 
             if analysis.stop is not None and analysis.target is not None:
