@@ -235,3 +235,127 @@ def clear_all(db_path: str = DEFAULT_DB_PATH) -> None:
     with _connect(db_path) as conn:
         conn.execute("DELETE FROM journal")
         conn.execute("DELETE FROM positions")
+
+
+# ---------------------------------------------------------------------
+# Forward-tracked signals
+#
+# Every B-or-better setup the scanner produces is recorded here with the
+# exact plan (entry, stop, target) at the moment it was generated. Later, the
+# outcome is resolved against real prices that came afterwards. This builds a
+# genuine out-of-sample track record — the plan is fixed before the result is
+# known, so there is no way to fit the rules to the outcome.
+# ---------------------------------------------------------------------
+
+SIGNAL_COLUMNS = [
+    "id", "created_utc", "ticker", "label", "direction", "score", "grade",
+    "entry", "stop", "target", "planned_rr", "expiry_hours", "status",
+    "fill_utc", "exit_utc", "r_result", "last_checked_utc", "source",
+]
+
+
+def _ensure_signals_table(conn) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_utc TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            label TEXT,
+            direction TEXT NOT NULL,
+            score REAL,
+            grade TEXT,
+            entry REAL NOT NULL,
+            stop REAL NOT NULL,
+            target REAL NOT NULL,
+            planned_rr REAL,
+            expiry_hours REAL DEFAULT 72,
+            status TEXT DEFAULT 'PENDING',
+            fill_utc TEXT,
+            exit_utc TEXT,
+            r_result REAL,
+            last_checked_utc TEXT,
+            source TEXT DEFAULT 'scan'
+        )
+    """)
+
+
+def record_signal(data: Dict[str, Any], db_path: str = DEFAULT_DB_PATH) -> Optional[int]:
+    """Record a signal unless an unresolved one already exists for the same
+    ticker and direction — rescanning every hour must not log the same setup
+    over and over, which would multiply its weight in the statistics."""
+    with _connect(db_path) as conn:
+        _ensure_signals_table(conn)
+        dup = conn.execute(
+            "SELECT id FROM signals WHERE ticker = ? AND direction = ? "
+            "AND status IN ('PENDING', 'FILLED')",
+            (data["ticker"], data["direction"])).fetchone()
+        if dup:
+            return None
+        payload = dict(data)
+        payload.setdefault("created_utc", datetime.now(timezone.utc).isoformat())
+        payload.setdefault("status", "PENDING")
+        fields = [k for k in payload if k in SIGNAL_COLUMNS and k != "id"]
+        cur = conn.execute(
+            f"INSERT INTO signals ({', '.join(fields)}) "
+            f"VALUES ({', '.join('?' for _ in fields)})",
+            [payload[f] for f in fields])
+        return cur.lastrowid
+
+
+def update_signal(signal_id: int, db_path: str = DEFAULT_DB_PATH, **changes) -> None:
+    valid = {k: v for k, v in changes.items() if k in SIGNAL_COLUMNS and k != "id"}
+    if not valid:
+        return
+    with _connect(db_path) as conn:
+        _ensure_signals_table(conn)
+        conn.execute(f"UPDATE signals SET {', '.join(f'{k} = ?' for k in valid)} "
+                      f"WHERE id = ?", list(valid.values()) + [signal_id])
+
+
+def get_signals_df(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
+    with _connect(db_path) as conn:
+        _ensure_signals_table(conn)
+        rows = conn.execute("SELECT * FROM signals ORDER BY id").fetchall()
+    if not rows:
+        return pd.DataFrame(columns=SIGNAL_COLUMNS)
+    return pd.DataFrame([dict(r) for r in rows])
+
+
+def signals_to_csv_bytes(db_path: str = DEFAULT_DB_PATH) -> bytes:
+    buf = io.StringIO()
+    get_signals_df(db_path).to_csv(buf, index=False)
+    return buf.getvalue().encode("utf-8")
+
+
+def import_signals_csv(raw: bytes, db_path: str = DEFAULT_DB_PATH) -> int:
+    """Restore tracked signals from an exported CSV. Needed because free
+    hosting wipes the database on every redeploy — without this, a track
+    record weeks in the making would vanish with the next code push.
+    Rows already present (same ticker, direction and created time) are skipped."""
+    df = pd.read_csv(io.BytesIO(raw))
+    missing = {"ticker", "direction", "entry", "stop", "target", "created_utc"} - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV is missing required columns: {sorted(missing)}")
+    added = 0
+    with _connect(db_path) as conn:
+        _ensure_signals_table(conn)
+        for _, row in df.iterrows():
+            exists = conn.execute(
+                "SELECT 1 FROM signals WHERE ticker = ? AND direction = ? AND created_utc = ?",
+                (row["ticker"], row["direction"], row["created_utc"])).fetchone()
+            if exists:
+                continue
+            record = {c: (None if pd.isna(row[c]) else row[c])
+                      for c in SIGNAL_COLUMNS if c in row.index and c != "id"}
+            fields = list(record)
+            conn.execute(f"INSERT INTO signals ({', '.join(fields)}) "
+                          f"VALUES ({', '.join('?' for _ in fields)})",
+                          [record[f] for f in fields])
+            added += 1
+    return added
+
+
+def clear_signals(db_path: str = DEFAULT_DB_PATH) -> None:
+    with _connect(db_path) as conn:
+        _ensure_signals_table(conn)
+        conn.execute("DELETE FROM signals")

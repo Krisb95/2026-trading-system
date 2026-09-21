@@ -470,6 +470,7 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
         price_source = "live spot"
 
     regime, regime_reason = detect_regime(df_1d)
+    regime_from_4h = False
     if regime == "unknown" and df_4h is not None and len(df_4h) >= 60:
         # Daily data missing (e.g. a rate-limited request). Rather than letting
         # that cascade into "no direction -> everything unevaluated -> 0/10",
@@ -478,6 +479,7 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
         alt_regime, alt_reason = detect_regime(df_4h)
         if alt_regime != "unknown":
             regime = alt_regime
+            regime_from_4h = True
             regime_reason = (f"[Daily data unavailable — regime inferred from 4H instead, "
                               f"which is a weaker read.] {alt_reason}")
             problems.append(
@@ -573,6 +575,16 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
 
     if regime == "unknown" or direction is None:
         ev["regime_alignment_1d_4h"] = EvidenceItem(None, f"{regime_reason} {dir_4h_reason}")
+    elif regime_from_4h:
+        # Alignment means two INDEPENDENT timeframes agree. When the "daily"
+        # regime was itself read from 4H, checking it against 4H structure is
+        # comparing a thing with itself — and the 4H structure point below
+        # already rewards that same observation. Awarding both double-counted
+        # one 4H uptrend as three points, which inflated universe-scan grades.
+        ev["regime_alignment_1d_4h"] = EvidenceItem(
+            None,
+            "Daily data unavailable, so 1D/4H alignment cannot be independently "
+            "confirmed. Not scored — 4H structure is already counted separately.")
     else:
         aligned = ((regime == "bullish" and direction == "Long" and dir_4h == "Long")
                    or (regime == "bearish" and direction == "Short" and dir_4h == "Short"))

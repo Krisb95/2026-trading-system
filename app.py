@@ -26,14 +26,16 @@ from portfolio import OpenPosition, summarize_portfolio_risk
 from stops import StopManager, suggest_management_label
 from position_math import PositionSnapshot, analyse_scale_in, ScaleVerdict
 from scanner import fetch_multi_timeframe, analyze_candidate, scan_universe
+from strategy_backtest import run_strategy_backtest, stats_by_grade, verdict
 from universe import fetch_top_cryptos
 import coingecko
 import exchanges
 import venues as venues_mod
 import storage
+import tracking
 from formatting import format_price
 
-APP_BUILD = "2026-09-21-b18 (entry prices, live spot, targets beyond price)"
+APP_BUILD = "2026-09-21-b19 (strategy backtest + forward tracking)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -191,8 +193,9 @@ st.sidebar.warning(
     "Export your journal to CSV after any session that matters."
 )
 
-tab_market, tab_scan, tab_positions, tab_risk, tab_journal, tab_backtest = st.tabs(
-    ["🌍 Market", "🎯 Scanner", "📋 Positions", "🧮 Risk", "📓 Journal", "🔁 Backtest"]
+tab_market, tab_scan, tab_positions, tab_risk, tab_journal, tab_track, tab_backtest = st.tabs(
+    ["🌍 Market", "🎯 Scanner", "📋 Positions", "🧮 Risk", "📓 Journal",
+     "📈 Tracking", "🔁 Backtest"]
 )
 
 # ---------------------------------------------------------------------
@@ -374,6 +377,11 @@ with tab_scan:
             f"{'exchange data (fast — no meaningful rate limit)' if CRYPTO_SOURCE == 'exchange' else 'CoinGecko (calls spaced to avoid 429s)'}."
         )
 
+        st.checkbox("Record B-or-better setups for forward tracking",
+                    value=True, key="track_signals",
+                    help="Builds a real track record: each setup's plan is frozen now and "
+                         "checked later against what price actually did.")
+
         if st.button("🔎 Scan universe", use_container_width=True):
             labels = list(CRYPTO_TICKERS)[:universe_size]
             instruments = [(lbl, CRYPTO_TICKERS[lbl],
@@ -386,10 +394,17 @@ with tab_scan:
                 ticker, coin_id = payload
                 if CRYPTO_SOURCE == "exchange":
                     df, err = exchanges.fetch_binance_klines(ticker, "4h")
+                    fetch_1d = exchanges.fetch_binance_klines
                     if df is None:
                         df, err = exchanges.fetch_kraken_ohlc(ticker, "4h")
+                        fetch_1d = exchanges.fetch_kraken_ohlc
                     if df is not None and not df.empty:
-                        return {"4h": df, "1d": pd.DataFrame(), "1h": pd.DataFrame()}, []
+                        # Daily candles let 1D/4H alignment be judged from two
+                        # genuinely independent timeframes. Without them the
+                        # alignment points are withheld rather than faked.
+                        d1, _e = fetch_1d(ticker, "1d")
+                        return {"4h": df, "1d": d1 if d1 is not None else pd.DataFrame(),
+                                "1h": pd.DataFrame()}, []
                 if coin_id:
                     df, _label, err = coingecko.fetch_ohlc(coin_id, days=30)
                     if df is not None and not df.empty:
@@ -415,6 +430,10 @@ with tab_scan:
                     progress_callback=_progress, spot_loader=_spot)
             bar.empty()
             st.session_state.ranked = ranked
+            if st.session_state.get("track_signals", True):
+                added = tracking.record_from_ranked(ranked, VENUE_TAGS)
+                if added:
+                    st.toast(f"Recorded {added} new signal(s) for forward tracking.")
 
         ranked = st.session_state.get("ranked")
         if ranked:
@@ -1094,47 +1113,181 @@ with tab_journal:
 # ---------------------------------------------------------------------
 # TAB: Backtest
 # ---------------------------------------------------------------------
-with tab_backtest:
-    st.subheader("Backtest engine")
-    st.warning(
-        "This validates the REPLAY ENGINE — no look-ahead, realistic fills, fees, metrics — "
-        "using a simple moving-average crossover as an example signal generator. It is NOT "
-        "the multi-timeframe strategy from the scanner. Results here say nothing about "
-        "whether your actual strategy has an edge."
+with tab_track:
+    st.subheader("Forward tracking")
+    st.caption(
+        "Every B-or-better setup from a universe scan is recorded with its plan frozen "
+        "at that moment. Outcomes are then checked against what price actually did. "
+        "Because the plan is fixed before the result is known, this is the most honest "
+        "test the strategy can get."
+    )
+    st.info(
+        "Works even while the app sleeps — pressing Update fetches every candle printed "
+        "since each signal was created. But the database is **wiped on every redeploy**, "
+        "so export the CSV regularly and re-import it after updating the app."
     )
 
-    b1, b2 = st.columns(2)
-    bt_ticker = b1.text_input("Ticker", value="BTC-USD")
-    bt_period = b2.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=1)
-    b3, b4, b5 = st.columns(3)
-    fast = b3.number_input("Fast MA", min_value=2, value=10)
-    slow = b4.number_input("Slow MA", min_value=3, value=30)
-    bt_fee = b5.number_input("Fee/side", min_value=0.0, value=0.0006, format="%.4f")
+    sig_df = storage.get_signals_df()
+    open_count = int(sig_df["status"].isin(["PENDING", "FILLED"]).sum()) if not sig_df.empty else 0
 
-    if st.button("Run backtest", use_container_width=True):
-        with st.spinner("Fetching history…"):
-            hist = yf.Ticker(bt_ticker).history(period=bt_period)
-        if hist is None or hist.empty:
-            st.error("No historical data returned for this ticker.")
-        else:
-            hist = hist[hist["Close"].notna()].reset_index(drop=True)
-            in_s, out_s = split_in_out_sample(hist, split_ratio=0.7)
-            for label, sample in [("In-sample", in_s), ("Out-of-sample", out_s)]:
-                st.markdown(f"##### {label}")
-                sigs = example_sma_crossover_signals(sample, fast=int(fast), slow=int(slow))
-                res = run_backtest(sample, sigs, fee_rate=bt_fee)
-                mt = compute_metrics(res)
-                x1, x2, x3, x4 = st.columns(4)
-                x1.metric("Trades", mt.trade_count)
-                x2.metric("Win rate", f"{mt.win_rate:.1%}")
-                x3.metric("Expectancy", f"{mt.expectancy_r:+.2f}R")
-                x4.metric("Profit factor",
-                          f"{mt.profit_factor:.2f}" if mt.profit_factor != float("inf") else "∞")
-                y1, y2, y3 = st.columns(3)
-                y1.metric("Max drawdown", f"{mt.max_drawdown_r:.2f}R")
-                y2.metric("Longest losing streak", mt.max_losing_streak)
-                y3.metric("Avg MFE / MAE", f"{mt.avg_mfe_r:.2f} / {mt.avg_mae_r:.2f}R")
+    t1, t2 = st.columns(2)
+    t1.metric("Signals tracked", len(sig_df))
+    t2.metric("Still open", open_count)
+
+    if st.button("🔄 Update outcomes", use_container_width=True, disabled=open_count == 0):
+        bar = st.progress(0.0, text="Checking…")
+
+        def _bars(ticker):
+            df, _err = exchanges.fetch_binance_klines(ticker, "1h", limit=1000)
+            if df is None:
+                df, _err = exchanges.fetch_kraken_ohlc(ticker, "1h")
+            return df
+
+        counts = tracking.update_all(
+            _bars, bar_hours=1.0,
+            progress=lambda i, n, t: bar.progress(min(i / max(n, 1), 1.0),
+                                                   text=f"{i}/{n} · {t}"))
+        bar.empty()
+        st.success(f"Checked {counts['checked']} · resolved {counts['resolved']}"
+                   + (f" · {counts['failed']} could not be fetched" if counts["failed"] else ""))
+        st.rerun()
+
+    if sig_df.empty:
+        st.info("No signals yet. Run a universe scan on the 🎯 Scanner tab with tracking "
+                "switched on, then come back after a few days.")
+    else:
+        stats = tracking.tracked_stats()
+        st.markdown("##### Live track record by grade")
+        st.dataframe(pd.DataFrame([{
+            "Grade": s_.grade, "Signals": s_.signals, "Filled": s_.filled,
+            "Wins": s_.wins, "Losses": s_.losses, "Expired": s_.expired,
+            "Open": s_.still_open,
+            "Win rate": f"{s_.win_rate:.0%}" if s_.win_rate is not None else "—",
+            "Avg R / trade": f"{s_.avg_r:+.2f}" if s_.avg_r is not None else "—",
+            "Total R": f"{s_.total_r:+.1f}",
+            "Enough data?": "yes" if s_.enough_data else "no (<30)",
+        } for s_ in stats]), use_container_width=True, hide_index=True)
+        resolved_total = sum(1 for _, r in sig_df.iterrows() if r["status"] in ("WIN", "LOSS"))
+        if resolved_total < 30:
             st.caption(
-                f"{len(hist)} bars total. A small or favourable sample is not proof of an edge — "
-                f"this is a mechanics check."
-            )
+                f"Only {resolved_total} resolved trade(s) so far. Under about 30 per grade, "
+                f"results are dominated by luck — a few lucky wins can make any grade look "
+                f"brilliant. Give it a few weeks.")
+
+        show = sig_df.copy()
+        for col in ("entry", "stop", "target"):
+            show[col] = show[col].apply(format_price)
+        st.dataframe(show[["created_utc", "label", "direction", "grade", "score",
+                           "entry", "stop", "target", "status", "r_result"]],
+                     use_container_width=True, hide_index=True)
+
+    e1, e2 = st.columns(2)
+    e1.download_button("⬇️ Export tracking CSV", data=storage.signals_to_csv_bytes(),
+                       file_name=f"tracked_signals_{datetime.now().date()}.csv",
+                       mime="text/csv", use_container_width=True)
+    upload = e2.file_uploader("Restore from CSV", type=["csv"], key="sig_upload",
+                               label_visibility="collapsed")
+    if upload is not None and st.button("Import CSV"):
+        try:
+            added = storage.import_signals_csv(upload.getvalue())
+            st.success(f"Restored {added} signal(s).")
+            st.rerun()
+        except ValueError as e:
+            st.error(str(e))
+
+with tab_backtest:
+    st.subheader("Strategy backtest")
+    st.caption(
+        "Replays the real scanner over past data. At each step it sees only candles "
+        "that had already closed, makes its plan exactly as it would live, then checks "
+        "what price did next. The question: **do higher grades actually do better?**"
+    )
+    st.warning(
+        "No score guarantees profit. A backtest measures whether the grades had an "
+        "edge in the past — it cannot promise they will in future, and a few months of "
+        "one market regime is a single sample. Ambiguous candles are resolved "
+        "pessimistically, so results lean worse rather than better."
+    )
+
+    b1, b2, b3 = st.columns(3)
+    bt_size = b1.selectbox("Coins", [5, 10, 20], index=1, key="bt_size",
+                            help="More coins = more trades = more trustworthy, but slower.")
+    bt_rr = b2.number_input("Min R:R", min_value=1.0, value=2.0, step=0.5, key="bt_rr")
+    bt_expiry = b3.selectbox("Limit order valid for", ["1 day", "3 days", "5 days"],
+                              index=1, key="bt_exp")
+    expiry_bars = {"1 day": 6, "3 days": 18, "5 days": 30}[bt_expiry]
+    bt_fee = st.number_input("Fees + slippage per trade (in R)", min_value=0.0,
+                              value=0.05, step=0.01, format="%.2f", key="bt_fee",
+                              help="0.05R means costs take 5% of your risk per trade.")
+
+    st.caption(f"Uses ~160 days of 4H candles per coin. Roughly "
+               f"{bt_size * 15 // 60 + 1} minute(s) for {bt_size} coins.")
+
+    if st.button("▶ Run strategy backtest", use_container_width=True):
+        labels = list(CRYPTO_TICKERS)[:bt_size]
+        all_trades, failures = [], []
+        bar = st.progress(0.0, text="Starting…")
+        for i, lbl in enumerate(labels):
+            ticker = CRYPTO_TICKERS[lbl]
+            bar.progress(i / len(labels), text=f"{i + 1}/{len(labels)} · {lbl}")
+            df4, err = exchanges.fetch_binance_klines(ticker, "4h", limit=1000)
+            fetch_d = exchanges.fetch_binance_klines
+            if df4 is None:
+                df4, err = exchanges.fetch_kraken_ohlc(ticker, "4h")
+                fetch_d = exchanges.fetch_kraken_ohlc
+            if df4 is None or df4.empty:
+                failures.append(f"{lbl}: {err}")
+                continue
+            if fetch_d is exchanges.fetch_binance_klines:
+                d1, _ = fetch_d(ticker, "1d", limit=500)
+            else:
+                d1, _ = fetch_d(ticker, "1d")
+            all_trades += run_strategy_backtest(df4, d1, ticker, min_rr=bt_rr,
+                                                 expiry_bars=expiry_bars, fee_r=bt_fee)
+        bar.empty()
+        st.session_state.bt_trades = all_trades
+        st.session_state.bt_failures = failures
+
+    trades = st.session_state.get("bt_trades")
+    if trades is not None:
+        if not trades:
+            st.info("No qualifying setups were produced over this history.")
+        else:
+            stats = stats_by_grade(trades)
+            st.markdown("##### Results by grade")
+            st.dataframe(pd.DataFrame([{
+                "Grade": s_.grade,
+                "Signals": s_.signals,
+                "Filled": s_.filled,
+                "Fill rate": f"{s_.fill_rate:.0%}" if s_.fill_rate is not None else "—",
+                "Wins": s_.wins, "Losses": s_.losses, "Expired": s_.expired,
+                "Win rate": f"{s_.win_rate:.0%}" if s_.win_rate is not None else "—",
+                "Avg R / trade": f"{s_.avg_r:+.2f}" if s_.avg_r is not None else "—",
+                "Total R": f"{s_.total_r:+.1f}",
+                "Enough data?": "yes" if s_.enough_data else "no (<30)",
+            } for s_ in stats]), use_container_width=True, hide_index=True)
+
+            v = verdict(stats)
+            (st.success if "separated better" in v else st.warning)(v)
+            st.caption(
+                "**Avg R / trade** is the key column: +0.30R means that, on average, each "
+                "trade returned 30% of the amount risked. Win rate alone can mislead — a "
+                "40% win rate at 2:1 is profitable, a 60% win rate at 0.5:1 is not.")
+            st.caption(
+                "**Baseline for comparison:** on random price data, where no edge exists, "
+                "this backtester returns roughly **−0.35R per trade** before fees. That is "
+                "partly the pessimistic candle handling and partly real adverse selection "
+                "(limit buys tend to fill while price is falling). A grade needs to clearly "
+                "beat that, not just zero, before it looks like more than luck.")
+
+            with st.expander(f"All {len(trades)} simulated trades"):
+                st.dataframe(pd.DataFrame([{
+                    "Coin": t.ticker, "Signal time": t.signal_time, "Dir": t.direction,
+                    "Grade": t.grade, "Score": t.score,
+                    "Entry": format_price(t.entry), "Stop": format_price(t.stop),
+                    "Target": format_price(t.target), "Planned R:R": f"{t.planned_rr:.2f}",
+                    "Outcome": t.status,
+                    "R": f"{t.r_result:+.2f}" if t.r_result is not None else "—",
+                } for t in trades]), use_container_width=True, hide_index=True)
+        for f in st.session_state.get("bt_failures", []):
+            st.caption(f"⚠️ Could not load {f}")
