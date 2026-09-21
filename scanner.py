@@ -298,7 +298,8 @@ def atr_value(df: pd.DataFrame, period: int = 14) -> Optional[float]:
 
 
 def derive_levels(df_4h: pd.DataFrame, entry: float, direction: str,
-                   min_rr: float = 2.0, stop_buffer_atr: float = 0.25
+                   min_rr: float = 2.0, stop_buffer_atr: float = 0.25,
+                   current_price: Optional[float] = None
                    ) -> Tuple[Optional[float], Optional[float], Optional[float], str]:
     """Pick a structural stop and a target that actually clears min_rr.
 
@@ -346,7 +347,12 @@ def derive_levels(df_4h: pd.DataFrame, entry: float, direction: str,
         pool = [s.price for s in swings if s.price > entry] + extensions
         if extreme is not None:
             pool.append(extreme)
-        candidates = sorted({round(p, 12) for p in pool if p > entry})
+        # A target must be a level price has NOT already cleared. With a planned
+        # entry below the live price, every level between the two was broken on
+        # the way up — it is support now, not resistance, so it cannot be where
+        # you take profit. Targets therefore start from the live price upward.
+        floor = max(entry, current_price) if current_price else entry
+        candidates = sorted({round(p, 12) for p in pool if p > floor})
     else:
         highs = sorted([s.price for s in swings if s.kind == "high" and s.price > entry])
         if not highs:
@@ -355,7 +361,8 @@ def derive_levels(df_4h: pd.DataFrame, entry: float, direction: str,
         pool = [s.price for s in swings if s.price < entry] + extensions
         if extreme is not None:
             pool.append(extreme)
-        candidates = sorted({round(p, 12) for p in pool if p < entry}, reverse=True)
+        ceiling = min(entry, current_price) if current_price else entry
+        candidates = sorted({round(p, 12) for p in pool if p < ceiling}, reverse=True)
 
     risk = abs(entry - stop)
     if risk <= 0:
@@ -435,7 +442,8 @@ def opposing_liquidity_ahead(df: pd.DataFrame, price: float, target: Optional[fl
 def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
                        direction_override: Optional[str] = None,
                        min_rr: float = 2.0,
-                       data_problems: Optional[List[str]] = None) -> CandidateAnalysis:
+                       data_problems: Optional[List[str]] = None,
+                       live_price: Optional[float] = None) -> CandidateAnalysis:
     """Derive score + sequence evidence from real multi-timeframe data."""
     problems = list(data_problems or [])
     df_1d = frames.get("1d", pd.DataFrame())
@@ -454,6 +462,12 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
             except Exception:
                 price_time = None
             break
+
+    # A genuine live spot price beats the last candle close — a 4H close can
+    # be up to four hours old.
+    if live_price is not None and live_price > 0:
+        price = float(live_price)
+        price_source = "live spot"
 
     regime, regime_reason = detect_regime(df_1d)
     if regime == "unknown" and df_4h is not None and len(df_4h) >= 60:
@@ -516,7 +530,8 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
                  if z.status != ENTRY_MISSED]
         evaluated = []
         for z in zones:
-            zs, zt, zrr, zreason = derive_levels(df_4h, z.reference, direction, min_rr=min_rr)
+            zs, zt, zrr, zreason = derive_levels(df_4h, z.reference, direction,
+                                                  min_rr=min_rr, current_price=price)
             evaluated.append((z, zs, zt, zrr, zreason))
 
         chosen = next((e for e in evaluated if e[3] is not None and e[3] >= min_rr), None)
@@ -538,7 +553,8 @@ def analyze_candidate(ticker: str, frames: Dict[str, pd.DataFrame],
             analysis.alternative_zones = [e[0] for e in evaluated if e[0] is not entry_plan]
         else:
             stop, target, rr, level_reason = derive_levels(df_4h, entry, direction,
-                                                            min_rr=min_rr)
+                                                            min_rr=min_rr,
+                                                            current_price=price)
 
     analysis.entry, analysis.stop, analysis.target, analysis.reward_risk = entry, stop, target, rr
     analysis.level_reason = level_reason
@@ -702,11 +718,13 @@ class RankedCandidate:
     note: str = ""
     error: Optional[str] = None
     entry_status: Optional[str] = None
+    entry: Optional[float] = None
+    price_is_live: bool = False
 
 
 def scan_universe(instruments, frame_loader, min_rr: float = 2.0,
                    direction_override: Optional[str] = None,
-                   progress_callback=None):
+                   progress_callback=None, spot_loader=None):
     """Score a list of instruments and return them ranked, best first.
 
     instruments:    list of (label, ticker, fetch_key) tuples
@@ -733,9 +751,16 @@ def scan_universe(instruments, frame_loader, min_rr: float = 2.0,
                     reward_risk=None, error="No data returned."))
                 continue
 
+            live = None
+            if spot_loader is not None:
+                try:
+                    live = spot_loader(fetch_key)
+                except Exception:
+                    live = None
             analysis = analyze_candidate(ticker, frames,
                                           direction_override=direction_override,
-                                          min_rr=min_rr, data_problems=problems)
+                                          min_rr=min_rr, data_problems=problems,
+                                          live_price=live)
             scored = score_setup(analysis.score_dict())
             results.append(RankedCandidate(
                 ticker=ticker, label=label, direction=analysis.direction,
@@ -745,7 +770,9 @@ def scan_universe(instruments, frame_loader, min_rr: float = 2.0,
                 reward_risk=analysis.reward_risk,
                 note=analysis.level_reason,
                 entry_status=(analysis.entry_plan.status
-                              if analysis.entry_plan else None)))
+                              if analysis.entry_plan else None),
+                entry=analysis.entry,
+                price_is_live=(analysis.price_source == "live spot")))
         except Exception as e:
             results.append(RankedCandidate(
                 ticker=ticker, label=label, direction=None, score=0.0, grade="—",

@@ -580,3 +580,107 @@ class TestZoneRanking(unittest.TestCase):
         missed = EntryPlan(109, 111, 110, ENTRY_MISSED, "None", 0.0, 0.0, 5,
                             ["a", "b", "c", "d", "e"])
         self.assertIs(rank_zones([missed, ok])[-1], missed)
+
+
+def zec_like_df():
+    seq = [1100]
+    for a, b in [(1100, 1300), (1300, 1210), (1210, 1420), (1420, 1330),
+                 (1330, 1540), (1540, 1440), (1440, 1534)]:
+        seq += list(np.linspace(a, b, 10))[1:]
+    idx = pd.date_range("2026-01-01", periods=len(seq), freq="4h", tz="UTC")
+    sp = [x * 0.006 for x in seq]
+    return pd.DataFrame({"Open": seq, "High": [x + s for x, s in zip(seq, sp)],
+                          "Low": [x - s for x, s in zip(seq, sp)], "Close": seq}, index=idx)
+
+
+class TestTargetsBeyondLivePrice(unittest.TestCase):
+    """Regression for the ZEC report: a long's target sat BELOW the live
+    price, so the row read like a short. Levels between a planned entry and
+    the live price were broken on the way up — they are support, not
+    resistance, and cannot be profit targets."""
+
+    def _analyse(self, live=1533.88):
+        df = zec_like_df()
+        return analyze_candidate("ZEC-USD", {"1d": df, "4h": df, "1h": df, "5m": df},
+                                  live_price=live)
+
+    def test_long_target_is_above_live_price(self):
+        a = self._analyse()
+        self.assertEqual(a.direction, "Long")
+        self.assertGreater(a.target, a.current_price)
+
+    def test_long_entry_below_live_stop_below_entry(self):
+        a = self._analyse()
+        self.assertLess(a.entry, a.current_price)
+        self.assertLess(a.stop, a.entry)
+
+    def test_live_price_override_is_used(self):
+        a = self._analyse(live=1533.88)
+        self.assertAlmostEqual(a.current_price, 1533.88)
+        self.assertEqual(a.price_source, "live spot")
+
+    def test_levels_are_ordered_like_a_long(self):
+        a = self._analyse()
+        self.assertTrue(a.stop < a.entry < a.current_price < a.target)
+
+    def test_derive_levels_excludes_levels_below_live_for_long(self):
+        from scanner import derive_levels
+        df = zec_like_df()
+        _, t_no_live, _, _ = derive_levels(df, 1450.0, "Long", min_rr=1.0)
+        _, t_live, _, _ = derive_levels(df, 1450.0, "Long", min_rr=1.0,
+                                        current_price=1533.88)
+        if t_live is not None:
+            self.assertGreater(t_live, 1533.88)
+        if t_no_live is not None and t_live is not None:
+            self.assertGreaterEqual(t_live, t_no_live)
+
+    def test_short_target_is_below_live_price(self):
+        from scanner import derive_levels
+        seq = [2000]
+        for a, b in [(2000, 1800), (1800, 1890), (1890, 1680), (1680, 1770),
+                     (1770, 1560), (1560, 1660), (1660, 1566)]:
+            seq += list(np.linspace(a, b, 10))[1:]
+        idx = pd.date_range("2026-01-01", periods=len(seq), freq="4h", tz="UTC")
+        sp = [x * 0.006 for x in seq]
+        df = pd.DataFrame({"Open": seq, "High": [x + s for x, s in zip(seq, sp)],
+                            "Low": [x - s for x, s in zip(seq, sp)], "Close": seq}, index=idx)
+        _, t, _, _ = derive_levels(df, 1620.0, "Short", min_rr=1.0, current_price=1566.0)
+        if t is not None:
+            self.assertLess(t, 1566.0)
+
+
+class TestUniverseCarriesEntryAndLivePrice(unittest.TestCase):
+    def test_ranked_row_has_entry_price_and_live_flag(self):
+        from scanner import scan_universe
+        df = zec_like_df()
+        out = scan_universe(
+            [("Zcash (ZEC)", "ZEC-USD", "zcash")],
+            lambda k: ({"4h": df, "1d": pd.DataFrame(), "1h": pd.DataFrame()}, []),
+            spot_loader=lambda k: 1533.88)
+        row = out[0]
+        self.assertIsNotNone(row.entry)
+        self.assertTrue(row.price_is_live)
+        self.assertAlmostEqual(row.price, 1533.88)
+
+    def test_spot_failure_falls_back_to_candle_close(self):
+        from scanner import scan_universe
+        df = zec_like_df()
+        out = scan_universe(
+            [("Zcash (ZEC)", "ZEC-USD", "zcash")],
+            lambda k: ({"4h": df, "1d": pd.DataFrame(), "1h": pd.DataFrame()}, []),
+            spot_loader=lambda k: None)
+        self.assertFalse(out[0].price_is_live)
+
+    def test_spot_loader_exception_does_not_break_scan(self):
+        from scanner import scan_universe
+        df = zec_like_df()
+
+        def boom(k):
+            raise ConnectionError("spot down")
+
+        out = scan_universe(
+            [("Zcash (ZEC)", "ZEC-USD", "zcash")],
+            lambda k: ({"4h": df, "1d": pd.DataFrame(), "1h": pd.DataFrame()}, []),
+            spot_loader=boom)
+        self.assertIsNone(out[0].error)
+        self.assertFalse(out[0].price_is_live)

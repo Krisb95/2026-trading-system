@@ -33,7 +33,7 @@ import venues as venues_mod
 import storage
 from formatting import format_price
 
-APP_BUILD = "2026-09-20-b17 (entries better than market)"
+APP_BUILD = "2026-09-21-b18 (entry prices, live spot, targets beyond price)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -396,6 +396,15 @@ with tab_scan:
                         return {"4h": df, "1d": pd.DataFrame(), "1h": pd.DataFrame()}, []
                 return {}, [err or "no data"]
 
+            def _spot(payload):
+                """Live spot price for the Price column and entry maths. Without
+                this, 'Price' was the last 4H close — up to four hours stale."""
+                ticker, coin_id = payload
+                px, _src, _err = exchanges.fetch_spot(ticker)
+                if px is None and coin_id:
+                    px, _upd, _e = coingecko.fetch_spot_price(coin_id)
+                return px
+
             def _progress(i, total, label):
                 bar.progress(min(i / max(total, 1), 1.0), text=f"{i}/{total} · {label}")
 
@@ -403,7 +412,7 @@ with tab_scan:
                 ranked = scan_universe(
                     instruments, _loader, min_rr=uni_min_rr,
                     direction_override=None if uni_direction == "Auto" else uni_direction,
-                    progress_callback=_progress)
+                    progress_callback=_progress, spot_loader=_spot)
             bar.empty()
             st.session_state.ranked = ranked
 
@@ -414,20 +423,33 @@ with tab_scan:
 
             st.markdown(f"##### Results · {len(ok)} scored, {len(failed)} failed")
             if ok:
+                def _gap(r):
+                    if not (r.entry and r.price):
+                        return "—"
+                    g = (r.entry - r.price) / r.price * 100
+                    return "at price" if abs(g) < 0.05 else f"{g:+.2f}%"
+
                 table = pd.DataFrame([{
                     "Instrument": r.label,
                     "Venue": "/".join(VENUE_TAGS.get(r.label, [])) or "—",
                     "Score": f"{r.score:.1f}",
                     "Grade": r.grade,
                     "Dir": r.direction or "—",
-                    "Regime": r.regime.title(),
-                    "Price": format_price(r.price),
+                    "Live price": format_price(r.price) + ("" if r.price_is_live else " *"),
+                    "Entry": format_price(r.entry),
+                    "Entry vs live": _gap(r),
                     "Stop": format_price(r.stop),
                     "Target": format_price(r.target),
                     "R:R": f"{r.reward_risk:.2f}" if r.reward_risk else "—",
-                    "Entry": r.entry_status or "—",
+                    "Regime": r.regime.title(),
                 } for r in ok])
                 st.dataframe(table, use_container_width=True, hide_index=True)
+                st.caption(
+                    "**Entry** is the planned price to place your order at — a limit order "
+                    "at a confluence zone, not the market price. **Entry vs live** shows how "
+                    "far price must travel to fill it. Stop, target and R:R are all measured "
+                    "from that entry. A price marked * is the last 4H close because the live "
+                    "spot fetch failed.")
 
                 tradeable = [r for r in ok if r.grade in ("A+", "B")]
                 if tradeable:
@@ -522,10 +544,13 @@ with tab_scan:
                             problems = ([f"Yahoo Finance has no data for {scan_ticker}; "
                                           f"using CoinGecko candles instead."] + cg_problems)
 
+                _live = None
+                if stype == "Crypto":
+                    _live, _src, _err = _cached_exchange_spot(scan_ticker)
                 st.session_state.analysis = analyze_candidate(
                     scan_ticker, frames,
                     direction_override=None if dir_choice == "Auto" else dir_choice,
-                    min_rr=min_rr, data_problems=problems)
+                    min_rr=min_rr, data_problems=problems, live_price=_live)
                 # Bump the scan id so the evidence checkboxes below get FRESH
                 # widget keys. Streamlit ignores `value=` for a key that already
                 # exists in session state, so reusing keys would freeze the
