@@ -33,9 +33,10 @@ import exchanges
 import venues as venues_mod
 import storage
 import tracking
+import trend_retrace
 from formatting import format_price
 
-APP_BUILD = "2026-09-21-b21 (1H in universe scan + backtest)"
+APP_BUILD = "2026-09-21-b22 (Trend Retrace strategy)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -111,15 +112,54 @@ COMMODITY_TICKERS = {
 # Sidebar settings (shared across tabs)
 # ---------------------------------------------------------------------
 st.sidebar.header("⚙️ Settings")
-live_threshold = st.sidebar.number_input("LIVE threshold (seconds)", value=60, min_value=5)
-stale_threshold = st.sidebar.number_input("STALE threshold (seconds)", value=900, min_value=60)
-tz_name = st.sidebar.text_input("Timezone (IANA)", value="Australia/Sydney")
-try:
-    local_tz = zoneinfo.ZoneInfo(tz_name)
-    st.sidebar.caption(f"Local now: {datetime.now(local_tz).strftime('%Y-%m-%d %H:%M %Z')}")
-except Exception:
-    st.sidebar.error(f"'{tz_name}' is not a valid IANA timezone — using UTC.")
-    local_tz = timezone.utc
+
+st.sidebar.subheader("Strategy")
+strategy_choice = st.sidebar.radio(
+    "Scanner strategy",
+    ["Trend Retrace (your strategy)", "Confluence (original)"],
+    key="strategy_choice",
+    help="Trend Retrace: two 4H candles of HH/HL, a bullish 1H candle, then a 5m "
+         "retrace to support (reverse for shorts). Confluence is the earlier 10-point "
+         "checklist, kept for comparison.")
+USE_TR = strategy_choice.startswith("Trend")
+
+if USE_TR:
+    with st.sidebar.expander("Stop & take profit — please confirm", expanded=False):
+        st.caption("Your rules don't specify these, so these are adjustable defaults.")
+        _stop_choice = st.radio("Stop loss", ["Below the 5m support (ATR buffer)",
+                                              "Below the last closed 4H candle"],
+                                key="tr_stop_mode")
+        _stop_atr = st.number_input(
+            "Buffer below support (x 5m ATR)", min_value=0.5, max_value=10.0, value=3.0,
+            step=0.5, key="tr_stop_atr",
+            disabled=_stop_choice.startswith("Below the last"),
+            help="At 1x, trades finished in ~12 minutes — before any 1H candle could close, "
+                 "so your 'add 50% after a 1H candle' rule could never trigger. 3x lets "
+                 "trades run for hours.")
+        _target_r = st.number_input("Take profit (multiple of risk)", min_value=0.5,
+                                     max_value=10.0, value=2.0, step=0.5, key="tr_target_r")
+        _trend_n = st.number_input("4H candles required", min_value=1, max_value=5,
+                                    value=2, step=1, key="tr_trend_n")
+    TR_PARAMS = trend_retrace.StrategyParams(
+        trend_candles=int(_trend_n),
+        stop_mode=(trend_retrace.STOP_BELOW_4H_CANDLE if _stop_choice.startswith("Below the last")
+                   else trend_retrace.STOP_BELOW_SUPPORT),
+        stop_atr_mult=_stop_atr, target_r=_target_r)
+else:
+    TR_PARAMS = None
+
+with st.sidebar.expander("Advanced settings"):
+    st.caption("Data-freshness rules and display timezone. The defaults rarely need "
+               "changing — crypto prices come live from the exchange regardless.")
+    live_threshold = st.number_input("LIVE threshold (seconds)", value=60, min_value=5)
+    stale_threshold = st.number_input("STALE threshold (seconds)", value=900, min_value=60)
+    tz_name = st.text_input("Timezone (IANA)", value="Australia/Sydney")
+    try:
+        local_tz = zoneinfo.ZoneInfo(tz_name)
+        st.caption(f"Local now: {datetime.now(local_tz).strftime('%Y-%m-%d %H:%M %Z')}")
+    except Exception:
+        st.error(f"'{tz_name}' is not a valid IANA timezone — using UTC.")
+        local_tz = timezone.utc
 
 # A free CoinGecko demo key raises the rate limit a lot. Optional.
 _cg_key = ""
@@ -345,30 +385,40 @@ with tab_scan:
         "overridable — ❔ means it could not be evaluated and scores zero rather than guessing."
     )
 
-    mode = st.radio("Mode",
-                     ["Rank the universe", "Auto-scan one instrument", "Manual checklist"],
-                     key="scan_mode",
-                     help="Rank the universe scores many coins and shortlists the best; "
-                          "the other modes analyse a single instrument in full depth.")
+    _modes = (["Rank the universe", "Auto-scan one instrument"] if USE_TR
+              else ["Rank the universe", "Auto-scan one instrument", "Manual checklist"])
+    mode = st.radio("Mode", _modes, key="scan_mode",
+                    help="Rank the universe checks many coins and shortlists the best; "
+                         "single-instrument mode shows every rule for one coin in detail.")
 
     score_evidence, seq_evidence = {}, {}
 
     if mode == "Rank the universe":
-        st.caption(
-            "Scores many instruments and shortlists the best. To stay inside rate "
-            "limits this uses **4H candles only** — so 1H entry confirmation cannot be "
-            "evaluated (capping scores at 9/10) and the regime is read from 4H rather "
-            "than daily. Treat results as a shortlist, then run a full single-instrument "
-            "scan on anything promising."
-        )
-
-        u1, u2, u3 = st.columns(3)
-        universe_size = u1.selectbox("How many coins", [10, 20, 30, 50],
-                                      index=1, key="uni_size",
-                                      help="More coins means more API calls and a longer wait.")
-        uni_direction = u2.selectbox("Direction", ["Auto", "Long", "Short"], key="uni_dir")
-        uni_min_rr = u3.number_input("Min R:R", min_value=1.0, value=2.0,
-                                      step=0.5, key="uni_rr")
+        if USE_TR:
+            st.caption(
+                "Applies your three rules to each coin: **two 4H candles of higher highs and "
+                "higher lows**, a **bullish 1H candle**, and a **5m retrace to previous "
+                "support** (reversed for shorts). Only closed candles count. A setup meeting "
+                "all three rules scores 10/10; the score is a checklist count, not a "
+                "probability of profit."
+            )
+            universe_size = st.selectbox("How many coins", [10, 20, 30, 50], index=1,
+                                          key="uni_size",
+                                          help="More coins means more API calls and a longer wait.")
+            uni_direction, uni_min_rr = "Auto", 2.0
+        else:
+            st.caption(
+                "Scores many instruments on the original 10-point confluence checklist "
+                "using daily, 4H and 1H candles. Treat results as a shortlist, then run a "
+                "full single-instrument scan on anything promising."
+            )
+            u1, u2, u3 = st.columns(3)
+            universe_size = u1.selectbox("How many coins", [10, 20, 30, 50],
+                                          index=1, key="uni_size",
+                                          help="More coins means more API calls and a longer wait.")
+            uni_direction = u2.selectbox("Direction", ["Auto", "Long", "Short"], key="uni_dir")
+            uni_min_rr = u3.number_input("Min R:R", min_value=1.0, value=2.0,
+                                          step=0.5, key="uni_rr")
 
         per_coin = 0.6 if CRYPTO_SOURCE == "exchange" else 1.4   # 4 calls/coin: 4H, 1D, 1H, spot
         est = universe_size * per_coin
@@ -426,11 +476,28 @@ with tab_scan:
             def _progress(i, total, label):
                 bar.progress(min(i / max(total, 1), 1.0), text=f"{i}/{total} · {label}")
 
-            with st.spinner("Scanning…"):
-                ranked = scan_universe(
-                    instruments, _loader, min_rr=uni_min_rr,
-                    direction_override=None if uni_direction == "Auto" else uni_direction,
-                    progress_callback=_progress, spot_loader=_spot)
+            def _tr_loader(payload):
+                """4H, 1H and 5m candles for the Trend Retrace rules."""
+                ticker, _coin_id = payload
+                out = {}
+                for tf, lim in (("4h", 30), ("1h", 48), ("5m", 400)):
+                    df, _e = exchanges.fetch_binance_klines(ticker, tf, limit=lim)
+                    if df is None:
+                        df, _e = exchanges.fetch_kraken_ohlc(ticker, tf)
+                    out[tf] = df if df is not None else pd.DataFrame()
+                return out
+
+            if USE_TR:
+                with st.spinner("Scanning…"):
+                    ranked = trend_retrace.scan_universe_tr(
+                        instruments, _tr_loader, spot_loader=_spot, params=TR_PARAMS,
+                        progress=_progress)
+            else:
+                with st.spinner("Scanning…"):
+                    ranked = scan_universe(
+                        instruments, _loader, min_rr=uni_min_rr,
+                        direction_override=None if uni_direction == "Auto" else uni_direction,
+                        progress_callback=_progress, spot_loader=_spot)
             bar.empty()
             st.session_state.ranked = ranked
             if st.session_state.get("track_signals", True):
@@ -483,7 +550,8 @@ with tab_scan:
                     "Stop": format_price(r.stop),
                     "Target": format_price(r.target),
                     "R:R": f"{r.reward_risk:.2f}" if r.reward_risk else "—",
-                    "Regime": r.regime.title(),
+                    ("Status" if USE_TR else "Regime"):
+                        (r.entry_status or "—") if USE_TR else r.regime.title(),
                 } for r in ok])
                 st.dataframe(table, use_container_width=True, hide_index=True)
                 st.caption(
@@ -508,6 +576,80 @@ with tab_scan:
                 with st.expander(f"⚠️ {len(failed)} instrument(s) could not be scored"):
                     for r in failed:
                         st.caption(f"**{r.label}** — {r.error}")
+
+        score_evidence, seq_evidence = {}, {}
+
+    elif mode == "Auto-scan one instrument" and USE_TR:
+        tr1, tr2 = st.columns([3, 1])
+        _tl = tr1.selectbox("Coin", list(CRYPTO_TICKERS), key="tr_single")
+        tr_ticker = CRYPTO_TICKERS[_tl]
+        tr_dir = tr2.selectbox("Direction", ["Auto", "Long", "Short"], key="tr_single_dir",
+                               help="Auto takes the direction from the 4H candles.")
+        stopped_out = st.checkbox("I was just stopped out on this coin — show re-entry plan",
+                                  key="tr_stopped")
+
+        if st.button("🔍 Check the rules", use_container_width=True):
+            with st.spinner(f"Checking {tr_ticker}…"):
+                frames = {}
+                for tf, lim in (("4h", 30), ("1h", 48), ("5m", 400)):
+                    df, _e = exchanges.fetch_binance_klines(tr_ticker, tf, limit=lim)
+                    if df is None:
+                        df, _e = exchanges.fetch_kraken_ohlc(tr_ticker, tf)
+                    frames[tf] = trend_retrace.drop_forming(
+                        df if df is not None else pd.DataFrame(), tf)
+                live, _src, _err = _cached_exchange_spot(tr_ticker)
+                st.session_state.tr_plan = trend_retrace.analyze(
+                    tr_ticker, frames["4h"], frames["1h"], frames["5m"], live_price=live,
+                    params=TR_PARAMS,
+                    direction_override=None if tr_dir == "Auto" else tr_dir)
+
+        plan = st.session_state.get("tr_plan")
+        if plan is None:
+            st.info("Pick a coin and press **Check the rules**.")
+        else:
+            h1c, h2c, h3c, h4c = st.columns(4)
+            h1c.metric("Coin", plan.ticker)
+            h2c.metric("Direction", plan.direction or "—")
+            h3c.metric("Score", f"{plan.score:.0f}/10", plan.grade)
+            h4c.metric("Live price", format_price(plan.current_price))
+
+            st.markdown(f"##### Status: **{plan.stage}**")
+            labels = {"4h": "1 · 4H trend — two candles of HH/HL (LH/LL for shorts)",
+                      "1h": "2 · 1H confirmation candle",
+                      "5m": "3 · 5m retrace to previous support (resistance for shorts)"}
+            for key_, text in labels.items():
+                rule = plan.rules.get(key_)
+                if rule is None:
+                    st.markdown(f"⬜ **{text}** — not checked (no direction yet)")
+                else:
+                    st.markdown(f"{'✅' if rule.passed else '❌'} **{text}**")
+                    st.caption(f"　↳ {rule.reason}")
+
+            if plan.entry is not None:
+                e1, e2, e3, e4 = st.columns(4)
+                e1.metric("Entry (limit)", format_price(plan.entry))
+                e2.metric("Stop", format_price(plan.stop))
+                e3.metric("Target", format_price(plan.target))
+                e4.metric("R:R", f"{plan.reward_risk:.2f}" if plan.reward_risk else "—")
+                if plan.current_price:
+                    gap = (plan.entry - plan.current_price) / plan.current_price * 100
+                    st.caption(f"Entry is {gap:+.2f}% from the live price — a limit order "
+                               f"waiting for the retrace, not a market buy.")
+            for p_ in plan.problems:
+                st.warning(p_)
+
+            if plan.stage == trend_retrace.AT_ENTRY:
+                st.success("All three rules are met and price is at the entry level.")
+            elif plan.stage == trend_retrace.WAIT_RETRACE:
+                st.info("All three rules are met. Place the limit order at the entry and let "
+                        "the retrace come to you.")
+
+            if stopped_out and plan.direction:
+                st.markdown("##### Re-entry plan (after being stopped out)")
+                for i_, step_ in enumerate(trend_retrace.reentry_plan_text(plan.direction), 1):
+                    st.markdown(f"{i_}. {step_}")
+                st.caption("Each re-entry half should risk half of your normal amount, so the "
+                           "full re-entry risks the same as one normal trade.")
 
         score_evidence, seq_evidence = {}, {}
 
@@ -715,63 +857,67 @@ with tab_scan:
             for key, points, label in NEGATIVE_COMPONENTS:
                 score_evidence[key] = st.checkbox(f"{label} ({points})", key=f"mn_{key}")
 
-    st.markdown("---")
-    result = score_setup(score_evidence)
-    r1, r2 = st.columns([1, 2])
-    r1.metric("Setup score", f"{result.normalized_score:.1f}/10", result.label)
-    r2.info(trade_policy_for_grade(result.label))
+    # The confluence score/readiness panel only applies to the original
+    # strategy's single-coin and manual modes. Under Trend Retrace, or after a
+    # universe scan, it would show a meaningless score built from no evidence.
+    if not USE_TR and mode != "Rank the universe":
+        st.markdown("---")
+        result = score_setup(score_evidence)
+        r1, r2 = st.columns([1, 2])
+        r1.metric("Setup score", f"{result.normalized_score:.1f}/10", result.label)
+        r2.info(trade_policy_for_grade(result.label))
 
-    if result.label != "A+":
-        missing = weakest_components(result)
-        if missing:
-            st.caption("Weakest: " + "; ".join(
-                f"{li.label} (+{li.points_possible} unclaimed)" for li in missing))
+        if result.label != "A+":
+            missing = weakest_components(result)
+            if missing:
+                st.caption("Weakest: " + "; ".join(
+                    f"{li.label} (+{li.points_possible} unclaimed)" for li in missing))
 
-    with st.expander("📊 Score breakdown — where every point went"):
-        earned = sum(li.points_awarded for li in result.breakdown if li.points_awarded > 0)
-        available = sum(li.points_possible for li in result.breakdown if li.points_possible > 0)
-        st.caption(f"Earned **{earned}** of **{available}** positive points.")
-        rows = []
-        for li in result.breakdown:
-            rows.append({
-                "Component": li.label,
-                "Worth": f"{li.points_possible:+d}",
-                "Earned": f"{li.points_awarded:+d}",
-                "Evidence": {True: "yes", False: "no", None: "could not evaluate"}[li.evidence],
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.caption(
-            "The two-point items (regime alignment, liquidity sweep + reclaim) are the "
-            "difference between a C and an A+. If they never fire, 4–5/10 is the "
-            "structural ceiling — that is the scoring working as designed, not a fault, "
-            "but it is worth reading their reasons above to see whether you agree."
-        )
+        with st.expander("📊 Score breakdown — where every point went"):
+            earned = sum(li.points_awarded for li in result.breakdown if li.points_awarded > 0)
+            available = sum(li.points_possible for li in result.breakdown if li.points_possible > 0)
+            st.caption(f"Earned **{earned}** of **{available}** positive points.")
+            rows = []
+            for li in result.breakdown:
+                rows.append({
+                    "Component": li.label,
+                    "Worth": f"{li.points_possible:+d}",
+                    "Earned": f"{li.points_awarded:+d}",
+                    "Evidence": {True: "yes", False: "no", None: "could not evaluate"}[li.evidence],
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption(
+                "The two-point items (regime alignment, liquidity sweep + reclaim) are the "
+                "difference between a C and an A+. If they never fire, 4–5/10 is the "
+                "structural ceiling — that is the scoring working as designed, not a fault, "
+                "but it is worth reading their reasons above to see whether you agree."
+            )
 
-    st.markdown("##### Readiness")
-    q = st.session_state.get("quote")
-    data_ok = q is not None and q.status in (DataStatus.LIVE, DataStatus.DELAYED)
-    risk_ok = st.checkbox("Risk checks pass (sized, within budget)", key="rdy_risk")
-    invalidated = st.checkbox("Structural invalidation has occurred", key="rdy_inval")
-    entered = st.checkbox("I have manually entered this trade", key="rdy_active")
+        st.markdown("##### Readiness")
+        q = st.session_state.get("quote")
+        data_ok = q is not None and q.status in (DataStatus.LIVE, DataStatus.DELAYED)
+        risk_ok = st.checkbox("Risk checks pass (sized, within budget)", key="rdy_risk")
+        invalidated = st.checkbox("Structural invalidation has occurred", key="rdy_inval")
+        entered = st.checkbox("I have manually entered this trade", key="rdy_active")
 
-    readiness = determine_readiness(ReadinessInputs(
-        data_is_valid=data_ok, invalidation_hit=invalidated, user_marked_active=entered,
-        near_actionable_location=seq_evidence.get("location", False),
-        confirmation_triggered=seq_evidence.get("confirmation", False),
-        invalidation_defined=seq_evidence.get("structural_invalidation", False),
-        risk_checks_pass=risk_ok))
+        readiness = determine_readiness(ReadinessInputs(
+            data_is_valid=data_ok, invalidation_hit=invalidated, user_marked_active=entered,
+            near_actionable_location=seq_evidence.get("location", False),
+            confirmation_triggered=seq_evidence.get("confirmation", False),
+            invalidation_defined=seq_evidence.get("structural_invalidation", False),
+            risk_checks_pass=risk_ok))
 
-    st.metric("Readiness", f"{display_label(readiness)} ({readiness.value})")
-    st.caption(READINESS_DESCRIPTIONS[readiness])
+        st.metric("Readiness", f"{display_label(readiness)} ({readiness.value})")
+        st.caption(READINESS_DESCRIPTIONS[readiness])
 
-    if not data_ok:
-        st.info("Readiness shows DATA ERROR because no usable quote is loaded. "
-                "Fetch the instrument on the 🌍 Market tab first.")
+        if not data_ok:
+            st.info("Readiness shows DATA ERROR because no usable quote is loaded. "
+                    "Fetch the instrument on the 🌍 Market tab first.")
 
-    if readiness in (Readiness.CONDITIONAL, Readiness.NOT_READY):
-        gaps = missing_entry_sequence_stages(seq_evidence)
-        if gaps:
-            st.warning("What would confirm this:\n" + "\n".join(f"- {g}" for g in gaps))
+        if readiness in (Readiness.CONDITIONAL, Readiness.NOT_READY):
+            gaps = missing_entry_sequence_stages(seq_evidence)
+            if gaps:
+                st.warning("What would confirm this:\n" + "\n".join(f"- {g}" for g in gaps))
 
 # ---------------------------------------------------------------------
 # TAB: Positions
@@ -1219,111 +1365,221 @@ with tab_track:
             st.error(str(e))
 
 with tab_backtest:
-    st.subheader("Strategy backtest")
+  if USE_TR:
+    st.subheader("Backtest — Trend Retrace (your strategy)")
     st.caption(
-        "Replays the real scanner over past data. At each step it sees only candles "
-        "that had already closed, makes its plan exactly as it would live, then checks "
-        "what price did next. The question: **do higher grades actually do better?**"
+        "Replays your rules candle by candle on 5-minute data: two 4H HH/HL candles, a "
+        "bullish 1H candle, then a limit order at 5m support. After a stop-out it follows "
+        "your re-entry rules — wait for a 4H candle in your direction, re-enter 50% on a "
+        "5m retrace, add 50% after a confirming 1H candle. Only closed candles are used."
     )
     st.warning(
-        "No score guarantees profit. A backtest measures whether the grades had an "
-        "edge in the past — it cannot promise they will in future, and a few months of "
-        "one market regime is a single sample. Ambiguous candles are resolved "
+        "No strategy guarantees profit. This shows how your rules would have performed on "
+        "past data — useful evidence, not a promise. Ambiguous candles are resolved "
         "pessimistically, so results lean worse rather than better."
     )
+    bc1, bc2, bc3 = st.columns(3)
+    trb_size = bc1.selectbox("Coins", [5, 10, 20], index=1, key="trb_size")
+    trb_days = bc2.selectbox("History", ["14 days", "30 days", "60 days"], index=1,
+                             key="trb_days",
+                             help="Longer history = more trades = more trustworthy, but slower.")
+    trb_fee = bc3.number_input("Costs per trade (R)", min_value=0.0, value=0.05, step=0.01,
+                               format="%.2f", key="trb_fee")
+    days = int(trb_days.split()[0])
+    st.caption(f"Fetches ~{days * 288:,} five-minute candles per coin. "
+               f"Allow roughly {max(1, trb_size * days // 60)} minute(s).")
 
-    b1, b2, b3 = st.columns(3)
-    bt_size = b1.selectbox("Coins", [5, 10, 20], index=1, key="bt_size",
-                            help="More coins = more trades = more trustworthy, but slower.")
-    bt_rr = b2.number_input("Min R:R", min_value=1.0, value=2.0, step=0.5, key="bt_rr")
-    bt_expiry = b3.selectbox("Limit order valid for", ["1 day", "3 days", "5 days"],
-                              index=1, key="bt_exp")
-    expiry_bars = {"1 day": 6, "3 days": 18, "5 days": 30}[bt_expiry]
-    bt_fee = st.number_input("Fees + slippage per trade (in R)", min_value=0.0,
-                              value=0.05, step=0.01, format="%.2f", key="bt_fee",
-                              help="0.05R means costs take 5% of your risk per trade.")
-
-    st.caption(f"Uses ~160 days of 4H candles per coin. Roughly "
-               f"{bt_size * 15 // 60 + 1} minute(s) for {bt_size} coins.")
-
-    if st.button("▶ Run strategy backtest", use_container_width=True):
-        labels = list(CRYPTO_TICKERS)[:bt_size]
-        all_trades, failures, kraken_short_1h = [], [], []
+    if st.button("▶ Run backtest", use_container_width=True, key="trb_run"):
+        labels = list(CRYPTO_TICKERS)[:trb_size]
+        results_on, results_off, failures = [], [], []
         bar = st.progress(0.0, text="Starting…")
-        for i, lbl in enumerate(labels):
-            ticker = CRYPTO_TICKERS[lbl]
-            bar.progress(i / len(labels), text=f"{i + 1}/{len(labels)} · {lbl}")
-            df4, err = exchanges.fetch_binance_klines(ticker, "4h", limit=1000)
-            fetch_d = exchanges.fetch_binance_klines
-            if df4 is None:
-                df4, err = exchanges.fetch_kraken_ohlc(ticker, "4h")
-                fetch_d = exchanges.fetch_kraken_ohlc
-            if df4 is None or df4.empty:
-                failures.append(f"{lbl}: {err}")
+        for i_, lbl in enumerate(labels):
+            tk = CRYPTO_TICKERS[lbl]
+            bar.progress(i_ / len(labels), text=f"{i_ + 1}/{len(labels)} · {lbl}")
+            m5, err = exchanges.fetch_binance_history(tk, "5m", days * 288)
+            if m5 is None or m5.empty:
+                failures.append(f"{lbl}: {err or 'no 5m history'}")
                 continue
-            if fetch_d is exchanges.fetch_binance_klines:
-                d1, _ = fetch_d(ticker, "1d", limit=500)
-                # ~4,000 hourly candles to span the same period as 1,000 4H ones
-                h1, _ = exchanges.fetch_binance_history(ticker, "1h", 4000)
-            else:
-                d1, _ = fetch_d(ticker, "1d")
-                h1, _ = fetch_d(ticker, "1h")   # Kraken only serves ~30 days
-                if h1 is not None and not h1.empty:
-                    kraken_short_1h.append(lbl)
-            all_trades += run_strategy_backtest(df4, d1, ticker, min_rr=bt_rr,
-                                                 expiry_bars=expiry_bars, fee_r=bt_fee,
-                                                 df_1h=h1)
+            h1, _ = exchanges.fetch_binance_history(tk, "1h", days * 24 + 48)
+            h4, _ = exchanges.fetch_binance_history(tk, "4h", days * 6 + 30)
+            if h1 is None or h4 is None:
+                failures.append(f"{lbl}: missing 1H or 4H history")
+                continue
+            results_on += trend_retrace.run_backtest(m5, h1, h4, tk, params=TR_PARAMS,
+                                                      fee_r=trb_fee, enable_reentry=True)
+            results_off += trend_retrace.run_backtest(m5, h1, h4, tk, params=TR_PARAMS,
+                                                       fee_r=trb_fee, enable_reentry=False)
         bar.empty()
-        st.session_state.bt_trades = all_trades
-        st.session_state.bt_failures = failures
-        st.session_state.bt_kraken_1h = kraken_short_1h
+        st.session_state.trb = (results_on, results_off, failures)
 
-    trades = st.session_state.get("bt_trades")
-    if trades is not None:
-        if not trades:
-            st.info("No qualifying setups were produced over this history.")
+    trb = st.session_state.get("trb")
+    if trb is not None:
+        res_on, res_off, fails = trb
+        if not res_on:
+            st.info("No trades were produced over this history.")
         else:
-            stats = stats_by_grade(trades)
-            st.markdown("##### Results by grade")
+            stats = trend_retrace.backtest_stats(res_on)
+            st.markdown("##### Results")
             st.dataframe(pd.DataFrame([{
-                "Grade": s_.grade,
-                "Signals": s_.signals,
-                "Filled": s_.filled,
-                "Fill rate": f"{s_.fill_rate:.0%}" if s_.fill_rate is not None else "—",
-                "Wins": s_.wins, "Losses": s_.losses, "Expired": s_.expired,
-                "Win rate": f"{s_.win_rate:.0%}" if s_.win_rate is not None else "—",
-                "Avg R / trade": f"{s_.avg_r:+.2f}" if s_.avg_r is not None else "—",
-                "Total R": f"{s_.total_r:+.1f}",
-                "Enough data?": "yes" if s_.enough_data else "no (<30)",
-            } for s_ in stats]), use_container_width=True, hide_index=True)
+                "Trade type": x.group, "Entries": x.entries, "Wins": x.wins,
+                "Losses": x.losses, "Expired orders": x.expired,
+                "Win rate": f"{x.win_rate:.0%}" if x.win_rate is not None else "—",
+                "Avg R per entry": f"{x.avg_r_per_entry:+.2f}"
+                                   if x.avg_r_per_entry is not None else "—",
+                "Total R": f"{x.total_r:+.1f}",
+                "Luck range": f"±{x.luck_range:.1f}" if x.luck_range is not None else "—",
+                "Verdict": x.verdict,
+            } for x in stats]), use_container_width=True, hide_index=True)
 
-            v = verdict(stats)
-            (st.success if "separated better" in v else st.warning)(v)
+            on_total = next(x.total_r for x in stats if x.group == "All")
+            off_total = next(x.total_r for x in trend_retrace.backtest_stats(res_off)
+                             if x.group == "All")
+            st.markdown("##### Do the re-entry rules help?")
+            cA, cB = st.columns(2)
+            cA.metric("With re-entry", f"{on_total:+.1f}R")
+            cB.metric("Without re-entry", f"{off_total:+.1f}R",
+                      f"{on_total - off_total:+.1f}R difference")
+            resolved = next(x.entries for x in stats if x.group == "All")
+            if resolved < 30:
+                st.caption(f"Only {resolved} resolved entries — too few to trust. Add coins "
+                           f"or lengthen the history before drawing conclusions.")
+            _luck = next(x.luck_range for x in stats if x.group == "All")
+            if _luck is not None:
+                st.caption(
+                    f"A difference smaller than about **±{_luck:.0f}R** between the two could "
+                    f"easily be chance, so don't read much into it unless it's larger.")
             st.caption(
-                "**Avg R / trade** is the key column: +0.30R means that, on average, each "
-                "trade returned 30% of the amount risked. Win rate alone can mislead — a "
-                "40% win rate at 2:1 is profitable, a 60% win rate at 0.5:1 is not.")
-            st.caption(
-                "**Baseline for comparison:** on random price data, where no edge exists, "
-                "this backtester returns roughly **−0.35R per trade** before fees. That is "
-                "partly the pessimistic candle handling and partly real adverse selection "
-                "(limit buys tend to fill while price is falling). A grade needs to clearly "
-                "beat that, not just zero, before it looks like more than luck.")
-
-            with st.expander(f"All {len(trades)} simulated trades"):
+                "**Total R** is the result in units of your normal risk: +10R means you'd "
+                "have made ten times the amount you risk per trade. Re-entry halves count "
+                "at 50%. **Luck range** is how far chance alone commonly pushes the total "
+                "over that many trades — only a total outside it says much. **Baseline:** on "
+                "random price data, where no edge exists, these rules come out roughly "
+                "break-even before costs (about 33% wins at 2R) and lose roughly the cost per "
+                "trade after costs. So an edge has to show up as clearly positive, after "
+                "costs, across plenty of trades.")
+            with st.expander(f"All {len(res_on)} trade records"):
                 st.dataframe(pd.DataFrame([{
-                    "Coin": t.ticker, "Signal time": t.signal_time, "Dir": t.direction,
-                    "Grade": t.grade, "Score": t.score,
-                    "Entry": format_price(t.entry), "Stop": format_price(t.stop),
-                    "Target": format_price(t.target), "Planned R:R": f"{t.planned_rr:.2f}",
+                    "Coin": t.ticker, "Type": t.kind, "Dir": t.direction,
+                    "Signal": t.signal_time, "Entry": format_price(t.entry),
+                    "Stop": format_price(t.stop), "Target": format_price(t.target),
                     "Outcome": t.status,
-                    "R": f"{t.r_result:+.2f}" if t.r_result is not None else "—",
-                } for t in trades]), use_container_width=True, hide_index=True)
-        for f in st.session_state.get("bt_failures", []):
-            st.caption(f"⚠️ Could not load {f}")
-        short = st.session_state.get("bt_kraken_1h") or []
-        if short:
-            st.caption(
-                f"⚠️ {len(short)} coin(s) came from Kraken, which only serves about 30 days "
-                f"of 1H candles. Earlier in their history the 1H confirmation point could "
-                f"not be scored, which slightly understates their grades.")
+                    "R": f"{t.weighted_r:+.2f}" if t.weighted_r is not None else "—",
+                } for t in res_on]), use_container_width=True, hide_index=True)
+        for f_ in fails:
+            st.caption(f"⚠️ Could not load {f_}")
+        if fails and not res_on and any("451" in f_ or "geo" in f_ for f_ in fails):
+            st.error(
+                "Binance is geo-blocked from this server, and it's the only free source "
+                "with weeks of 5-minute history — Kraken serves only about 2.5 days, too "
+                "short to backtest. Running the app locally, from a region Binance serves, "
+                "would work.")
+
+  else:
+      st.subheader("Strategy backtest")
+      st.caption(
+          "Replays the real scanner over past data. At each step it sees only candles "
+          "that had already closed, makes its plan exactly as it would live, then checks "
+          "what price did next. The question: **do higher grades actually do better?**"
+      )
+      st.warning(
+          "No score guarantees profit. A backtest measures whether the grades had an "
+          "edge in the past — it cannot promise they will in future, and a few months of "
+          "one market regime is a single sample. Ambiguous candles are resolved "
+          "pessimistically, so results lean worse rather than better."
+      )
+
+      b1, b2, b3 = st.columns(3)
+      bt_size = b1.selectbox("Coins", [5, 10, 20], index=1, key="bt_size",
+                              help="More coins = more trades = more trustworthy, but slower.")
+      bt_rr = b2.number_input("Min R:R", min_value=1.0, value=2.0, step=0.5, key="bt_rr")
+      bt_expiry = b3.selectbox("Limit order valid for", ["1 day", "3 days", "5 days"],
+                                index=1, key="bt_exp")
+      expiry_bars = {"1 day": 6, "3 days": 18, "5 days": 30}[bt_expiry]
+      bt_fee = st.number_input("Fees + slippage per trade (in R)", min_value=0.0,
+                                value=0.05, step=0.01, format="%.2f", key="bt_fee",
+                                help="0.05R means costs take 5% of your risk per trade.")
+
+      st.caption(f"Uses ~160 days of 4H candles per coin. Roughly "
+                 f"{bt_size * 15 // 60 + 1} minute(s) for {bt_size} coins.")
+
+      if st.button("▶ Run strategy backtest", use_container_width=True):
+          labels = list(CRYPTO_TICKERS)[:bt_size]
+          all_trades, failures, kraken_short_1h = [], [], []
+          bar = st.progress(0.0, text="Starting…")
+          for i, lbl in enumerate(labels):
+              ticker = CRYPTO_TICKERS[lbl]
+              bar.progress(i / len(labels), text=f"{i + 1}/{len(labels)} · {lbl}")
+              df4, err = exchanges.fetch_binance_klines(ticker, "4h", limit=1000)
+              fetch_d = exchanges.fetch_binance_klines
+              if df4 is None:
+                  df4, err = exchanges.fetch_kraken_ohlc(ticker, "4h")
+                  fetch_d = exchanges.fetch_kraken_ohlc
+              if df4 is None or df4.empty:
+                  failures.append(f"{lbl}: {err}")
+                  continue
+              if fetch_d is exchanges.fetch_binance_klines:
+                  d1, _ = fetch_d(ticker, "1d", limit=500)
+                  # ~4,000 hourly candles to span the same period as 1,000 4H ones
+                  h1, _ = exchanges.fetch_binance_history(ticker, "1h", 4000)
+              else:
+                  d1, _ = fetch_d(ticker, "1d")
+                  h1, _ = fetch_d(ticker, "1h")   # Kraken only serves ~30 days
+                  if h1 is not None and not h1.empty:
+                      kraken_short_1h.append(lbl)
+              all_trades += run_strategy_backtest(df4, d1, ticker, min_rr=bt_rr,
+                                                   expiry_bars=expiry_bars, fee_r=bt_fee,
+                                                   df_1h=h1)
+          bar.empty()
+          st.session_state.bt_trades = all_trades
+          st.session_state.bt_failures = failures
+          st.session_state.bt_kraken_1h = kraken_short_1h
+
+      trades = st.session_state.get("bt_trades")
+      if trades is not None:
+          if not trades:
+              st.info("No qualifying setups were produced over this history.")
+          else:
+              stats = stats_by_grade(trades)
+              st.markdown("##### Results by grade")
+              st.dataframe(pd.DataFrame([{
+                  "Grade": s_.grade,
+                  "Signals": s_.signals,
+                  "Filled": s_.filled,
+                  "Fill rate": f"{s_.fill_rate:.0%}" if s_.fill_rate is not None else "—",
+                  "Wins": s_.wins, "Losses": s_.losses, "Expired": s_.expired,
+                  "Win rate": f"{s_.win_rate:.0%}" if s_.win_rate is not None else "—",
+                  "Avg R / trade": f"{s_.avg_r:+.2f}" if s_.avg_r is not None else "—",
+                  "Total R": f"{s_.total_r:+.1f}",
+                  "Enough data?": "yes" if s_.enough_data else "no (<30)",
+              } for s_ in stats]), use_container_width=True, hide_index=True)
+
+              v = verdict(stats)
+              (st.success if "separated better" in v else st.warning)(v)
+              st.caption(
+                  "**Avg R / trade** is the key column: +0.30R means that, on average, each "
+                  "trade returned 30% of the amount risked. Win rate alone can mislead — a "
+                  "40% win rate at 2:1 is profitable, a 60% win rate at 0.5:1 is not.")
+              st.caption(
+                  "**Baseline for comparison:** on random price data, where no edge exists, "
+                  "this backtester returns roughly **−0.35R per trade** before fees. That is "
+                  "partly the pessimistic candle handling and partly real adverse selection "
+                  "(limit buys tend to fill while price is falling). A grade needs to clearly "
+                  "beat that, not just zero, before it looks like more than luck.")
+
+              with st.expander(f"All {len(trades)} simulated trades"):
+                  st.dataframe(pd.DataFrame([{
+                      "Coin": t.ticker, "Signal time": t.signal_time, "Dir": t.direction,
+                      "Grade": t.grade, "Score": t.score,
+                      "Entry": format_price(t.entry), "Stop": format_price(t.stop),
+                      "Target": format_price(t.target), "Planned R:R": f"{t.planned_rr:.2f}",
+                      "Outcome": t.status,
+                      "R": f"{t.r_result:+.2f}" if t.r_result is not None else "—",
+                  } for t in trades]), use_container_width=True, hide_index=True)
+          for f in st.session_state.get("bt_failures", []):
+              st.caption(f"⚠️ Could not load {f}")
+          short = st.session_state.get("bt_kraken_1h") or []
+          if short:
+              st.caption(
+                  f"⚠️ {len(short)} coin(s) came from Kraken, which only serves about 30 days "
+                  f"of 1H candles. Earlier in their history the 1H confirmation point could "
+                  f"not be scored, which slightly understates their grades.")

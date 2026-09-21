@@ -45,6 +45,34 @@ Build 2026-09-19-b6 ... · data persisted to SQLite
 
 If that line is missing, the deployed code is not the code you just uploaded.
 
+## The strategy — Trend Retrace
+
+The default scanner strategy, as specified by the trader.
+
+**Long** (short is the exact reverse):
+
+1. **4H trend** — the last two closed 4H candles each made a higher high and a higher low.
+2. **1H confirmation** — the last closed 1H candle is bullish.
+3. **5m entry** — wait for price to retrace to a previous support on the 5m chart; enter there with a limit order.
+
+**Re-entry after a stop-out:**
+
+1. Wait for a closed 4H candle in the trade's direction.
+2. On the 5m, wait for a retrace to support and re-enter **50%**.
+3. Wait for another closed 1H candle in the trade's direction, then add the remaining **50%**.
+
+**Not specified by the trader — adjustable defaults in the sidebar:**
+
+- **Stop loss:** below the 5m support by 3x the 5m ATR (alternatively, below the last closed 4H candle). A 1x buffer was tested and rejected: trades finished in about 12 minutes, before any 1H candle could close, so the second 50% could never be added.
+- **Take profit:** 2x the risk.
+- **Order expiry:** an unfilled limit is cancelled after a day, or if the 4H trend reverses.
+
+**Scoring** is a checklist count — 4H trend 4 points, 1H confirmation 3, 5m support entry 3 — so a setup meeting all three rules scores 10/10. It is not a probability of profit.
+
+Only **closed** candles count. Exchanges return the still-forming candle as the latest row; it is dropped, because a 1H candle that is green mid-hour can close red.
+
+The original 10-point confluence strategy remains available from the sidebar for comparison.
+
 ## Tabs
 
 | Tab | Purpose |
