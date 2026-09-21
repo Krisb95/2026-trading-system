@@ -254,3 +254,51 @@ def build_frames(ticker: str) -> ExchangeResult:
             frames[tf] = got
 
     return ExchangeResult(frames=frames, source=source, problems=problems)
+
+
+INTERVAL_MS = {"5m": 300_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
+
+
+def fetch_binance_history(ticker: str, interval: str, total_bars: int
+                           ) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    """More than 1,000 candles by paging backwards through Binance history.
+
+    Binance caps one request at 1,000 candles. A backtest wanting ~160 days of
+    1H candles needs ~3,800, so this walks backwards in 1,000-candle pages and
+    stitches them together, oldest first, with duplicates removed.
+    """
+    if interval not in BINANCE_INTERVALS:
+        return None, f"Unsupported interval {interval!r}"
+    frames = []
+    end_time = None
+    remaining = total_bars
+    while remaining > 0:
+        params = {"symbol": to_binance_symbol(ticker),
+                  "interval": BINANCE_INTERVALS[interval],
+                  "limit": min(1000, remaining)}
+        if end_time is not None:
+            params["endTime"] = end_time
+        resp, err = _get(BINANCE_KLINES, params)
+        if resp is None:
+            if frames:
+                break          # keep what we have rather than discard it
+            return None, err
+        rows = resp.json()
+        if not isinstance(rows, list) or not rows:
+            break
+        df = pd.DataFrame(rows, columns=[
+            "openTime", "Open", "High", "Low", "Close", "Volume",
+            "closeTime", "qav", "trades", "tbb", "tbq", "ignore"])
+        frames.append(df)
+        remaining -= len(rows)
+        earliest = int(df["openTime"].iloc[0])
+        end_time = earliest - 1
+        if len(rows) < params["limit"]:
+            break              # reached the start of the listing
+    if not frames:
+        return None, "Binance returned no candles."
+    raw = pd.concat(frames).drop_duplicates(subset="openTime")
+    raw["ts"] = pd.to_datetime(raw["openTime"], unit="ms", utc=True)
+    out = raw.set_index("ts")[["Open", "High", "Low", "Close", "Volume"]].astype(float)
+    out = out[out["Close"].notna()].sort_index()
+    return out, None

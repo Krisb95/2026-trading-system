@@ -193,3 +193,69 @@ class TestFallbackBehaviour(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBinanceHistoryPaging(unittest.TestCase):
+    """Binance caps a request at 1,000 candles; history beyond that is paged."""
+
+    def setUp(self):
+        self.original = exchanges.requests.get
+
+    def tearDown(self):
+        exchanges.requests.get = self.original
+
+    def _pager(self, available):
+        """Serve `available` total candles, newest first, honouring endTime."""
+        base = 1_700_000_000_000
+        step = 3_600_000
+        all_rows = [[base + i * step, "1", "2", "0.5", "1.5", "10",
+                     base + (i + 1) * step, "0", 1, "0", "0", "0"]
+                    for i in range(available)]
+        calls = {"n": 0}
+
+        def _get(url, params=None, **k):
+            calls["n"] += 1
+            end = params.get("endTime")
+            pool = [r for r in all_rows if end is None or r[0] <= end]
+            return FakeResp(pool[-params["limit"]:])
+        return _get, calls
+
+    def test_pages_beyond_one_thousand(self):
+        get, calls = self._pager(2500)
+        exchanges.requests.get = get
+        df, err = exchanges.fetch_binance_history("BTC-USD", "1h", 2500)
+        self.assertIsNone(err)
+        self.assertEqual(len(df), 2500)
+        self.assertEqual(calls["n"], 3)
+
+    def test_result_is_sorted_and_deduplicated(self):
+        get, _ = self._pager(2200)
+        exchanges.requests.get = get
+        df, _ = exchanges.fetch_binance_history("BTC-USD", "1h", 2200)
+        self.assertTrue(df.index.is_monotonic_increasing)
+        self.assertFalse(df.index.duplicated().any())
+
+    def test_stops_at_start_of_listing(self):
+        get, calls = self._pager(600)          # coin only has 600 candles
+        exchanges.requests.get = get
+        df, _ = exchanges.fetch_binance_history("NEW-USD", "1h", 4000)
+        self.assertEqual(len(df), 600)
+        self.assertEqual(calls["n"], 1)
+
+    def test_partial_failure_keeps_pages_already_fetched(self):
+        get, _ = self._pager(3000)
+        state = {"n": 0}
+
+        def flaky(url, params=None, **k):
+            state["n"] += 1
+            if state["n"] == 2:
+                return FakeResp({}, status_code=451)
+            return get(url, params=params)
+
+        exchanges.requests.get = flaky
+        df, err = exchanges.fetch_binance_history("BTC-USD", "1h", 3000)
+        self.assertEqual(len(df), 1000)       # first page kept, not discarded
+
+    def test_unsupported_interval(self):
+        df, err = exchanges.fetch_binance_history("BTC-USD", "7m", 100)
+        self.assertIsNone(df)

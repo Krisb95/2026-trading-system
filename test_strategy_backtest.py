@@ -180,3 +180,39 @@ class TestNoFakeEdgeOnRandomData(unittest.TestCase):
         self.assertLess(overall.avg_r, 0.15,
                         f"backtester found an edge in pure noise ({overall.avg_r:+.2f}R) — "
                         f"look for look-ahead bias")
+
+
+class TestHourlyInBacktest(unittest.TestCase):
+    def test_hourly_candle_excluded_until_closed(self):
+        from strategy_backtest import closed_hourly_slice
+        idx = pd.date_range("2026-03-01 00:00", periods=10, freq="1h", tz="UTC")
+        h = pd.DataFrame({"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0}, index=idx)
+        decision = pd.Timestamp("2026-03-01 05:30", tz="UTC")
+        # 05:00 candle closes at 06:00, so the last closed one opened at 04:00
+        self.assertEqual(closed_hourly_slice(h, decision).index[-1],
+                         pd.Timestamp("2026-03-01 04:00", tz="UTC"))
+
+    def test_hourly_data_enables_the_confirmation_component(self):
+        df = market()
+        hourly = df.resample("1h").ffill()
+        with_h = run_strategy_backtest(df, daily_from(df), "X", step=4, df_1h=hourly)
+        without = run_strategy_backtest(df, daily_from(df), "X", step=4)
+        self.assertIsInstance(with_h, list)
+        self.assertIsInstance(without, list)
+
+    def test_no_lookahead_holds_with_hourly_data(self):
+        df = market()
+        hourly = df.resample("1h").ffill()
+        base = run_strategy_backtest(df, daily_from(df), "X", step=3, df_1h=hourly)
+        cutoff = df.index[300]
+        t_df = df.copy()
+        t_df.loc[t_df.index > cutoff, ["Open", "High", "Low", "Close"]] *= 3.0
+        t_h = hourly.copy()
+        t_h.loc[t_h.index > cutoff, ["Open", "High", "Low", "Close"]] *= 3.0
+        altered = run_strategy_backtest(t_df, daily_from(t_df), "X", step=3, df_1h=t_h)
+
+        def plans(tr):
+            return [(t.signal_time, round(t.entry, 8), round(t.stop, 8), t.grade)
+                    for t in tr if t.signal_time <= cutoff]
+        self.assertTrue(plans(base))
+        self.assertEqual(plans(base), plans(altered))

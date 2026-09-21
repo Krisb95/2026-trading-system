@@ -35,7 +35,7 @@ import storage
 import tracking
 from formatting import format_price
 
-APP_BUILD = "2026-09-21-b19 (strategy backtest + forward tracking)"
+APP_BUILD = "2026-09-21-b21 (1H in universe scan + backtest)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -370,7 +370,7 @@ with tab_scan:
         uni_min_rr = u3.number_input("Min R:R", min_value=1.0, value=2.0,
                                       step=0.5, key="uni_rr")
 
-        per_coin = 0.3 if CRYPTO_SOURCE == "exchange" else 1.4
+        per_coin = 0.6 if CRYPTO_SOURCE == "exchange" else 1.4   # 4 calls/coin: 4H, 1D, 1H, spot
         est = universe_size * per_coin
         st.caption(
             f"Roughly {est:.0f}s for {universe_size} coins using "
@@ -403,8 +403,11 @@ with tab_scan:
                         # genuinely independent timeframes. Without them the
                         # alignment points are withheld rather than faked.
                         d1, _e = fetch_1d(ticker, "1d")
+                        # 1H lets the entry-confirmation component be judged, so
+                        # the full 10 points are reachable in a universe scan.
+                        h1, _e = fetch_1d(ticker, "1h")
                         return {"4h": df, "1d": d1 if d1 is not None else pd.DataFrame(),
-                                "1h": pd.DataFrame()}, []
+                                "1h": h1 if h1 is not None else pd.DataFrame()}, []
                 if coin_id:
                     df, _label, err = coingecko.fetch_ohlc(coin_id, days=30)
                     if df is not None and not df.empty:
@@ -437,10 +440,30 @@ with tab_scan:
 
         ranked = st.session_state.get("ranked")
         if ranked:
-            ok = [r for r in ranked if r.error is None]
+            scored_all = [r for r in ranked if r.error is None]
             failed = [r for r in ranked if r.error is not None]
 
-            st.markdown(f"##### Results · {len(ok)} scored, {len(failed)} failed")
+            f1, f2 = st.columns(2)
+            min_score = f1.number_input(
+                "Show scores of at least", min_value=0.0, max_value=10.0, value=0.0,
+                step=0.5, key="uni_min_score",
+                help="Scores are whole numbers, so 8.5 behaves the same as 9. "
+                     "A 9 or 10 appears in only a few percent of market states.")
+            a_plus_only = f2.checkbox("A+ only", key="uni_aplus_only")
+
+            ok = [r for r in scored_all
+                  if r.score >= min_score and (not a_plus_only or r.grade == "A+")]
+            hidden = len(scored_all) - len(ok)
+
+            st.markdown(f"##### Results · {len(ok)} shown"
+                        + (f", {hidden} hidden by filter" if hidden else "")
+                        + (f", {len(failed)} failed" if failed else ""))
+            if scored_all and not ok:
+                best = max(scored_all, key=lambda r: r.score)
+                st.info(
+                    f"Nothing meets the filter right now. The best setup scanned was "
+                    f"**{best.label} at {best.score:.0f}/10 ({best.grade})**. An empty list is "
+                    f"a legitimate answer — your rulebook treats no-trade as a valid decision.")
             if ok:
                 def _gap(r):
                     if not (r.entry and r.price):
@@ -1225,7 +1248,7 @@ with tab_backtest:
 
     if st.button("▶ Run strategy backtest", use_container_width=True):
         labels = list(CRYPTO_TICKERS)[:bt_size]
-        all_trades, failures = [], []
+        all_trades, failures, kraken_short_1h = [], [], []
         bar = st.progress(0.0, text="Starting…")
         for i, lbl in enumerate(labels):
             ticker = CRYPTO_TICKERS[lbl]
@@ -1240,13 +1263,20 @@ with tab_backtest:
                 continue
             if fetch_d is exchanges.fetch_binance_klines:
                 d1, _ = fetch_d(ticker, "1d", limit=500)
+                # ~4,000 hourly candles to span the same period as 1,000 4H ones
+                h1, _ = exchanges.fetch_binance_history(ticker, "1h", 4000)
             else:
                 d1, _ = fetch_d(ticker, "1d")
+                h1, _ = fetch_d(ticker, "1h")   # Kraken only serves ~30 days
+                if h1 is not None and not h1.empty:
+                    kraken_short_1h.append(lbl)
             all_trades += run_strategy_backtest(df4, d1, ticker, min_rr=bt_rr,
-                                                 expiry_bars=expiry_bars, fee_r=bt_fee)
+                                                 expiry_bars=expiry_bars, fee_r=bt_fee,
+                                                 df_1h=h1)
         bar.empty()
         st.session_state.bt_trades = all_trades
         st.session_state.bt_failures = failures
+        st.session_state.bt_kraken_1h = kraken_short_1h
 
     trades = st.session_state.get("bt_trades")
     if trades is not None:
@@ -1291,3 +1321,9 @@ with tab_backtest:
                 } for t in trades]), use_container_width=True, hide_index=True)
         for f in st.session_state.get("bt_failures", []):
             st.caption(f"⚠️ Could not load {f}")
+        short = st.session_state.get("bt_kraken_1h") or []
+        if short:
+            st.caption(
+                f"⚠️ {len(short)} coin(s) came from Kraken, which only serves about 30 days "
+                f"of 1H candles. Earlier in their history the 1H confirmation point could "
+                f"not be scored, which slightly understates their grades.")

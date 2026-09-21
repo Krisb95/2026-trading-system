@@ -36,6 +36,7 @@ from scanner import analyze_candidate
 from scoring import score_setup
 from trade_sim import simulate_limit_trade, WIN, LOSS, EXPIRED, FILLED, PENDING
 
+ONE_HOUR = pd.Timedelta(hours=1)
 FOUR_HOURS = pd.Timedelta(hours=4)
 ONE_DAY = pd.Timedelta(days=1)
 
@@ -73,11 +74,20 @@ def closed_daily_slice(df_1d: pd.DataFrame, decision_time: pd.Timestamp,
     return closed.tail(max_bars)
 
 
+def closed_hourly_slice(df_1h: pd.DataFrame, decision_time: pd.Timestamp,
+                         max_bars: int = 200) -> pd.DataFrame:
+    """1H candles that had fully closed by decision_time (same rule as daily)."""
+    if df_1h is None or df_1h.empty:
+        return pd.DataFrame()
+    return df_1h[df_1h.index + ONE_HOUR <= decision_time].tail(max_bars)
+
+
 def run_strategy_backtest(df_4h: pd.DataFrame, df_1d: Optional[pd.DataFrame],
                            ticker: str, min_rr: float = 2.0, window: int = 300,
                            step: int = 3, expiry_bars: int = 18, warmup: int = 120,
                            fee_r: float = 0.0,
-                           progress: Optional[Callable[[int, int], None]] = None
+                           progress: Optional[Callable[[int, int], None]] = None,
+                           df_1h: Optional[pd.DataFrame] = None
                            ) -> List[BacktestTrade]:
     """Replay the scanner over history for one instrument.
 
@@ -103,10 +113,11 @@ def run_strategy_backtest(df_4h: pd.DataFrame, df_1d: Optional[pd.DataFrame],
         decision_time = df_4h.index[t] + FOUR_HOURS     # bar t has now closed
         slice_4h = df_4h.iloc[max(0, t - window + 1):t + 1]
         slice_1d = closed_daily_slice(df_1d, decision_time)
+        slice_1h = closed_hourly_slice(df_1h, decision_time)
 
         try:
             analysis = analyze_candidate(
-                ticker, {"4h": slice_4h, "1d": slice_1d, "1h": pd.DataFrame()},
+                ticker, {"4h": slice_4h, "1d": slice_1d, "1h": slice_1h},
                 min_rr=min_rr)
         except Exception:
             continue
