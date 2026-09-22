@@ -420,3 +420,47 @@ class TestThreeToOneDefault(unittest.TestCase):
         for t in run_backtest(m5, h1, h4, "X", enable_reentry=False):
             if t.status == "WIN":
                 self.assertAlmostEqual(t.r_result, 3.0, places=6)
+
+
+class TestSetupSnapshotsInBacktest(unittest.TestCase):
+    def test_backtest_trades_carry_features(self):
+        m5, h1, h4 = market()
+        trades = run_backtest(m5, h1, h4, "X")
+        initial = [t for t in trades if t.kind == KIND_INITIAL]
+        self.assertTrue(initial)
+        for key in ("retrace_depth_atr", "risk_pct", "session", "direction"):
+            self.assertIn(key, initial[0].features)
+
+    def test_live_plan_carries_features(self):
+        p = analyze("X", uptrend_4h(), bullish_1h(), five_min_with_support(), live_price=103.0)
+        self.assertIn("retrace_depth_atr", p.features)
+        self.assertEqual(p.features["direction"], "Long")
+
+    def test_learner_runs_on_real_backtest_trades(self):
+        from learning import learn
+        trades = []
+        for seed in range(4):
+            m5, h1, h4 = market(seed=seed + 30, days=30)
+            trades += [t for t in run_backtest(m5, h1, h4, f"C{seed}")
+                       if t.kind == KIND_INITIAL]
+        model = learn(trades)
+        self.assertGreater(model.n_trades, 0)
+        self.assertTrue(model.summary)
+
+    def test_features_use_only_past_candles(self):
+        """Altering later prices must not change features of earlier trades."""
+        m5, h1, h4 = market()
+        base = run_backtest(m5, h1, h4, "X")
+        cutoff = m5.index[4000]
+        agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+        t5 = m5.copy()
+        t5.loc[t5.index > cutoff, ["Open", "High", "Low", "Close"]] *= 2.5
+        altered = run_backtest(t5, t5.resample("1h").agg(agg).dropna(),
+                               t5.resample("4h").agg(agg).dropna(), "X")
+
+        def feats(tr_):
+            return [(t.signal_time, sorted((k, round(v, 8) if isinstance(v, float) else v)
+                                           for k, v in (t.features or {}).items()))
+                    for t in tr_ if t.exit_time is not None and t.exit_time < cutoff]
+        self.assertTrue(feats(base))
+        self.assertEqual(feats(base), feats(altered))

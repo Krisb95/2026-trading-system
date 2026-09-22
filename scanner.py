@@ -732,6 +732,7 @@ class RankedCandidate:
     entry_status: Optional[str] = None
     entry: Optional[float] = None
     price_is_live: bool = False
+    features: Optional[dict] = None     # setup snapshot, used by the learner
 
 
 def scan_universe(instruments, frame_loader, min_rr: float = 2.0,

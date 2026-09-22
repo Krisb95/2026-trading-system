@@ -136,7 +136,7 @@ class TestFiltering(unittest.TestCase):
         listings = VenueListings(bybit={"BTC"}, hyperliquid=set(),
                                   problems=["Hyperliquid unreachable: TimeoutError"])
         filtered, tags, notes = filter_universe(UNIVERSE, listings)
-        self.assertTrue(any("narrower" in n for n in notes))
+        self.assertTrue(any("missing from the list" in n for n in notes))
 
     def test_note_reports_counts(self):
         listings = VenueListings(bybit={"BTC", "ETH"}, hyperliquid={"HYPE"})
@@ -149,3 +149,50 @@ class TestFiltering(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVenueOutages(unittest.TestCase):
+    """Bybit returns 403 from the US-hosted server; the filter must cope."""
+
+    def _bybit_down(self):
+        return VenueListings(bybit=set(), hyperliquid={"BTC", "ETH", "HYPE"},
+                             problems=["Bybit unreachable: HTTPError: 403 Client Error: "
+                                       "Forbidden for url: https://api.bybit.com/v5/..."])
+
+    def test_both_mode_does_not_return_zero_coins_when_bybit_down(self):
+        from venues import MODE_BOTH
+        filtered, _, notes = filter_universe(UNIVERSE, self._bybit_down(), mode=MODE_BOTH)
+        self.assertGreater(len(filtered), 0)
+        self.assertIn("Hyperliquid (HYPE)", filtered)
+        self.assertTrue(any("instead of an empty list" in n for n in notes))
+
+    def test_legacy_require_both_flag_also_protected(self):
+        filtered, _, _ = filter_universe(UNIVERSE, self._bybit_down(), require_both=True)
+        self.assertGreater(len(filtered), 0)
+
+    def test_hyperliquid_only_mode(self):
+        from venues import MODE_HYPERLIQUID
+        listings = VenueListings(bybit={"BTC", "PEPE"}, hyperliquid={"BTC", "HYPE"})
+        filtered, _, _ = filter_universe(UNIVERSE, listings, mode=MODE_HYPERLIQUID)
+        self.assertIn("Hyperliquid (HYPE)", filtered)
+        self.assertNotIn("Pepe (PEPE)", filtered)
+
+    def test_hyperliquid_only_ignores_bybit_outage(self):
+        from venues import MODE_HYPERLIQUID
+        filtered, _, notes = filter_universe(UNIVERSE, self._bybit_down(), mode=MODE_HYPERLIQUID)
+        self.assertEqual(len(filtered), 3)
+        self.assertFalse(any("Bybit" in n for n in notes))
+
+    def test_hyperliquid_only_when_hyperliquid_down_is_flagged(self):
+        from venues import MODE_HYPERLIQUID
+        listings = VenueListings(bybit={"BTC"}, hyperliquid=set(), problems=["HL down"])
+        filtered, _, notes = filter_universe(UNIVERSE, listings, mode=MODE_HYPERLIQUID)
+        self.assertEqual(len(filtered), len(UNIVERSE))
+        self.assertTrue(any("NOT applied" in n for n in notes))
+
+    def test_geo_block_explained_in_plain_english(self):
+        from venues import MODE_EITHER
+        _, _, notes = filter_universe(UNIVERSE, self._bybit_down(), mode=MODE_EITHER)
+        joined = " ".join(notes)
+        self.assertIn("blocks requests from this server's location", joined)
+        self.assertIn("prices come from elsewhere", joined)

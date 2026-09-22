@@ -117,8 +117,14 @@ def base_asset_from_label(ticker: str) -> str:
     return ticker.upper().replace("-USD", "").strip()
 
 
+MODE_EITHER = "either"
+MODE_BOTH = "both"
+MODE_HYPERLIQUID = "hyperliquid"
+MODE_BYBIT = "bybit"
+
+
 def filter_universe(tickers: Dict[str, str], listings: VenueListings,
-                     require_both: bool = False
+                     require_both: bool = False, mode: Optional[str] = None
                      ) -> Tuple[Dict[str, str], Dict[str, List[str]], List[str]]:
     """Keep only coins listed on the chosen venues.
 
@@ -135,7 +141,33 @@ def filter_universe(tickers: Dict[str, str], listings: VenueListings,
         )
         return dict(tickers), {}, notes + listings.problems
 
-    allowed = listings.both if require_both else listings.union
+    mode = mode or (MODE_BOTH if require_both else MODE_EITHER)
+    bybit_down = not listings.bybit
+    hl_down = not listings.hyperliquid
+
+    if mode == MODE_HYPERLIQUID:
+        if hl_down:
+            notes.append("Hyperliquid couldn't be reached, so the Hyperliquid-only filter "
+                         "is NOT applied — the full list is shown.")
+            return dict(tickers), {}, notes + listings.problems
+        allowed = listings.hyperliquid
+    elif mode == MODE_BYBIT:
+        if bybit_down:
+            notes.append("Bybit couldn't be reached, so the Bybit-only filter is NOT applied "
+                         "— the full list is shown.")
+            return dict(tickers), {}, notes + listings.problems
+        allowed = listings.bybit
+    elif mode == MODE_BOTH and (bybit_down or hl_down):
+        # "Listed on both" can't be judged with one list missing — requiring it
+        # would silently return ZERO coins. Fall back to the venue that answered.
+        up = "Hyperliquid" if bybit_down else "Bybit"
+        allowed = listings.hyperliquid if bybit_down else listings.bybit
+        notes.append(f"'Both venues' needs both lists, but only {up} answered — showing "
+                     f"{up}'s coins instead of an empty list.")
+    elif mode == MODE_BOTH:
+        allowed = listings.both
+    else:
+        allowed = listings.union
     filtered: Dict[str, str] = {}
     tags: Dict[str, List[str]] = {}
     for label, ticker in tickers.items():
@@ -145,12 +177,23 @@ def filter_universe(tickers: Dict[str, str], listings: VenueListings,
             tags[label] = listings.venues_for(asset)
 
     dropped = len(tickers) - len(filtered)
-    scope = "both Bybit and Hyperliquid" if require_both else "Bybit or Hyperliquid"
+    scope = {MODE_BOTH: "both Bybit and Hyperliquid", MODE_HYPERLIQUID: "Hyperliquid",
+             MODE_BYBIT: "Bybit"}.get(mode, "Bybit or Hyperliquid")
     notes.append(
         f"Filtered to {len(filtered)} coins listed on {scope} "
         f"({dropped} dropped — exchange tokens, wrapped assets and unlisted coins)."
     )
-    if listings.problems:
-        notes.extend(listings.problems)
-        notes.append("One venue was unreachable, so the list may be narrower than it should be.")
+    relevant_down = ((mode in (MODE_EITHER, MODE_BOTH, MODE_BYBIT) and bybit_down)
+                     or (mode in (MODE_EITHER, MODE_BOTH, MODE_HYPERLIQUID) and hl_down))
+    if listings.problems and relevant_down:
+        for p in listings.problems:
+            if "403" in p or "451" in p:
+                venue = "Bybit" if "bybit" in p.lower() else "Hyperliquid"
+                notes.append(f"{venue} blocks requests from this server's location (the app "
+                             f"is hosted in the US). This only affects which coins are listed "
+                             f"— prices come from elsewhere.")
+            else:
+                notes.append(p)
+        if mode == MODE_EITHER:
+            notes.append("Coins listed only on the unreachable venue are missing from the list.")
     return filtered, tags, notes

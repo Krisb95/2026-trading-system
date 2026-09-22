@@ -15,8 +15,10 @@ deliberately pessimistic handling of ambiguous candles, so tracked results and
 backtest results are directly comparable.
 """
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
+import json
 import pandas as pd
 
 import storage
@@ -48,6 +50,7 @@ def record_from_ranked(ranked, tags: Optional[Dict[str, List[str]]] = None,
             "score": r.score, "grade": r.grade, "entry": r.entry, "stop": r.stop,
             "target": r.target, "planned_rr": r.reward_risk,
             "expiry_hours": expiry_hours, "source": "universe",
+            "features": json.dumps(r.features) if getattr(r, "features", None) else None,
         }, db_path=db_path)
         if new_id is not None:
             added += 1
@@ -128,3 +131,35 @@ def tracked_stats(db_path: str = storage.DEFAULT_DB_PATH):
             planned_rr=float(r["planned_rr"] or 0), status=r["status"],
             r_result=None if pd.isna(r["r_result"]) else float(r["r_result"])))
     return stats_by_grade(trades)
+
+
+
+@dataclass
+class TrackedTrade:
+    """A resolved tracked signal, in the shape the learner expects."""
+    signal_time: pd.Timestamp
+    features: Optional[dict]
+    r_result: Optional[float]
+    status: str
+    ticker: str = ""
+    direction: str = ""
+
+
+def tracked_trades(db_path: str = storage.DEFAULT_DB_PATH) -> List[TrackedTrade]:
+    """The app's own live trades — plan frozen at signal time, outcome resolved
+    later — with the setup snapshot each was taken with."""
+    df = storage.get_signals_df(db_path)
+    out = []
+    for _, r in df.iterrows():
+        raw = r.get("features")
+        feats = None
+        if isinstance(raw, str) and raw:
+            try:
+                feats = json.loads(raw)
+            except ValueError:
+                feats = None
+        out.append(TrackedTrade(
+            signal_time=pd.Timestamp(r["created_utc"]), features=feats,
+            r_result=None if pd.isna(r["r_result"]) else float(r["r_result"]),
+            status=r["status"], ticker=r["ticker"], direction=r["direction"]))
+    return out

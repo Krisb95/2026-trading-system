@@ -36,6 +36,7 @@ import tracking
 import trend_retrace
 import expectancy
 import explain
+import learning
 from formatting import format_price
 
 MIN_RR = 3.0   # reward:risk floor — nothing below this is shown, tracked or traded
@@ -63,6 +64,26 @@ def _plan_stage(r, use_tr):
     return explain.AT_ENTRY if r.entry_status == "AT_ZONE" else explain.WAIT_RETRACE
 
 
+def _render_learned(model):
+    """Show what the learner found, including what it rejected and why."""
+    (st.success if model.rules else st.info)(model.summary)
+    for r in model.rules:
+        st.markdown(f"**Skip setups where:** {r.description}")
+        st.caption(f"　Learning trades: {r.train_avg:+.2f}R each (n={r.train_n}) vs "
+                   f"{r.train_rest_avg:+.2f}R for the rest · Unseen trades: "
+                   f"{r.test_avg:+.2f}R each (n={r.test_n}) vs {r.test_rest_avg:+.2f}R")
+    tested = [c for c in model.candidates if c.train_avg is not None
+              and c.verdict.startswith(("Looked", "Confirmed, but"))]
+    if tested:
+        with st.expander(f"Lessons that looked promising but were rejected ({len(tested)})"):
+            st.caption("These appeared in the learning trades but failed on unseen ones — "
+                       "exactly the coincidences the hold-out check exists to catch.")
+            for c in tested:
+                ta = f"{c.test_avg:+.2f}R (n={c.test_n})" if c.test_avg is not None else "n/a"
+                st.caption(f"**{c.description}** — learning {c.train_avg:+.2f}R "
+                           f"(n={c.train_n}), unseen {ta}. {c.verdict}")
+
+
 def _config_signature(use_tr, params):
     """The settings that backtest evidence depends on. Evidence measured under
     one stop/target/strategy says nothing about another."""
@@ -71,7 +92,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-21-b25 (plain-English trade plans)"
+APP_BUILD = "2026-09-21-b27 (Hyperliquid-only filter, Bybit outage fix)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -212,10 +233,15 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("Tradable universe")
 venue_mode = st.sidebar.radio(
     "Restrict coins to",
-    ["Bybit or Hyperliquid", "Bybit AND Hyperliquid", "All top-100"],
+    ["Hyperliquid only", "Bybit or Hyperliquid", "Bybit AND Hyperliquid", "All top-100"],
     key="venue_mode",
     help="Market-cap rank includes exchange tokens (WBT, OKB) and wrapped assets you "
-         "cannot trade as perpetuals. Filtering to your venues keeps the scan actionable.")
+         "cannot trade as perpetuals. Filtering to your venue keeps the scan actionable. "
+         "Bybit blocks requests from the US server this app runs on, so its list may be "
+         "unavailable.")
+_VENUE_MODES = {"Hyperliquid only": venues_mod.MODE_HYPERLIQUID,
+                "Bybit or Hyperliquid": venues_mod.MODE_EITHER,
+                "Bybit AND Hyperliquid": venues_mod.MODE_BOTH}
 
 if venue_mode == "All top-100":
     CRYPTO_TICKERS = dict(CRYPTO_TICKERS_ALL)
@@ -225,11 +251,14 @@ else:
     _by, _hl, _vprob = _load_venue_listings()
     _listings = venues_mod.VenueListings(bybit=_by, hyperliquid=_hl, problems=_vprob)
     CRYPTO_TICKERS, VENUE_TAGS, _vnotes = venues_mod.filter_universe(
-        CRYPTO_TICKERS_ALL, _listings,
-        require_both=(venue_mode == "Bybit AND Hyperliquid"))
-    st.sidebar.caption(f"Bybit: {len(_by)} perps · Hyperliquid: {len(_hl)} perps")
+        CRYPTO_TICKERS_ALL, _listings, mode=_VENUE_MODES[venue_mode])
+    if venue_mode == "Hyperliquid only":
+        st.sidebar.caption(f"Hyperliquid: {len(_hl)} perps")
+    else:
+        st.sidebar.caption(f"Bybit: {len(_by) or 'unavailable'} · "
+                           f"Hyperliquid: {len(_hl) or 'unavailable'} perps")
     for _n in _vnotes:
-        if "NOT applied" in _n or "narrower" in _n:
+        if "NOT applied" in _n or "missing from the list" in _n or "instead of an empty" in _n:
             st.sidebar.warning(_n)
         else:
             st.sidebar.caption(_n)
@@ -583,11 +612,33 @@ with tab_scan:
                     return None, ""
                 return EVIDENCE.evidence_for(r.ticker, r.direction)
 
+            _lm_raw, _ = storage.load_value("learned_model")
+            LEARNED = None
+            if _lm_raw and _lm_raw.get("config") == _config_signature(USE_TR, TR_PARAMS):
+                LEARNED = learning.LearnedModel.from_dict(_lm_raw)
+            _has_lessons = LEARNED is not None and bool(LEARNED.rules)
+            apply_lessons = st.checkbox(
+                "Skip setups the system has learned to avoid",
+                key="uni_apply_lessons", disabled=not _has_lessons,
+                help="Hides setups matching a lesson confirmed on unseen trades.")
+            if _has_lessons:
+                st.caption("Lessons in use (from " + LEARNED.source + "): "
+                           + "; ".join(f"skip when {r_.description}" for r_ in LEARNED.rules))
+            elif LEARNED is not None:
+                st.caption("The system has checked its trades and found no lesson worth "
+                           "acting on yet — so it isn't filtering anything.")
+
+            def _lesson(r):
+                if not _has_lessons:
+                    return True, []
+                return LEARNED.check(r.features)
+
             ok = [r for r in scored_all
                   if r.score >= min_score and (not a_plus_only or r.grade == "A+")
                   and r.reward_risk is not None and r.reward_risk >= _rr_floor - 1e-9
                   and (not proven_only
-                       or _evidence(r)[0] == expectancy.PROVEN_POSITIVE)]
+                       or _evidence(r)[0] == expectancy.PROVEN_POSITIVE)
+                  and (not apply_lessons or _lesson(r)[0])]
             hidden = len(scored_all) - len(ok)
 
             st.markdown(f"##### Results · {len(ok)} shown"
@@ -617,6 +668,8 @@ with tab_scan:
                     "Trade plan": explain.short_plan(
                         r.direction, _plan_stage(r, USE_TR), r.entry, r.stop, r.target,
                         r.reward_risk, r.price),
+                    "Learned": ("—" if not _has_lessons else
+                                ("✅ OK" if _lesson(r)[0] else "⚠️ Avoid")),
                     "Evidence": {expectancy.PROVEN_POSITIVE: "✅ Proven +",
                                  expectancy.PROVEN_NEGATIVE: "❌ Proven −",
                                  expectancy.UNPROVEN: "❔ Unproven",
@@ -646,6 +699,10 @@ with tab_scan:
                             _sm, _tm = _methods(USE_TR, TR_PARAMS, r.direction)
                             _reasons = [x.strip() for x in (r.note or "").split(";") if x.strip()]
                             with st.container(border=True):
+                                _ok_l, _why_l = _lesson(r)
+                                if not _ok_l:
+                                    st.warning("⚠️ The system has learned to avoid setups like "
+                                               "this: " + "; ".join(_why_l) + ".")
                                 for line in explain.full_plan(
                                         r.label, r.direction, _plan_stage(r, USE_TR),
                                         r.entry, r.stop, r.target, r.reward_risk, r.price,
@@ -1495,6 +1552,26 @@ with tab_track:
                            "entry", "stop", "target", "status", "r_result"]],
                      use_container_width=True, hide_index=True)
 
+    st.markdown("##### 🧠 Learn from the app's own trades")
+    _tt = tracking.tracked_trades()
+    _usable = [t for t in _tt if t.status in ("WIN", "LOSS") and t.features]
+    st.caption(
+        f"{len(_usable)} resolved trade(s) with a setup snapshot so far; about "
+        f"{learning.MIN_TRADES} are needed. These are the strongest evidence available — each "
+        f"plan was locked in before its result was known.")
+    if st.button("🧠 Learn from tracked trades", use_container_width=True,
+                 disabled=len(_usable) < learning.MIN_TRADES):
+        _m = learning.learn(_tt, source=f"live tracked trades, {len(_usable)} trades")
+        st.session_state.track_model = _m
+        _md = _m.to_dict()
+        _md["config"] = _config_signature(USE_TR, TR_PARAMS)
+        storage.save_value("learned_model", _md)
+    if st.session_state.get("track_model") is not None:
+        _render_learned(st.session_state.track_model)
+    if len(_usable) < learning.MIN_TRADES:
+        st.caption("Keep scanning with tracking switched on; this unlocks once enough of the "
+                   "app's own trades have resolved.")
+
     e1, e2 = st.columns(2)
     e1.download_button("⬇️ Export tracking CSV", data=storage.signals_to_csv_bytes(),
                        file_name=f"tracked_signals_{datetime.now().date()}.csv",
@@ -1562,6 +1639,14 @@ with tab_backtest:
                                    f"{days} days").to_dict()
             _ev["config"] = _config_signature(True, TR_PARAMS)
             storage.save_value("evidence", _ev)
+            # Learn once per backtest run (not on every page refresh, which
+            # would overwrite lessons learned from live tracked trades).
+            _initial = [t for t in results_on if t.kind == trend_retrace.KIND_INITIAL]
+            _model = learning.learn(_initial, source=f"backtest, {len(_initial)} trades")
+            st.session_state.trb_model = _model
+            _md = _model.to_dict()
+            _md["config"] = _config_signature(True, TR_PARAMS)
+            storage.save_value("learned_model", _md)
 
     trb = st.session_state.get("trb")
     if trb is not None:
@@ -1636,6 +1721,18 @@ with tab_backtest:
                         "These projections assume the backtest's win rate is the true one. "
                         "Your result is not yet distinguishable from luck, so treat them as "
                         "illustrative until the evidence is stronger.")
+
+            st.markdown("##### 🧠 What the system learned")
+            st.caption(
+                "Looks for kinds of setup that lost — by trend strength, retrace depth, stop "
+                "width, 1H candle strength, volatility, session and direction — using the "
+                "earlier 70% of trades, then keeps only lessons that also held on the later "
+                "30% it never saw. Uses initial entries, so each trade stands on its own.")
+            _model = st.session_state.get("trb_model")
+            if _model is not None:
+                _render_learned(_model)
+            if _model is not None and _model.rules:
+                st.caption("These lessons are now available as a filter on the 🎯 Scanner.")
 
             with st.expander(f"All {len(res_on)} trade records"):
                 st.dataframe(pd.DataFrame([{

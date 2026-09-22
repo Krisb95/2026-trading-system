@@ -164,3 +164,34 @@ class TestMinimumRewardRisk(Base):
     def test_setup_without_rr_is_not_recorded_under_a_floor(self):
         none_rr = ranked(); none_rr.reward_risk = None
         self.assertEqual(tracking.record_from_ranked([none_rr], db_path=self.db, min_rr=3.0), 0)
+
+
+class TestSetupSnapshots(Base):
+    def test_features_are_stored_with_the_signal(self):
+        r = ranked(); r.features = {"retrace_depth_atr": 1.4, "session": "US"}
+        tracking.record_from_ranked([r], db_path=self.db)
+        trades = tracking.tracked_trades(self.db)
+        self.assertEqual(trades[0].features, {"retrace_depth_atr": 1.4, "session": "US"})
+
+    def test_signal_without_features_still_records(self):
+        tracking.record_from_ranked([ranked()], db_path=self.db)
+        self.assertIsNone(tracking.tracked_trades(self.db)[0].features)
+
+    def test_old_database_gains_features_column(self):
+        import sqlite3
+        conn = sqlite3.connect(self.db)
+        conn.execute("DROP TABLE IF EXISTS signals")
+        conn.execute("""CREATE TABLE signals (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_utc TEXT NOT NULL, ticker TEXT NOT NULL, label TEXT,
+            direction TEXT NOT NULL, score REAL, grade TEXT, entry REAL NOT NULL,
+            stop REAL NOT NULL, target REAL NOT NULL, planned_rr REAL,
+            expiry_hours REAL DEFAULT 72, status TEXT DEFAULT 'PENDING', fill_utc TEXT,
+            exit_utc TEXT, r_result REAL, last_checked_utc TEXT, source TEXT DEFAULT 'scan')""")
+        conn.commit(); conn.close()
+        r = ranked(); r.features = {"session": "Asia"}
+        tracking.record_from_ranked([r], db_path=self.db)
+        self.assertEqual(tracking.tracked_trades(self.db)[0].features, {"session": "Asia"})
+
+    def test_tracked_trades_feed_the_learner(self):
+        from learning import learn
+        self.assertEqual(learn(tracking.tracked_trades(self.db)).n_trades, 0)

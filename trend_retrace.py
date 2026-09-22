@@ -87,6 +87,7 @@ class TrendRetracePlan:
     reward_risk: Optional[float] = None
     rules: Dict[str, RuleResult] = field(default_factory=dict)
     problems: List[str] = field(default_factory=list)
+    features: Dict[str, object] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------
@@ -181,6 +182,48 @@ def stop_and_target(direction: str, entry: float, df_5m: pd.DataFrame,
     return stop, target, f"Stop {_fp(stop)} ({how}); target {_fp(target)} ({params.target_r:g}R)."
 
 
+def session_of(ts: pd.Timestamp) -> str:
+    h = ts.tz_convert("UTC").hour if ts.tzinfo else ts.hour
+    if h < 8:
+        return "Asia"
+    if h < 13:
+        return "Europe"
+    if h < 21:
+        return "US"
+    return "Late US"
+
+
+def compute_features(direction: str, price: float, entry: float, stop: float,
+                      df_4h: pd.DataFrame, df_1h: pd.DataFrame, df_5m: pd.DataFrame,
+                      when: pd.Timestamp, n_trend: int = 2) -> Dict[str, object]:
+    """Snapshot of a setup at the moment it is signalled.
+
+    Used to learn which KINDS of setup win. Computed from closed candles only,
+    and identically in live scanning and the backtest — lessons learned from
+    one only transfer to the other if the measurements are the same.
+    """
+    feats: Dict[str, object] = {}
+    a5 = atr(df_5m)
+    if df_4h is not None and len(df_4h) >= n_trend + 1:
+        first = float(df_4h["High"].iloc[-(n_trend + 1)] if direction == "Long"
+                      else df_4h["Low"].iloc[-(n_trend + 1)])
+        last = float(df_4h["High"].iloc[-1] if direction == "Long" else df_4h["Low"].iloc[-1])
+        if first:
+            feats["trend_move_pct"] = abs(last - first) / first * 100
+    if a5:
+        feats["retrace_depth_atr"] = abs(price - entry) / a5
+        feats["volatility_pct"] = a5 / price * 100 if price else None
+    if entry:
+        feats["risk_pct"] = abs(entry - stop) / entry * 100
+    if df_1h is not None and not df_1h.empty:
+        c = df_1h.iloc[-1]
+        rng = float(c["High"] - c["Low"])
+        feats["h1_body_ratio"] = abs(float(c["Close"] - c["Open"])) / rng if rng > 0 else 0.0
+    feats["session"] = session_of(when)
+    feats["direction"] = direction
+    return {k: v for k, v in feats.items() if v is not None}
+
+
 def _grade(score: float) -> str:
     return "A+" if score >= 8 else "B" if score >= 6 else "C"
 
@@ -240,6 +283,10 @@ def analyze(ticker: str, df_4h: pd.DataFrame, df_1h: pd.DataFrame,
             plan.reward_risk = params.target_r
             # The stop/target explanation belongs to the plan, not the rule —
             # keeping it out of the rule's reason avoids stating it twice.
+            _when = df_5m.index[-1] + FIVE_MIN if df_5m is not None and len(df_5m) else \
+                pd.Timestamp.now(tz="UTC")
+            plan.features = compute_features(direction, price, level, stop, df_4h, df_1h,
+                                              df_5m, _when, params.trend_candles)
         else:
             plan.problems.append(how)
     return plan
@@ -288,6 +335,7 @@ class TRTrade:
     r_result: Optional[float] = None       # per unit of this leg's own risk
     fill_time: Optional[pd.Timestamp] = None
     exit_time: Optional[pd.Timestamp] = None
+    features: Optional[Dict[str, object]] = None
 
     @property
     def weighted_r(self) -> Optional[float]:
@@ -335,14 +383,19 @@ def run_backtest(df_5m: pd.DataFrame, df_1h: pd.DataFrame, df_4h: pd.DataFrame,
                                            df_4h.iloc[:i4 + 1], params)
         if stop is None:
             return None
+        i1 = _closed_index(open_1h, ONE_HOUR, t5[k] + FIVE_MIN)
+        feats = compute_features(direction, float(c5[k]), level, stop,
+                                  df_4h.iloc[:i4 + 1], df_1h.iloc[:i1 + 1] if i1 >= 0
+                                  else pd.DataFrame(), win5, t5[k] + FIVE_MIN,
+                                  params.trend_candles)
         return {"direction": direction, "kind": kind, "weight": weight,
                 "entry": level, "stop": stop, "target": target,
-                "placed": k, "signal_time": t5[k] + FIVE_MIN}
+                "placed": k, "signal_time": t5[k] + FIVE_MIN, "features": feats}
 
     def _record(o, status, r=None, fill=None, exit_=None):
         trades.append(TRTrade(ticker, o["kind"], o["weight"], o["direction"],
                                o["signal_time"], o["entry"], o["stop"], o["target"],
-                               status, r, fill, exit_))
+                               status, r, fill, exit_, o.get("features")))
 
     def _rr(o):
         risk = abs(o["entry"] - o["stop"])
@@ -566,7 +619,7 @@ def scan_universe_tr(instruments, frame_loader, spot_loader=None,
                 stop=plan.stop, target=plan.target, reward_risk=plan.reward_risk,
                 note="; ".join(r.reason for r in plan.rules.values()),
                 entry_status=plan.stage, entry=plan.entry,
-                price_is_live=live is not None))
+                price_is_live=live is not None, features=plan.features or None))
         except Exception as e:
             out.append(RankedCandidate(ticker, label, None, 0.0, "—", "unknown",
                                         None, None, None, None,

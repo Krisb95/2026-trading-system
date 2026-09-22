@@ -157,3 +157,20 @@ The Risk tab and backtest results show what a win rate feels like to trade:
 typical and bad-case losing streaks and drawdowns. At a genuinely profitable
 30% win rate and 1% risk, a run of ~10 losses and a ~13% drop from a peak are
 typical over 100 trades — normal, not a sign the strategy has broken.
+
+## Learning from trades
+
+Every trade — backtested or forward-tracked — carries a snapshot of its setup at
+signal time: 4H trend move, retrace depth to entry, stop width, 1H candle
+strength, volatility, trading session and direction. The learner looks for kinds
+of setup that lost, using the earlier 70% of trades, and adopts a lesson only if
+it also held on the later 30% it never saw.
+
+On synthetic tests it recovered a planted losing condition in 23 of 30 datasets
+(finding a threshold of 2.73 against a true 2.7), and invented a false lesson
+from pure noise in 4 of 60. When nothing survives the unseen-trade check, it
+changes nothing and says so.
+
+Adopted lessons can filter the scanner and are flagged on trade plan cards. It
+learns only to skip losing kinds of setup; it doesn't invent new rules. Lessons
+should be re-learned as trades accumulate, since markets change.

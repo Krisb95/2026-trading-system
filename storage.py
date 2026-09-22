@@ -250,7 +250,7 @@ def clear_all(db_path: str = DEFAULT_DB_PATH) -> None:
 SIGNAL_COLUMNS = [
     "id", "created_utc", "ticker", "label", "direction", "score", "grade",
     "entry", "stop", "target", "planned_rr", "expiry_hours", "status",
-    "fill_utc", "exit_utc", "r_result", "last_checked_utc", "source",
+    "fill_utc", "exit_utc", "r_result", "last_checked_utc", "source", "features",
 ]
 
 
@@ -274,9 +274,14 @@ def _ensure_signals_table(conn) -> None:
             exit_utc TEXT,
             r_result REAL,
             last_checked_utc TEXT,
-            source TEXT DEFAULT 'scan'
+            source TEXT DEFAULT 'scan',
+            features TEXT
         )
     """)
+    # Databases created before setup snapshots existed gain the column.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(signals)")}
+    if "features" not in cols:
+        conn.execute("ALTER TABLE signals ADD COLUMN features TEXT")
 
 
 def record_signal(data: Dict[str, Any], db_path: str = DEFAULT_DB_PATH) -> Optional[int]:
