@@ -38,6 +38,8 @@ import expectancy
 import explain
 import learning
 import trade_log
+import hyperliquid_data
+import trade_review
 from formatting import format_price
 
 MIN_RR = 3.0   # reward:risk floor — nothing below this is shown, tracked or traded
@@ -120,6 +122,37 @@ def _take_trade_widget(key, ticker, direction, entry, stop, target, features=Non
             st.error(str(e))
 
 
+def _review_inputs(ticker, entry_time):
+    """Closed candles and live price for reviewing an open trade, from the same
+    source the trade came from (Hyperliquid for HL: tickers)."""
+    now = pd.Timestamp.now(tz="UTC")
+    hours = max(1.0, (now - entry_time).total_seconds() / 3600)
+    frames = {}
+    if hyperliquid_data.is_hl_ticker(ticker):
+        n5 = int(min(5000, hours * 12 + 60))
+        for tf, n in (("4h", 30), ("1h", 48), ("5m", n5)):
+            df, _e = hyperliquid_data.fetch_candles(ticker, tf, n)
+            frames[tf] = trend_retrace.drop_forming(df if df is not None else pd.DataFrame(),
+                                                   tf, now)
+        _cx, _e = hyperliquid_data.fetch_market_contexts()
+        m = next((c for c in _cx if c.ticker == ticker), None)
+        price = m.mark_price if m else None
+    else:
+        for tf, n in (("4h", 30), ("1h", 1000), ("5m", 1000)):
+            df, _e = exchanges.fetch_binance_klines(ticker, tf, limit=n)
+            if df is None:
+                df, _e = exchanges.fetch_kraken_ohlc(ticker, tf)
+            frames[tf] = trend_retrace.drop_forming(df if df is not None else pd.DataFrame(),
+                                                   tf, now)
+        price, _s, _e = exchanges.fetch_spot(ticker)
+    m5 = frames["5m"]
+    since = m5[m5.index >= entry_time] if not m5.empty else m5
+    # Older than the 5m window? Fall back to 1H candles for the excursions.
+    if not m5.empty and m5.index[0] > entry_time and not frames["1h"].empty:
+        since = frames["1h"][frames["1h"].index >= entry_time]
+    return frames, since, price, now
+
+
 def _config_signature(use_tr, params):
     """The settings that backtest evidence depends on. Evidence measured under
     one stop/target/strategy says nothing about another."""
@@ -128,7 +161,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-21-b28 (log trades you take, learn from them)"
+APP_BUILD = "2026-09-21-b30 (trade review)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -497,6 +530,27 @@ with tab_scan:
     score_evidence, seq_evidence = {}, {}
 
     if mode == "Rank the universe":
+        coin_source = st.radio(
+            "Which coins",
+            ["Top by market cap", "High volume, outside the top 20 (Hyperliquid)"],
+            key="uni_coin_source",
+            help="The second option ranks Hyperliquid perps by their 24-hour volume on "
+                 "Hyperliquid — the liquidity you'd actually trade into — and skips the "
+                 "largest coins by market cap.")
+        HL_MODE = coin_source.startswith("High volume")
+        if HL_MODE:
+            v1, v2, v3 = st.columns(3)
+            hl_exclude_n = v1.number_input("Skip the top N by market cap", min_value=0,
+                                           max_value=100, value=20, step=5, key="hl_excl")
+            hl_min_vol = v2.number_input("Min 24h volume ($M)", min_value=0.0, value=20.0,
+                                         step=5.0, key="hl_minvol",
+                                         help="Volume on Hyperliquid only. Thinner markets "
+                                              "mean wider spreads and more slippage.")
+            hl_count = v3.selectbox("How many coins", [10, 20, 30], index=1, key="hl_count")
+            st.caption(
+                "⚠️ High volume outside the top coins often means a sharp move, news or a "
+                "pump. These markets are usually more volatile, and your strategy hasn't "
+                "been backtested on them — treat results with extra caution.")
         if USE_TR:
             st.caption(
                 "Applies your three rules to each coin: **two 4H candles of higher highs and "
@@ -505,9 +559,13 @@ with tab_scan:
                 "all three rules scores 10/10; the score is a checklist count, not a "
                 "probability of profit."
             )
-            universe_size = st.selectbox("How many coins", [10, 20, 30, 50], index=1,
-                                          key="uni_size",
-                                          help="More coins means more API calls and a longer wait.")
+            if HL_MODE:
+                universe_size = hl_count
+            else:
+                universe_size = st.selectbox("How many coins", [10, 20, 30, 50], index=1,
+                                              key="uni_size",
+                                              help="More coins means more API calls and a "
+                                                   "longer wait.")
             uni_direction, uni_min_rr = "Auto", 3.0
         else:
             st.caption(
@@ -516,19 +574,27 @@ with tab_scan:
                 "full single-instrument scan on anything promising."
             )
             u1, u2, u3 = st.columns(3)
-            universe_size = u1.selectbox("How many coins", [10, 20, 30, 50],
-                                          index=1, key="uni_size",
-                                          help="More coins means more API calls and a longer wait.")
+            if HL_MODE:
+                universe_size = hl_count
+            else:
+                universe_size = u1.selectbox("How many coins", [10, 20, 30, 50],
+                                              index=1, key="uni_size",
+                                              help="More coins means more API calls and a "
+                                                   "longer wait.")
             uni_direction = u2.selectbox("Direction", ["Auto", "Long", "Short"], key="uni_dir")
             uni_min_rr = u3.number_input("Min R:R", min_value=3.0, value=3.0,
                                           step=0.5, key="uni_rr")
 
-        per_coin = 0.6 if CRYPTO_SOURCE == "exchange" else 1.4   # 4 calls/coin: 4H, 1D, 1H, spot
-        est = universe_size * per_coin
-        st.caption(
-            f"Roughly {est:.0f}s for {universe_size} coins using "
-            f"{'exchange data (fast — no meaningful rate limit)' if CRYPTO_SOURCE == 'exchange' else 'CoinGecko (calls spaced to avoid 429s)'}."
-        )
+        if HL_MODE:
+            st.caption(f"Roughly {universe_size * 4.5 + 2:.0f}s for {universe_size} coins — "
+                       f"Hyperliquid limits request rates, so calls are paced.")
+        else:
+            per_coin = 0.6 if CRYPTO_SOURCE == "exchange" else 1.4   # 4 calls/coin
+            est = universe_size * per_coin
+            st.caption(
+                f"Roughly {est:.0f}s for {universe_size} coins using "
+                f"{'exchange data (fast — no meaningful rate limit)' if CRYPTO_SOURCE == 'exchange' else 'CoinGecko (calls spaced to avoid 429s)'}."
+            )
 
         st.checkbox("Record B-or-better setups for forward tracking",
                     value=True, key="track_signals",
@@ -536,15 +602,39 @@ with tab_scan:
                          "checked later against what price actually did.")
 
         if st.button("🔎 Scan universe", use_container_width=True):
-            labels = list(CRYPTO_TICKERS)[:universe_size]
-            instruments = [(lbl, CRYPTO_TICKERS[lbl],
-                             (CRYPTO_TICKERS[lbl], CRYPTO_CG_IDS.get(lbl)))
-                           for lbl in labels]
+            hl_marks = {}
+            if HL_MODE:
+                _ctxs, _hl_err = hyperliquid_data.fetch_market_contexts()
+                if not _ctxs:
+                    st.error(f"Couldn't load Hyperliquid volumes: {_hl_err}")
+                _top = {v.upper().replace("-USD", "")
+                        for v in list(CRYPTO_TICKERS_ALL.values())[:int(hl_exclude_n)]}
+                _picks = hyperliquid_data.rank_by_volume(
+                    _ctxs, exclude_bases=_top, min_volume_usd=hl_min_vol * 1e6,
+                    limit=universe_size)
+                if _ctxs and not _picks:
+                    st.warning("No Hyperliquid coins met the volume minimum after skipping "
+                               "the top coins. Lower the minimum and try again.")
+                instruments = [(c.label, c.ticker, (c.ticker, None)) for c in _picks]
+                hl_marks = {c.ticker: c.mark_price for c in _picks}
+                st.session_state.hl_info = {c.ticker: c for c in _picks}
+            else:
+                labels = list(CRYPTO_TICKERS)[:universe_size]
+                instruments = [(lbl, CRYPTO_TICKERS[lbl],
+                                 (CRYPTO_TICKERS[lbl], CRYPTO_CG_IDS.get(lbl)))
+                               for lbl in labels]
+                st.session_state.hl_info = {}
 
             bar = st.progress(0.0, text="Starting…")
 
             def _loader(payload):
                 ticker, coin_id = payload
+                if hyperliquid_data.is_hl_ticker(ticker):
+                    out = {}
+                    for tf, n in (("4h", 300), ("1d", 200), ("1h", 200)):
+                        df, _e = hyperliquid_data.fetch_candles(ticker, tf, n)
+                        out[tf] = df if df is not None else pd.DataFrame()
+                    return out, []
                 if CRYPTO_SOURCE == "exchange":
                     df, err = exchanges.fetch_binance_klines(ticker, "4h")
                     fetch_1d = exchanges.fetch_binance_klines
@@ -571,6 +661,8 @@ with tab_scan:
                 """Live spot price for the Price column and entry maths. Without
                 this, 'Price' was the last 4H close — up to four hours stale."""
                 ticker, coin_id = payload
+                if hyperliquid_data.is_hl_ticker(ticker):
+                    return hl_marks.get(ticker)        # already fetched with the volumes
                 px, _src, _err = exchanges.fetch_spot(ticker)
                 if px is None and coin_id:
                     px, _upd, _e = coingecko.fetch_spot_price(coin_id)
@@ -583,6 +675,11 @@ with tab_scan:
                 """4H, 1H and 5m candles for the Trend Retrace rules."""
                 ticker, _coin_id = payload
                 out = {}
+                if hyperliquid_data.is_hl_ticker(ticker):
+                    for tf, lim in (("4h", 30), ("1h", 48), ("5m", 400)):
+                        df, _e = hyperliquid_data.fetch_candles(ticker, tf, lim)
+                        out[tf] = df if df is not None else pd.DataFrame()
+                    return out
                 for tf, lim in (("4h", 30), ("1h", 48), ("5m", 400)):
                     df, _e = exchanges.fetch_binance_klines(ticker, tf, limit=lim)
                     if df is None:
@@ -699,6 +796,7 @@ with tab_scan:
                     g = (r.entry - r.price) / r.price * 100
                     return "at price" if abs(g) < 0.05 else f"{g:+.2f}%"
 
+                _hlinfo = st.session_state.get("hl_info") or {}
                 table = pd.DataFrame([{
                     "Instrument": r.label,
                     "Trade plan": explain.short_plan(
@@ -710,7 +808,12 @@ with tab_scan:
                                  expectancy.PROVEN_NEGATIVE: "❌ Proven −",
                                  expectancy.UNPROVEN: "❔ Unproven",
                                  expectancy.TOO_FEW: "— Too few"}.get(_evidence(r)[0], "—"),
-                    "Venue": "/".join(VENUE_TAGS.get(r.label, [])) or "—",
+                    "Venue": ("HL" if hyperliquid_data.is_hl_ticker(r.ticker)
+                              else "/".join(VENUE_TAGS.get(r.label, [])) or "—"),
+                    **({"24h volume": f"${_hlinfo[r.ticker].day_volume_usd / 1e6:,.0f}M",
+                        "Open interest": f"${_hlinfo[r.ticker].open_interest_usd / 1e6:,.0f}M",
+                        "Funding (1h)": f"{_hlinfo[r.ticker].funding_rate * 100:+.4f}%"}
+                       if r.ticker in _hlinfo else {}),
                     "Score": f"{r.score:.1f}",
                     "Grade": r.grade,
                     "Dir": r.direction or "—",
@@ -1207,7 +1310,13 @@ with tab_positions:
                                            value=float(cprice), format="%.8f",
                                            key=f"cp_{pid}")
                 if fc2.button("↻ Fetch", key=f"fetch_{pid}"):
-                    px, src, err = exchanges.fetch_spot(r["asset"])
+                    if hyperliquid_data.is_hl_ticker(r["asset"]):
+                        _cx, err = hyperliquid_data.fetch_market_contexts()
+                        _m = next((c for c in _cx if c.ticker == r["asset"]), None)
+                        px, src = (_m.mark_price, "Hyperliquid") if _m else (None, None)
+                        err = err or ("not listed on Hyperliquid" if _m is None else None)
+                    else:
+                        px, src, err = exchanges.fetch_spot(r["asset"])
                     if px is not None:
                         st.session_state[f"cp_{pid}"] = float(px)
                         st.success(f"{src}: {format_price(px)}")
@@ -1520,6 +1629,66 @@ with tab_journal:
             if _r is not None:
                 st.caption(f"Result: **{_r:+.2f}R** — {trade_log.pl_status_for(_r).lower()}, "
                            f"measured against your original stop of {format_price(_init)}.")
+            if st.button("🔍 Review this trade", key=f"rv_go_{jid}", use_container_width=True):
+                with st.spinner("Reviewing…"):
+                    _et = pd.Timestamp(jr["timestamp_utc"])
+                    _et = _et.tz_localize("UTC") if _et.tzinfo is None else _et
+                    _fr, _since, _px, _now = _review_inputs(jr["asset"], _et)
+                    if _px is None:
+                        st.error("Couldn't fetch a current price for this coin.")
+                    else:
+                        st.session_state[f"rv_{jid}"] = (trade_review.review(
+                            direction=jr["direction"], entry=float(jr["entry"]),
+                            stop=float(jr["sl"]), target=float(jr["tp"]), entry_time=_et,
+                            price=float(_px), now=_now, df_4h=_fr["4h"], df_1h=_fr["1h"],
+                            candles_since_entry=_since,
+                            structure_candles=_fr["5m"].tail(200),
+                            atr_value=trend_retrace.atr(_fr["5m"]),
+                            trend_candles=(TR_PARAMS.trend_candles if TR_PARAMS else 2),
+                            stale_hours=st.session_state.get("trb_stale", 12.0)), float(_px))
+
+            _rv = st.session_state.get(f"rv_{jid}")
+            if _rv is not None:
+                rv, rv_px = _rv
+                box = {trade_review.HOLD: st.success, trade_review.TIGHTEN: st.info,
+                       trade_review.CLOSE: st.warning,
+                       trade_review.CLOSE_THESIS: st.error}[rv.verdict]
+                box(f"**Review: {rv.verdict}**")
+                for why in rv.reasons:
+                    st.caption(f"• {why}")
+                for act in rv.actions:
+                    st.markdown(act)
+                if rv.current_r is not None:
+                    rc1, rc2, rc3 = st.columns(3)
+                    rc1.metric("Close now", f"{rv.close_now_r:+.2f}R")
+                    rc2.metric("If stop hits", f"{rv.stop_r:+.2f}R")
+                    rc3.metric("If target hits", f"{rv.target_r:+.2f}R")
+                if rv.suggested_stop is not None:
+                    widening = (rv.suggested_stop < float(jr["sl"]) if jr["direction"] == "Long"
+                                else rv.suggested_stop > float(jr["sl"]))
+                    if not widening and st.button(
+                            f"Move stop to {format_price(rv.suggested_stop)}",
+                            key=f"rv_sl_{jid}"):
+                        storage.update_journal_entry(jid, sl=float(rv.suggested_stop),
+                                                     updated_sl=float(rv.suggested_stop))
+                        st.success("Stop updated in the journal — remember to move it on "
+                                   "Hyperliquid too. Results still count against your "
+                                   "original stop.")
+                        st.session_state.pop(f"rv_{jid}", None)
+                        st.rerun()
+                if rv.verdict in (trade_review.CLOSE, trade_review.CLOSE_THESIS):
+                    if st.button(f"Close now at {format_price(rv_px)} ({rv.close_now_r:+.2f}R)",
+                                 key=f"rv_close_{jid}"):
+                        trade_log.complete_trade(jid, exit_price=rv_px,
+                                                 exit_reason=f"Closed early after review: "
+                                                             f"{rv.verdict}")
+                        st.success("Completed in the journal — remember to close it on "
+                                   "Hyperliquid too.")
+                        st.session_state.pop(f"rv_{jid}", None)
+                        st.rerun()
+                st.caption("The review is a second opinion based on your rules, not an "
+                           "instruction. Nothing is changed on the exchange.")
+
             if st.button("✅ Complete trade", key=f"cm_go_{jid}", use_container_width=True):
                 trade_log.complete_trade(jid, exit_price=exit_px, actual_entry=fill_px,
                                          final_stop=fin_sl, final_target=fin_tp, fees=fees,
@@ -1655,6 +1824,9 @@ with tab_track:
         bar = st.progress(0.0, text="Checking…")
 
         def _bars(ticker):
+            if hyperliquid_data.is_hl_ticker(ticker):
+                df, _err = hyperliquid_data.fetch_candles(ticker, "1h", 1000)
+                return df
             df, _err = exchanges.fetch_binance_klines(ticker, "1h", limit=1000)
             if df is None:
                 df, _err = exchanges.fetch_kraken_ohlc(ticker, "1h")
@@ -1753,13 +1925,18 @@ with tab_backtest:
                              help="Longer history = more trades = more trustworthy, but slower.")
     trb_fee = bc3.number_input("Costs per trade (R)", min_value=0.0, value=0.05, step=0.01,
                                format="%.2f", key="trb_fee")
+    trb_stale = st.number_input(
+        "Treat a trade as stale after (hours)", min_value=2.0, max_value=72.0, value=12.0,
+        step=1.0, key="trb_stale",
+        help="Used to test the trade review's 'close stale trades' rule, and by the "
+             "review itself on the Journal tab.")
     days = int(trb_days.split()[0])
     st.caption(f"Fetches ~{days * 288:,} five-minute candles per coin. "
                f"Allow roughly {max(1, trb_size * days // 60)} minute(s).")
 
     if st.button("▶ Run backtest", use_container_width=True, key="trb_run"):
         labels = list(CRYPTO_TICKERS)[:trb_size]
-        results_on, results_off, failures = [], [], []
+        results_on, results_off, results_rev, failures = [], [], [], []
         bar = st.progress(0.0, text="Starting…")
         for i_, lbl in enumerate(labels):
             tk = CRYPTO_TICKERS[lbl]
@@ -1777,8 +1954,13 @@ with tab_backtest:
                                                       fee_r=trb_fee, enable_reentry=True)
             results_off += trend_retrace.run_backtest(m5, h1, h4, tk, params=TR_PARAMS,
                                                        fee_r=trb_fee, enable_reentry=False)
+            results_rev += trend_retrace.run_backtest(m5, h1, h4, tk, params=TR_PARAMS,
+                                                       fee_r=trb_fee, enable_reentry=True,
+                                                       exit_on_reversal=True,
+                                                       exit_stale_hours=trb_stale)
         bar.empty()
         st.session_state.trb = (results_on, results_off, failures)
+        st.session_state.trb_review = results_rev
         if results_on:
             _ev = expectancy.EvidenceBook.from_trades(
                 results_on, source=f"Trend Retrace backtest, {trb_size} coins, "
@@ -1839,6 +2021,34 @@ with tab_backtest:
                 "break-even before costs (about 33% wins at 2R) and lose roughly the cost per "
                 "trade after costs. So an edge has to show up as clearly positive, after "
                 "costs, across plenty of trades.")
+            _rev = st.session_state.get("trb_review")
+            if _rev:
+                _rs = next(x for x in trend_retrace.backtest_stats(_rev) if x.group == "All")
+                st.markdown("##### Does reviewing trades help?")
+                st.caption(
+                    f"Replays the same history applying the trade review's two early exits: "
+                    f"close when the 4H trend reverses, and close a trade that has gone "
+                    f"nowhere for {st.session_state.get('trb_stale', 12):g}h while the 1H "
+                    f"turns against it.")
+                rA, rB = st.columns(2)
+                rA.metric("Following the plan", f"{on_total:+.1f}R")
+                rB.metric("With review exits", f"{_rs.total_r:+.1f}R",
+                          f"{_rs.total_r - on_total:+.1f}R")
+                _early = [t for t in _rev if t.exit_reason in ("reversal", "stale")]
+                _diff = _rs.total_r - on_total
+                if _luck is not None and abs(_diff) < _luck:
+                    st.info(f"The difference is inside the ±{_luck:.0f}R luck range — no "
+                            f"evidence either way yet. Following the plan is the safer default.")
+                elif _diff > 0:
+                    st.success("Closing stale and reversed trades improved results by more "
+                               "than luck explains — the review's 'close' advice is worth "
+                               "taking seriously for this strategy.")
+                else:
+                    st.warning("Closing early made results worse by more than luck explains — "
+                               "sideways trades often recover in this strategy. Lean towards "
+                               "holding to the stop.")
+                st.caption(f"{len(_early)} trade(s) were closed early by the review rules.")
+
             _all = next(x for x in stats if x.group == "All")
             if _all.entries >= 10 and _all.win_rate is not None:
                 st.markdown("##### What trading this would feel like")

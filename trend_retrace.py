@@ -336,6 +336,7 @@ class TRTrade:
     fill_time: Optional[pd.Timestamp] = None
     exit_time: Optional[pd.Timestamp] = None
     features: Optional[Dict[str, object]] = None
+    exit_reason: str = ""            # "stop" / "target" / "reversal" / "stale" / ""
 
     @property
     def weighted_r(self) -> Optional[float]:
@@ -350,7 +351,17 @@ def _closed_index(open_times: np.ndarray, bar_len: pd.Timedelta, t: pd.Timestamp
 def run_backtest(df_5m: pd.DataFrame, df_1h: pd.DataFrame, df_4h: pd.DataFrame,
                   ticker: str, params: Optional[StrategyParams] = None,
                   expiry_bars: int = 288, reentry_timeout_bars: int = 576,
-                  fee_r: float = 0.0, enable_reentry: bool = True) -> List[TRTrade]:
+                  fee_r: float = 0.0, enable_reentry: bool = True,
+                  exit_on_reversal: bool = False,
+                  exit_stale_hours: Optional[float] = None) -> List[TRTrade]:
+    """exit_on_reversal / exit_stale_hours apply the trade review's two early-exit
+    rules, so the backtest can measure whether they actually help:
+      * reversal — close when the 4H candles start trending the other way
+      * stale    — close a trade open this many hours that has gone nowhere
+                   (under 0.5R either way, never reached +1R) while the last
+                   closed 1H candle runs against it
+    Early exits close at the 5m close and do not trigger the re-entry rules,
+    which are for stop-outs."""
     params = params or StrategyParams()
     trades: List[TRTrade] = []
     if any(d is None or d.empty for d in (df_5m, df_1h, df_4h)):
@@ -392,10 +403,10 @@ def run_backtest(df_5m: pd.DataFrame, df_1h: pd.DataFrame, df_4h: pd.DataFrame,
                 "entry": level, "stop": stop, "target": target,
                 "placed": k, "signal_time": t5[k] + FIVE_MIN, "features": feats}
 
-    def _record(o, status, r=None, fill=None, exit_=None):
+    def _record(o, status, r=None, fill=None, exit_=None, why=""):
         trades.append(TRTrade(ticker, o["kind"], o["weight"], o["direction"],
                                o["signal_time"], o["entry"], o["stop"], o["target"],
-                               status, r, fill, exit_, o.get("features")))
+                               status, r, fill, exit_, o.get("features"), why))
 
     def _rr(o):
         risk = abs(o["entry"] - o["stop"])
@@ -442,6 +453,8 @@ def run_backtest(df_5m: pd.DataFrame, df_1h: pd.DataFrame, df_4h: pd.DataFrame,
                         reentry_since = k
                     else:
                         order["fill"] = t5[k]
+                        order["fill_k"] = k
+                        order["mfe"] = 0.0
                         legs = [order]
                         state = "IN_TRADE" if state == "PENDING" else "RE_HALF"
                 else:
@@ -459,12 +472,37 @@ def run_backtest(df_5m: pd.DataFrame, df_1h: pd.DataFrame, df_4h: pd.DataFrame,
             long = base["direction"] == "Long"
             hit_stop = l5[k] <= base["stop"] if long else h5[k] >= base["stop"]
             hit_tgt = h5[k] >= base["target"] if long else l5[k] <= base["target"]
-            if hit_stop or hit_tgt:
+            risk0 = abs(base["entry"] - base["stop"])
+            if risk0 > 0:
+                fav = (h5[k] - base["entry"]) if long else (base["entry"] - l5[k])
+                base["mfe"] = max(base.get("mfe", 0.0), fav / risk0)
+            early = None
+            if not (hit_stop or hit_tgt):
+                cur_r = (((c5[k] - base["entry"]) if long else (base["entry"] - c5[k]))
+                         / risk0) if risk0 > 0 else 0.0
+                opposite = "Short" if long else "Long"
+                if exit_on_reversal and trend is not None and trend != base["direction"]:
+                    early = "reversal"
+                elif (exit_stale_hours and "fill_k" in base
+                      and (k - base["fill_k"]) * 5 / 60 >= exit_stale_hours
+                      and abs(cur_r) < 0.5 and base.get("mfe", 0.0) < 1.0
+                      and _h1_ok(i1, opposite)):
+                    early = "stale"
+            if early:
+                for leg in legs:
+                    lr = abs(leg["entry"] - leg["stop"])
+                    mv = (c5[k] - leg["entry"]) if long else (leg["entry"] - c5[k])
+                    r_leg = (mv / lr if lr else 0.0) - fee_r
+                    _record(leg, "WIN" if r_leg > 0 else "LOSS", r_leg, leg["fill"],
+                            t5[k], early)
+                legs = []
+                state = "FLAT"
+            elif hit_stop or hit_tgt:
                 for leg in legs:
                     if hit_stop:
-                        _record(leg, "LOSS", -1.0 - fee_r, leg["fill"], t5[k])
+                        _record(leg, "LOSS", -1.0 - fee_r, leg["fill"], t5[k], "stop")
                     else:
-                        _record(leg, "WIN", _rr(leg) - fee_r, leg["fill"], t5[k])
+                        _record(leg, "WIN", _rr(leg) - fee_r, leg["fill"], t5[k], "target")
                 legs = []
                 if hit_stop and enable_reentry:
                     state, reentry_dir, stop_time, reentry_since = (
@@ -479,7 +517,7 @@ def run_backtest(df_5m: pd.DataFrame, df_1h: pd.DataFrame, df_4h: pd.DataFrame,
                     price = float(c5[k])
                     second = dict(base)
                     second.update({"kind": KIND_RE2, "entry": price, "fill": t5[k],
-                                   "signal_time": now})
+                                   "signal_time": now, "fill_k": k})
                     valid = (price > base["stop"]) if long else (price < base["stop"])
                     if valid:
                         legs.append(second)

@@ -191,3 +191,44 @@ your **original** stop.
 Completed trades feed the same learner as backtests and forward tracking, with
 the same unseen-trade check. **Export the journal before every app update** —
 Streamlit wipes the database on redeploy — and restore it with the import box.
+
+## High-volume coins outside the top 20
+
+The universe scan can rank coins by their **24-hour volume on Hyperliquid**
+instead of by market cap, skipping the largest coins (top 20 by default) and
+anything below a minimum volume. It uses Hyperliquid's own volume — the
+liquidity you would trade into — and its own candles and mark prices, so coins
+not listed on Binance can still be scanned. Results show 24h volume, open
+interest and hourly funding.
+
+Hyperliquid limits request rates, so candle requests are paced at one per
+1.5 seconds (about 4.5 seconds per coin). Some coins trade in bundles of 1,000
+(e.g. kPEPE); their prices are per 1,000 and are labelled so. Tickers from this
+source are prefixed "HL:" so tracking and the journal always fetch from the
+same place.
+
+Caution: high volume away from the top coins often reflects a sharp move, news
+or a pump. These markets are more volatile, and the strategy has not been
+backtested on them.
+
+## Reviewing an open trade
+
+Each open trade on the Journal tab has a **Review this trade** button. It
+re-checks the trade against your rules using fresh, closed candles:
+
+- **Thesis** — is the 4H trend still in your direction, paused, or reversed?
+- **Progress** — current R, and the best and worst reached since entry
+- **Time** — whether it has gone nowhere for longer than the stale threshold
+- **1H** — whether the last closed 1H candle runs against the trade
+- **Structure** — whether a newer swing allows a *tighter* stop
+
+It recommends **Hold**, **Tighten the stop**, **Consider closing early**, or
+**Close — the reason you entered no longer holds**, and shows the cost of closing
+now against the stop and the target. It never suggests widening a stop.
+
+The backtest measures whether the review's early exits actually help, by
+replaying history with and without them. Caution: in a 3:1 strategy many
+winners go sideways first, so closing stale trades can cut off the wins that
+pay for the losses. A broken 4H thesis is the clearer signal — though it is
+rare, because most trades end within a few hours while a 4H reversal needs
+at least eight hours to form.

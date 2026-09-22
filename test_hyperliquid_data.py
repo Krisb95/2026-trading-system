@@ -1,0 +1,234 @@
+import unittest
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import hyperliquid_data as hl
+
+hl.configure(spacing=0.0, max_retries=0, backoff=0.0)
+
+
+class FakeResp:
+    def __init__(self, payload, status=200):
+        self._p, self.status_code = payload, status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._p
+
+
+META = [
+    {"universe": [{"name": "BTC", "maxLeverage": 40}, {"name": "HYPE", "maxLeverage": 10},
+                  {"name": "kPEPE", "maxLeverage": 10},
+                  {"name": "DEAD", "isDelisted": True}, {"name": "WIF"}]},
+    [{"markPx": "80000", "prevDayPx": "79000", "dayNtlVlm": "2000000000",
+      "openInterest": "10000", "funding": "0.0000125"},
+     {"markPx": "40", "prevDayPx": "38", "dayNtlVlm": "300000000",
+      "openInterest": "5000000", "funding": "0.00002"},
+     {"markPx": "0.012", "prevDayPx": "0.011", "dayNtlVlm": "90000000",
+      "openInterest": "900000000", "funding": "-0.00001"},
+     {"markPx": "1", "prevDayPx": "1", "dayNtlVlm": "999999999", "openInterest": "1"},
+     {"markPx": "2.5", "prevDayPx": "2.4", "dayNtlVlm": "40000000",
+      "openInterest": "1000000", "funding": "0.00001"}],
+]
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.orig = hl.requests.post
+
+    def tearDown(self):
+        hl.requests.post = self.orig
+
+
+class TestMarketContexts(Base):
+    def test_parses_volume_price_oi_funding(self):
+        hl.requests.post = lambda *a, **k: FakeResp(META)
+        ctxs, err = hl.fetch_market_contexts()
+        self.assertIsNone(err)
+        btc = next(c for c in ctxs if c.name == "BTC")
+        self.assertEqual(btc.day_volume_usd, 2e9)
+        self.assertEqual(btc.mark_price, 80000.0)
+        self.assertEqual(btc.open_interest_usd, 10000 * 80000)
+        self.assertAlmostEqual(btc.change_24h_pct, 1000 / 79000 * 100)
+
+    def test_skips_delisted(self):
+        hl.requests.post = lambda *a, **k: FakeResp(META)
+        names = {c.name for c in hl.fetch_market_contexts()[0]}
+        self.assertNotIn("DEAD", names)
+
+    def test_network_failure_reported(self):
+        hl.requests.post = lambda *a, **k: (_ for _ in ()).throw(ConnectionError("down"))
+        ctxs, err = hl.fetch_market_contexts()
+        self.assertEqual(ctxs, [])
+        self.assertIn("ConnectionError", err)
+
+    def test_malformed_response_reported(self):
+        hl.requests.post = lambda *a, **k: FakeResp({"oops": 1})
+        self.assertEqual(hl.fetch_market_contexts()[0], [])
+
+    def test_rate_limit_reported(self):
+        hl.requests.post = lambda *a, **k: FakeResp({}, status=429)
+        ctxs, err = hl.fetch_market_contexts()
+        self.assertIn("429", err)
+
+
+class TestKCoins(unittest.TestCase):
+    def test_k_prefix_is_a_bundle_of_1000(self):
+        self.assertEqual(hl.base_symbol("kPEPE"), "PEPE")
+        self.assertEqual(hl.bundle_size("kPEPE"), 1000)
+
+    def test_normal_coin_unchanged(self):
+        self.assertEqual(hl.base_symbol("BTC"), "BTC")
+        self.assertEqual(hl.bundle_size("BTC"), 1)
+
+    def test_label_warns_about_bundles(self):
+        c = hl.MarketContext("kPEPE", 1.0, 0.01, 1.0, 0.0, None, None)
+        self.assertIn("per 1,000", c.label)
+
+    def test_tickers_are_prefixed_so_prices_never_mix(self):
+        c = hl.MarketContext("kPEPE", 1.0, 0.01, 1.0, 0.0, None, None)
+        self.assertEqual(c.ticker, "HL:kPEPE")
+        self.assertTrue(hl.is_hl_ticker(c.ticker))
+        self.assertEqual(hl.hl_name(c.ticker), "kPEPE")
+        self.assertFalse(hl.is_hl_ticker("PEPE-USD"))
+
+
+class TestRanking(Base):
+    def _ctxs(self):
+        hl.requests.post = lambda *a, **k: FakeResp(META)
+        return hl.fetch_market_contexts()[0]
+
+    def test_excludes_top_market_cap_coins(self):
+        ranked = hl.rank_by_volume(self._ctxs(), exclude_bases={"BTC"}, limit=10)
+        self.assertNotIn("BTC", [c.name for c in ranked])
+
+    def test_excludes_k_coins_by_underlying_token(self):
+        ranked = hl.rank_by_volume(self._ctxs(), exclude_bases={"PEPE"}, limit=10)
+        self.assertNotIn("kPEPE", [c.name for c in ranked])
+
+    def test_sorted_by_volume(self):
+        ranked = hl.rank_by_volume(self._ctxs(), exclude_bases=set(), limit=10)
+        vols = [c.day_volume_usd for c in ranked]
+        self.assertEqual(vols, sorted(vols, reverse=True))
+
+    def test_minimum_volume(self):
+        ranked = hl.rank_by_volume(self._ctxs(), exclude_bases=set(),
+                                   min_volume_usd=50_000_000)
+        self.assertTrue(all(c.day_volume_usd >= 50_000_000 for c in ranked))
+        self.assertNotIn("WIF", [c.name for c in ranked])
+
+    def test_limit(self):
+        self.assertEqual(len(hl.rank_by_volume(self._ctxs(), set(), limit=2)), 2)
+
+
+class TestCandles(Base):
+    def test_parses_candles(self):
+        rows = [{"t": 1758000000000 + i * 14400000, "T": 0, "s": "BTC", "i": "4h",
+                 "o": "100", "h": "110", "l": "95", "c": "105", "v": "12", "n": 3}
+                for i in range(5)]
+        seen = {}
+
+        def post(url, json=None, **k):
+            seen.update(json)
+            return FakeResp(rows)
+
+        hl.requests.post = post
+        df, err = hl.fetch_candles("HL:BTC", "4h", 5)
+        self.assertIsNone(err)
+        self.assertEqual(list(df.columns), ["Open", "High", "Low", "Close", "Volume"])
+        self.assertEqual(df["High"].iloc[0], 110.0)
+        self.assertEqual(str(df.index.tz), "UTC")
+        self.assertEqual(seen["req"]["coin"], "BTC")     # prefix stripped for the API
+
+    def test_empty_candles_reported(self):
+        hl.requests.post = lambda *a, **k: FakeResp([])
+        df, err = hl.fetch_candles("BTC", "4h", 5)
+        self.assertIsNone(df)
+        self.assertIsNotNone(err)
+
+    def test_unsupported_interval(self):
+        df, err = hl.fetch_candles("BTC", "7m", 5)
+        self.assertIsNone(df)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestEndToEndHighVolumeScan(Base):
+    """Volume ranking -> Hyperliquid candles -> Trend Retrace -> ranked setups,
+    against a simulated Hyperliquid API."""
+
+    def _fake_api(self):
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+        from test_trend_retrace import uptrend_4h, bullish_1h, five_min_with_support
+        frames = {"4h": uptrend_4h(), "1h": bullish_1h(), "5m": five_min_with_support()}
+
+        def to_rows(df):
+            return [{"t": int(ts.value // 1_000_000), "o": str(r.Open), "h": str(r.High),
+                     "l": str(r.Low), "c": str(r.Close), "v": "1"} for ts, r in df.iterrows()]
+
+        def post(url, json=None, **k):
+            if json["type"] == "metaAndAssetCtxs":
+                return FakeResp(META)
+            return FakeResp(to_rows(frames[json["req"]["interval"]]))
+        return post
+
+    def test_scan_excludes_top_coins_and_ranks_setups(self):
+        import pandas as pd
+        import trend_retrace
+        hl.requests.post = self._fake_api()
+        ctxs, err = hl.fetch_market_contexts()
+        picks = hl.rank_by_volume(ctxs, exclude_bases={"BTC"}, min_volume_usd=30e6, limit=10)
+        self.assertNotIn("BTC", [c.name for c in picks])
+        marks = {c.ticker: 103.0 for c in picks}      # price near the fixture's range
+        instruments = [(c.label, c.ticker, (c.ticker, None)) for c in picks]
+
+        def loader(payload):
+            ticker, _ = payload
+            out = {}
+            for tf, n in (("4h", 30), ("1h", 48), ("5m", 400)):
+                df, _e = hl.fetch_candles(ticker, tf, n)
+                out[tf] = df if df is not None else pd.DataFrame()
+            return out
+
+        ranked = trend_retrace.scan_universe_tr(
+            instruments, loader, spot_loader=lambda p: marks.get(p[0]),
+            now=pd.Timestamp("2030-01-01", tz="UTC"))
+        self.assertEqual(len(ranked), len(picks))
+        self.assertTrue(all(r.ticker.startswith("HL:") for r in ranked))
+        top = ranked[0]
+        self.assertEqual(top.score, 10)
+        self.assertTrue(top.price_is_live)
+
+    def test_tracked_hl_signal_resolves_from_hl_candles(self):
+        import tempfile, os
+        import pandas as pd
+        import storage, tracking
+        from scanner import RankedCandidate
+        fd, db = tempfile.mkstemp(suffix=".db"); os.close(fd); os.unlink(db)
+        storage.init_db(db)
+        try:
+            r = RankedCandidate("HL:WIF", "WIF", "Long", 10.0, "A+", "", 2.6, 2.4, 3.1,
+                                3.0, entry=2.5)
+            tracking.record_from_ranked([r], db_path=db)
+            sid = int(storage.get_signals_df(db).iloc[0]["id"])
+            storage.update_signal(sid, db_path=db, created_utc="2026-06-01T00:00:00+00:00")
+            idx = pd.date_range("2026-06-01 01:00", periods=3, freq="1h", tz="UTC")
+            bars = pd.DataFrame({"Open": [2.55, 2.5, 3.0], "High": [2.56, 2.6, 3.2],
+                                 "Low": [2.49, 2.45, 2.9], "Close": [2.5, 2.55, 3.1]}, index=idx)
+            seen = []
+
+            def bar_loader(ticker):
+                seen.append(ticker)
+                return bars if hl.is_hl_ticker(ticker) else None
+
+            tracking.update_all(bar_loader, db_path=db)
+            self.assertEqual(seen, ["HL:WIF"])
+            self.assertEqual(storage.get_signals_df(db).iloc[0]["status"], "WIN")
+        finally:
+            os.unlink(db)

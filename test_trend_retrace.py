@@ -464,3 +464,71 @@ class TestSetupSnapshotsInBacktest(unittest.TestCase):
                     for t in tr_ if t.exit_time is not None and t.exit_time < cutoff]
         self.assertTrue(feats(base))
         self.assertEqual(feats(base), feats(altered))
+
+
+class TestReviewExitsInBacktest(unittest.TestCase):
+    """The trade review's early-exit rules, measured in the backtest."""
+
+    def setUp(self):
+        self.m5, self.h1, self.h4 = market(seed=5, days=30)
+
+    def test_off_by_default(self):
+        trades = run_backtest(self.m5, self.h1, self.h4, "X")
+        self.assertFalse(any(t.exit_reason in ("reversal", "stale") for t in trades))
+
+    def test_reversal_exits_happen_when_enabled(self):
+        """Reversal exits are rare — trades usually end within ~3h, while a 4H
+        reversal needs 8h+ to form — so check across several markets."""
+        found = False
+        for seed in range(40, 52):
+            m5, h1, h4 = market(seed=seed, days=30)
+            if any(t.exit_reason == "reversal"
+                   for t in run_backtest(m5, h1, h4, "X", exit_on_reversal=True)):
+                found = True
+                break
+        self.assertTrue(found)
+
+    def test_stale_exits_respect_the_time_limit(self):
+        trades = run_backtest(self.m5, self.h1, self.h4, "X", exit_stale_hours=6)
+        stale = [t for t in trades if t.exit_reason == "stale"]
+        for t in stale:
+            self.assertGreaterEqual((t.exit_time - t.fill_time).total_seconds() / 3600, 6 - 1e-9)
+
+    def test_early_exit_results_sit_between_stop_and_target(self):
+        trades = run_backtest(self.m5, self.h1, self.h4, "X", exit_on_reversal=True,
+                              exit_stale_hours=6)
+        for t in trades:
+            if t.exit_reason in ("reversal", "stale"):
+                self.assertGreaterEqual(t.r_result, -1.0 - 1e-9)
+                self.assertLessEqual(t.r_result, 3.0 + 1e-9)
+
+    def test_early_exits_do_not_trigger_reentry(self):
+        trades = sorted(run_backtest(self.m5, self.h1, self.h4, "X", exit_on_reversal=True),
+                        key=lambda t: t.signal_time)
+        for i, t in enumerate(trades):
+            if t.kind == KIND_RE1:
+                prior = [x for x in trades[:i] if x.exit_time is not None]
+                self.assertEqual(prior[-1].exit_reason, "stop")
+
+    def test_no_lookahead_with_exits_enabled(self):
+        base = run_backtest(self.m5, self.h1, self.h4, "X", exit_on_reversal=True,
+                            exit_stale_hours=6)
+        cutoff = self.m5.index[5000]
+        agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+        t5 = self.m5.copy()
+        t5.loc[t5.index > cutoff, ["Open", "High", "Low", "Close"]] *= 2.5
+        altered = run_backtest(t5, t5.resample("1h").agg(agg).dropna(),
+                               t5.resample("4h").agg(agg).dropna(), "X",
+                               exit_on_reversal=True, exit_stale_hours=6)
+
+        def done(tr_):
+            return [(t.kind, t.signal_time, round(t.entry, 8), t.status,
+                     round(t.r_result, 8) if t.r_result is not None else None, t.exit_reason)
+                    for t in tr_ if t.exit_time is not None and t.exit_time < cutoff]
+        self.assertTrue(done(base))
+        self.assertEqual(done(base), done(altered))
+
+    def test_stops_and_targets_are_labelled(self):
+        trades = run_backtest(self.m5, self.h1, self.h4, "X")
+        reasons = {t.exit_reason for t in trades if t.status in ("WIN", "LOSS")}
+        self.assertTrue(reasons <= {"stop", "target"})
