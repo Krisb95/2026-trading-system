@@ -37,6 +37,7 @@ import trend_retrace
 import expectancy
 import explain
 import learning
+import trade_log
 from formatting import format_price
 
 MIN_RR = 3.0   # reward:risk floor — nothing below this is shown, tracked or traded
@@ -84,6 +85,41 @@ def _render_learned(model):
                            f"(n={c.train_n}), unseen {ta}. {c.verdict}")
 
 
+def _take_trade_widget(key, ticker, direction, entry, stop, target, features=None,
+                       score=None, grade=None, reason=""):
+    """'I took this trade' — records a recommended setup in the journal, with the
+    setup snapshot the learner needs. Same control on every recommendation."""
+    if None in (direction, entry, stop, target):
+        return
+    if not st.toggle("I took this trade", key=f"tk_on_{key}"):
+        return
+    c1, c2 = st.columns(2)
+    fill = c1.number_input("Your actual entry price", value=float(entry), format="%.8f",
+                           key=f"tk_fill_{key}",
+                           help="What you were really filled at. Leave as-is if it matched.")
+    qty = c2.number_input("Quantity (coins, optional)", min_value=0.0, value=0.0,
+                          format="%.8f", key=f"tk_qty_{key}",
+                          help="Lets the journal show dollar P&L. R is worked out either way.")
+    c3, c4 = st.columns(2)
+    lev = c3.number_input("Leverage", min_value=1.0, value=1.0, step=0.5, key=f"tk_lev_{key}")
+    followed = c4.checkbox("I followed the rules", value=True, key=f"tk_rules_{key}",
+                           help="Untick if you entered early, skipped a rule or changed the "
+                                "stop. Only rule-following trades teach the strategy.")
+    note = st.text_input("Note (optional)", key=f"tk_note_{key}")
+    if st.button("💾 Save to journal", key=f"tk_save_{key}", use_container_width=True):
+        try:
+            jid = trade_log.take_trade(
+                ticker=ticker, direction=direction, planned_entry=float(entry),
+                stop=float(stop), target=float(target), actual_entry=fill, quantity=qty,
+                leverage=lev, features=features, followed_rules=followed,
+                strategy_config=_config_signature(USE_TR, TR_PARAMS),
+                reason=note or reason, score=score, grade=grade)
+            st.success(f"Saved as journal entry #{jid}. Complete it on the 📓 Journal tab "
+                       f"when the trade closes.")
+        except ValueError as e:
+            st.error(str(e))
+
+
 def _config_signature(use_tr, params):
     """The settings that backtest evidence depends on. Evidence measured under
     one stop/target/strategy says nothing about another."""
@@ -92,7 +128,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-21-b27 (Hyperliquid-only filter, Bybit outage fix)"
+APP_BUILD = "2026-09-21-b28 (log trades you take, learn from them)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -711,6 +747,11 @@ with tab_scan:
                                         reentry_steps=(trend_retrace.reentry_plan_text(
                                             r.direction) if USE_TR else None)):
                                     st.markdown(line)
+                                _take_trade_widget(
+                                    f"u_{r.ticker}_{r.direction}", r.ticker, r.direction,
+                                    r.entry, r.stop, r.target, features=r.features,
+                                    score=r.score, grade=r.grade,
+                                    reason=f"Scanner: {r.entry_status or ''}")
                 st.caption(
                     "**Entry** is the planned price to place your order at — a limit order "
                     "at a confluence zone, not the market price. **Entry vs live** shows how "
@@ -805,6 +846,11 @@ with tab_scan:
                             reasons=[r_.reason for r_ in plan.rules.values()],
                             stop_method=_sm, target_method=_tm):
                         st.markdown(line)
+                    _take_trade_widget(
+                        f"s_{plan.ticker}_{plan.direction}", plan.ticker, plan.direction,
+                        plan.entry, plan.stop, plan.target, features=plan.features,
+                        score=plan.score, grade=plan.grade,
+                        reason=f"Single-coin check: {plan.stage}")
 
             if plan.stage == trend_retrace.AT_ENTRY:
                 st.success("All three rules are met and price is at the entry level.")
@@ -1437,6 +1483,81 @@ with tab_risk:
 with tab_journal:
     st.subheader("Trade journal")
 
+    # --- trades taken from the scanner, waiting to be completed ----------
+    _open = trade_log.open_scanner_trades()
+    st.markdown(f"##### Trades to complete ({len(_open)})")
+    if _open.empty:
+        st.caption("Trades you mark **I took this trade** on the 🎯 Scanner appear here. "
+                   "When one closes, complete it so the system can learn from it.")
+    for _, jr in _open.iterrows():
+        jid = int(jr["id"])
+        with st.container(border=True):
+            st.markdown(f"**#{jid} · {jr['direction']} {jr['asset']}** — entry "
+                        f"{format_price(jr['entry'])}, stop {format_price(jr['sl'])}, "
+                        f"target {format_price(jr['tp'])}")
+            outcome = st.radio("How did it end?", trade_log.OUTCOMES, horizontal=True,
+                               key=f"cm_out_{jid}")
+            _default = trade_log.default_exit_price(outcome, float(jr["sl"]), float(jr["tp"]),
+                                                    manual=float(jr["entry"]))
+            cc1, cc2 = st.columns(2)
+            exit_px = cc1.number_input("Exit price achieved", value=float(_default),
+                                       format="%.8f", key=f"cm_exit_{jid}_{outcome}")
+            fill_px = cc2.number_input("Actual entry (correct if needed)",
+                                       value=float(jr["entry"]), format="%.8f",
+                                       key=f"cm_fill_{jid}")
+            cc3, cc4 = st.columns(2)
+            fin_sl = cc3.number_input("Final stop loss (if you moved it)",
+                                      value=float(jr["sl"]), format="%.8f",
+                                      key=f"cm_sl_{jid}")
+            fin_tp = cc4.number_input("Final take profit (if you moved it)",
+                                      value=float(jr["tp"]), format="%.8f",
+                                      key=f"cm_tp_{jid}")
+            fees = st.number_input("Fees paid ($, optional)", min_value=0.0, value=0.0,
+                                   key=f"cm_fee_{jid}")
+            _init = jr.get("initial_stop")
+            _init = float(jr["sl"]) if _init is None or pd.isna(_init) else float(_init)
+            _r = trade_log.realized_r(jr["direction"], fill_px, _init, exit_px)
+            if _r is not None:
+                st.caption(f"Result: **{_r:+.2f}R** — {trade_log.pl_status_for(_r).lower()}, "
+                           f"measured against your original stop of {format_price(_init)}.")
+            if st.button("✅ Complete trade", key=f"cm_go_{jid}", use_container_width=True):
+                trade_log.complete_trade(jid, exit_price=exit_px, actual_entry=fill_px,
+                                         final_stop=fin_sl, final_target=fin_tp, fees=fees,
+                                         exit_reason=outcome)
+                st.success(f"#{jid} completed at {_r:+.2f}R.")
+                st.rerun()
+
+    # --- learning from the trades you've actually taken -------------------
+    st.markdown("##### 🧠 Learn from your trades")
+    _include_disc = st.checkbox(
+        "Include trades where I didn't follow the rules", key="lt_disc",
+        help="Off by default: those trades test your judgement, not the strategy.")
+    _mine = trade_log.learning_trades(config=_config_signature(USE_TR, TR_PARAMS),
+                                      followed_only=not _include_disc)
+    if _mine:
+        _wins = sum(t.status == "WIN" for t in _mine)
+        _avg = sum(t.r_result for t in _mine) / len(_mine)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Completed trades", len(_mine))
+        m2.metric("Win rate", f"{_wins / len(_mine):.0%}")
+        m3.metric("Average result", f"{_avg:+.2f}R")
+    st.caption(
+        f"{len(_mine)} completed trade(s) under your current settings; about "
+        f"{learning.MIN_TRADES} are needed before lessons are trustworthy. Your real trades "
+        f"are the most valuable evidence there is — they include your actual fills and exits.")
+    if st.button("🧠 Learn from my trades", use_container_width=True,
+                 disabled=len(_mine) < learning.MIN_TRADES, key="lt_go"):
+        _m = learning.learn(_mine, source=f"your real trades, {len(_mine)} trades")
+        st.session_state.mine_model = _m
+        _md = _m.to_dict()
+        _md["config"] = _config_signature(USE_TR, TR_PARAMS)
+        storage.save_value("learned_model", _md)
+    if st.session_state.get("mine_model") is not None:
+        _render_learned(st.session_state.mine_model)
+
+    st.markdown("---")
+    st.markdown("##### Add a trade manually")
+
     with st.form("journal_add"):
         j1, j2, j3, j4 = st.columns(4)
         ja = j1.text_input("Asset")
@@ -1455,11 +1576,36 @@ with tab_journal:
             st.success("Added.")
             st.rerun()
 
+    _jup = st.file_uploader("Restore journal from an exported CSV", type=["csv"],
+                            key="journal_upload")
+    if _jup is not None and st.button("Import journal", key="journal_import"):
+        try:
+            _n = storage.import_journal_csv(_jup.getvalue())
+            st.success(f"Restored {_n} journal entr{'y' if _n == 1 else 'ies'}.")
+            st.rerun()
+        except ValueError as e:
+            st.error(str(e))
+
     df = storage.get_journal_df()
     if df.empty:
         st.info("No journal entries yet.")
     else:
-        st.dataframe(df, use_container_width=True)
+        _hide = ["features", "strategy_config", "margin", "current_pl",
+                 "potential_profit_at_tp", "potential_loss_at_sl", "management_notes"]
+        _view = df.drop(columns=[c for c in _hide if c in df.columns])
+        _first = [c for c in ("id", "status", "asset", "direction", "pl_status",
+                              "realized_r", "entry", "sl", "tp", "exit_price",
+                              "realized_pnl") if c in _view.columns]
+        _view = _view[_first + [c for c in _view.columns if c not in _first]]
+        st.dataframe(_view, use_container_width=True, hide_index=True,
+                     column_config={"realized_r": st.column_config.NumberColumn(
+                         "Result (R)", format="%+.2f")})
+        st.caption("The full export below includes every column, including the setup "
+                   "snapshots used for learning.")
+        st.warning("**Export your journal before every app update.** Streamlit wipes the "
+                   "database on redeploy — your trades, and everything the system has "
+                   "learned from them, would otherwise be lost. Restore with the import "
+                   "box below.")
         st.download_button("⬇️ Export CSV", data=storage.journal_to_csv_bytes(),
                             file_name=f"trade_journal_{datetime.now().date()}.csv",
                             mime="text/csv", use_container_width=True)

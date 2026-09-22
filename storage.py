@@ -31,6 +31,9 @@ JOURNAL_COLUMNS = [
     "potential_profit_at_tp", "potential_loss_at_sl", "realized_pnl",
     "pl_status", "entry_reason", "score_breakdown", "exit_reason",
     "timestamp_utc", "management_notes",
+    # Added so trades you actually take can teach the learner:
+    "planned_entry", "initial_stop", "exit_price", "realized_r", "quantity",
+    "features", "followed_rules", "strategy_config", "source", "closed_utc",
 ]
 
 
@@ -108,6 +111,18 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             "slippage_pct": "REAL DEFAULT 0.0",
             "entry_reason": "TEXT DEFAULT ''",
             "notes": "TEXT DEFAULT ''",
+        })
+        _ensure_columns(conn, "journal", {
+            "planned_entry": "REAL",
+            "initial_stop": "REAL",
+            "exit_price": "REAL",
+            "realized_r": "REAL",
+            "quantity": "REAL",
+            "features": "TEXT",
+            "followed_rules": "INTEGER",
+            "strategy_config": "TEXT",
+            "source": "TEXT",
+            "closed_utc": "TEXT",
         })
 
 
@@ -394,3 +409,40 @@ def load_value(key: str, db_path: str = DEFAULT_DB_PATH):
     if not row:
         return None, None
     return _json.loads(row["value"]), row["updated_utc"]
+
+
+def import_journal_csv(raw: bytes, db_path: str = DEFAULT_DB_PATH) -> int:
+    """Restore journal entries from an exported CSV.
+
+    Essential on free hosting, where every redeploy wipes the database: without
+    it, weeks of real trades — the most valuable data the learner has — would
+    vanish with each app update. Rows already present (same asset, timestamp
+    and entry) are skipped, so importing twice is harmless.
+    """
+    df = pd.read_csv(io.BytesIO(raw))
+    if "asset" not in df.columns or "timestamp_utc" not in df.columns:
+        raise ValueError("This doesn't look like a journal export (missing asset/timestamp).")
+    added = 0
+    with _connect(db_path) as conn:
+        for _, row in df.iterrows():
+            exists = conn.execute(
+                "SELECT 1 FROM journal WHERE asset IS ? AND timestamp_utc IS ? AND entry IS ?",
+                (None if pd.isna(row.get("asset")) else row.get("asset"),
+                 None if pd.isna(row.get("timestamp_utc")) else row.get("timestamp_utc"),
+                 None if pd.isna(row.get("entry")) else float(row.get("entry")))).fetchone()
+            if exists:
+                continue
+            record = {}
+            for col in JOURNAL_COLUMNS:
+                if col == "id" or col not in row.index:
+                    continue
+                v = row[col]
+                record[col] = None if (not isinstance(v, str) and pd.isna(v)) else v
+            if not record:
+                continue
+            fields = list(record)
+            conn.execute(f"INSERT INTO journal ({', '.join(fields)}) "
+                         f"VALUES ({', '.join('?' for _ in fields)})",
+                         [record[f] for f in fields])
+            added += 1
+    return added

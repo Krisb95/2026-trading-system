@@ -174,3 +174,20 @@ changes nothing and says so.
 Adopted lessons can filter the scanner and are flagged on trade plan cards. It
 learns only to skip losing kinds of setup; it doesn't invent new rules. Lessons
 should be re-learned as trades accumulate, since markets change.
+
+## Logging the trades you take
+
+Every recommended setup — from a universe scan or a single-coin check — has an
+**I took this trade** toggle. It records the trade in the journal as Open, with
+your actual fill, the plan, and the setup snapshot the learner uses. Tick off
+"I followed the rules" if you deviated; only rule-following trades teach the
+strategy by default.
+
+When the trade closes, complete it on the Journal tab: choose whether it hit the
+take profit, hit the stop, or was closed manually, and correct the exit price,
+entry, or final stop and target if needed. The result is recorded in R against
+your **original** stop.
+
+Completed trades feed the same learner as backtests and forward tracking, with
+the same unseen-trade check. **Export the journal before every app update** —
+Streamlit wipes the database on redeploy — and restore it with the import box.
