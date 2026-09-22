@@ -18,7 +18,7 @@ POSITIVE_COMPONENTS = [
     ("structure_4h_supports", 1, "4H structure supports the trade"),
     ("entry_confirmation_1h", 1, "Entry-timeframe confirmation"),
     ("invalidation_defined", 1, "Clear structural invalidation"),
-    ("rr_at_least_2", 1, "At least 2:1 reward-to-risk"),
+    ("rr_at_least_2", 1, "Meets the minimum reward-to-risk (3:1)"),
 ]
 
 NEGATIVE_COMPONENTS = [

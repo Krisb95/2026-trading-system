@@ -359,3 +359,33 @@ def clear_signals(db_path: str = DEFAULT_DB_PATH) -> None:
     with _connect(db_path) as conn:
         _ensure_signals_table(conn)
         conn.execute("DELETE FROM signals")
+
+
+# ---------------------------------------------------------------------
+# Small key/value store (e.g. the latest backtest evidence), so results
+# survive a page refresh. Like everything here, wiped on redeploy.
+# ---------------------------------------------------------------------
+import json as _json
+
+
+def _ensure_kv(conn) -> None:
+    conn.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT, "
+                 "updated_utc TEXT)")
+
+
+def save_value(key: str, value: Any, db_path: str = DEFAULT_DB_PATH) -> None:
+    with _connect(db_path) as conn:
+        _ensure_kv(conn)
+        conn.execute("INSERT OR REPLACE INTO kv (key, value, updated_utc) VALUES (?, ?, ?)",
+                     (key, _json.dumps(value), datetime.now(timezone.utc).isoformat()))
+
+
+def load_value(key: str, db_path: str = DEFAULT_DB_PATH):
+    """Returns (value, updated_utc) or (None, None)."""
+    with _connect(db_path) as conn:
+        _ensure_kv(conn)
+        row = conn.execute("SELECT value, updated_utc FROM kv WHERE key = ?",
+                           (key,)).fetchone()
+    if not row:
+        return None, None
+    return _json.loads(row["value"]), row["updated_utc"]

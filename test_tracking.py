@@ -150,3 +150,17 @@ class TestStats(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMinimumRewardRisk(Base):
+    def test_setup_below_minimum_is_not_recorded(self):
+        low = ranked(); low.reward_risk = 2.5
+        self.assertEqual(tracking.record_from_ranked([low], db_path=self.db, min_rr=3.0), 0)
+
+    def test_setup_at_minimum_is_recorded(self):
+        ok = ranked(); ok.reward_risk = 3.0
+        self.assertEqual(tracking.record_from_ranked([ok], db_path=self.db, min_rr=3.0), 1)
+
+    def test_setup_without_rr_is_not_recorded_under_a_floor(self):
+        none_rr = ranked(); none_rr.reward_risk = None
+        self.assertEqual(tracking.record_from_ranked([none_rr], db_path=self.db, min_rr=3.0), 0)

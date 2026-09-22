@@ -265,3 +265,22 @@ class TestSchemaMigration(StorageTestBase):
         self.assertIn("target", rows[0])
         self.assertIn("leverage", rows[0])
         os.unlink(old_db)
+
+
+class TestKeyValue(StorageTestBase):
+    def test_save_and_load_round_trip(self):
+        from storage import save_value, load_value
+        save_value("evidence", {"a": [1, 2]}, db_path=self.db)
+        value, when = load_value("evidence", db_path=self.db)
+        self.assertEqual(value, {"a": [1, 2]})
+        self.assertIsNotNone(when)
+
+    def test_missing_key(self):
+        from storage import load_value
+        self.assertEqual(load_value("nope", db_path=self.db), (None, None))
+
+    def test_overwrite(self):
+        from storage import save_value, load_value
+        save_value("k", 1, db_path=self.db)
+        save_value("k", 2, db_path=self.db)
+        self.assertEqual(load_value("k", db_path=self.db)[0], 2)

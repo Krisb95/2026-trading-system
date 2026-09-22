@@ -17,8 +17,7 @@ RE-ENTRY after being stopped out:
 NOT SPECIFIED BY THE TRADER — defaults chosen here, all adjustable:
   * Stop loss:   below the 5m support used for entry, by a multiple of 5m ATR
                  (alternative: below the low of the last closed 4H candle)
-  * Take profit: a fixed multiple of the risk (default 2R, matching the
-                 earlier 2:1 rule)
+  * Take profit: a fixed multiple of the risk — minimum and default 3R
   * Order expiry: an unfilled limit is cancelled after a day, or sooner if
                  the 4H trend condition stops holding
 
@@ -61,7 +60,7 @@ class StrategyParams:
     # second 50% after a 1H confirmation" could never fire. 3x lets trades run
     # for hours, which is what that re-entry rule implies.
     stop_atr_mult: float = 3.0
-    target_r: float = 2.0           # take profit as a multiple of risk
+    target_r: float = 3.0           # take profit as a multiple of risk (minimum 3)
     support_lookback: int = 288     # 5m bars searched for support (288 = 24h)
     at_entry_atr: float = 0.3       # within this many 5m ATR = "at entry"
     swing_left: int = 3
@@ -239,7 +238,8 @@ def analyze(ticker: str, df_4h: pd.DataFrame, df_1h: pd.DataFrame,
         if stop is not None:
             plan.entry, plan.stop, plan.target = level, stop, target
             plan.reward_risk = params.target_r
-            rules["5m"] = RuleResult(True, f"{level_reason} {how}")
+            # The stop/target explanation belongs to the plan, not the rule —
+            # keeping it out of the rule's reason avoids stating it twice.
         else:
             plan.problems.append(how)
     return plan

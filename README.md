@@ -64,7 +64,7 @@ The default scanner strategy, as specified by the trader.
 **Not specified by the trader — adjustable defaults in the sidebar:**
 
 - **Stop loss:** below the 5m support by 3x the 5m ATR (alternatively, below the last closed 4H candle). A 1x buffer was tested and rejected: trades finished in about 12 minutes, before any 1H candle could close, so the second 50% could never be added.
-- **Take profit:** 2x the risk.
+- **Take profit:** 3x the risk, and never below 3:1. A higher multiple does not create an edge on its own: on random data the win rate falls to exactly the break-even rate (33% at 2R, 25% at 3R, 20% at 4R).
 - **Order expiry:** an unfilled limit is cancelled after a day, or if the 4H trend reverses.
 
 **Scoring** is a checklist count — 4H trend 4 points, 1H confirmation 3, 5m support entry 3 — so a setup meeting all three rules scores 10/10. It is not a probability of profit.
@@ -138,3 +138,22 @@ UNAVAILABLE and blocks trade-readiness rather than showing a substituted price.
 - **Free equity data is exchange-delayed** by nature; the app labels it DELAYED
   rather than pretending it is live.
 - **Evidence marked ❔ could not be evaluated** and scores zero. It is never assumed.
+
+## Long-run profitability (expectancy)
+
+"Profitable over the long run" means positive **expectancy**: the average result
+per trade, across many trades, is above zero. It does not mean individual trades
+don't lose. At 3:1, break-even is a 25% win rate; a system winning 30% of trades
+makes money while still losing 7 trades in 10.
+
+After a backtest, each setup in the scanner is labelled with its evidence —
+**Proven +**, **Proven −**, **Unproven** or **Too few** — taken from the most
+specific group of backtested trades with enough data (that coin and direction,
+then that direction, then all trades). A filter can hide everything not proven
+positive. Evidence is stamped with the settings it was measured under and is
+not used if the stop, target or strategy change afterwards.
+
+The Risk tab and backtest results show what a win rate feels like to trade:
+typical and bad-case losing streaks and drawdowns. At a genuinely profitable
+30% win rate and 1% risk, a run of ~10 losses and a ~13% drop from a peak are
+typical over 100 trades — normal, not a sign the strategy has broken.

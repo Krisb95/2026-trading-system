@@ -87,7 +87,7 @@ ENTRY_SEQUENCE_STAGES = [
     ("reclaim_or_rejection", "Price reclaims the level, or clearly rejects it (close-based, not wick-only)"),
     ("confirmation", "Lower-timeframe confirmation consistent with the higher-timeframe thesis"),
     ("structural_invalidation", "A clear structural invalidation level is defined"),
-    ("acceptable_rr", "Reward-to-risk is at least 2:1 (or your configured minimum)"),
+    ("acceptable_rr", "Reward-to-risk is at least 3:1"),
     ("execution_plan", "Entry, stop, and target are fully specified and ready to log"),
 ]
 

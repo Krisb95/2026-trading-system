@@ -34,9 +34,44 @@ import venues as venues_mod
 import storage
 import tracking
 import trend_retrace
+import expectancy
+import explain
 from formatting import format_price
 
-APP_BUILD = "2026-09-21-b22 (Trend Retrace strategy)"
+MIN_RR = 3.0   # reward:risk floor — nothing below this is shown, tracked or traded
+
+
+def _methods(use_tr, params, direction):
+    """How the stop and target were set, in words, for the plan text."""
+    if not (use_tr and params):
+        return "the nearest confirmed swing beyond entry", "the first level clearing your minimum R:R"
+    beyond = "below" if direction == "Long" else "above"
+    level = "support" if direction == "Long" else "resistance"
+    if params.stop_mode == trend_retrace.STOP_BELOW_4H_CANDLE:
+        stop_m = f"{beyond} the last closed 4H candle"
+    else:
+        stop_m = f"{params.stop_atr_mult:g}× the 5m ATR {beyond} the {level}"
+    return stop_m, f"{params.target_r:g}× the risk"
+
+
+def _plan_stage(r, use_tr):
+    """The explain-module stage for a ranked row from either strategy."""
+    if use_tr:
+        return r.entry_status
+    if r.direction is None:
+        return explain.NO_TREND
+    return explain.AT_ENTRY if r.entry_status == "AT_ZONE" else explain.WAIT_RETRACE
+
+
+def _config_signature(use_tr, params):
+    """The settings that backtest evidence depends on. Evidence measured under
+    one stop/target/strategy says nothing about another."""
+    if use_tr and params is not None:
+        return (f"TR|n={params.trend_candles}|stop={params.stop_mode}|"
+                f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
+    return "CONFLUENCE"
+
+APP_BUILD = "2026-09-21-b25 (plain-English trade plans)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -136,8 +171,11 @@ if USE_TR:
             help="At 1x, trades finished in ~12 minutes — before any 1H candle could close, "
                  "so your 'add 50% after a 1H candle' rule could never trigger. 3x lets "
                  "trades run for hours.")
-        _target_r = st.number_input("Take profit (multiple of risk)", min_value=0.5,
-                                     max_value=10.0, value=2.0, step=0.5, key="tr_target_r")
+        _target_r = st.number_input(
+            "Take profit (multiple of risk)", min_value=3.0, max_value=10.0, value=3.0,
+            step=0.5, key="tr_target_r",
+            help="Minimum 3:1. Note the win rate falls as the target moves further away — "
+                 "on random data it lands at the break-even rate for any multiple.")
         _trend_n = st.number_input("4H candles required", min_value=1, max_value=5,
                                     value=2, step=1, key="tr_trend_n")
     TR_PARAMS = trend_retrace.StrategyParams(
@@ -405,7 +443,7 @@ with tab_scan:
             universe_size = st.selectbox("How many coins", [10, 20, 30, 50], index=1,
                                           key="uni_size",
                                           help="More coins means more API calls and a longer wait.")
-            uni_direction, uni_min_rr = "Auto", 2.0
+            uni_direction, uni_min_rr = "Auto", 3.0
         else:
             st.caption(
                 "Scores many instruments on the original 10-point confluence checklist "
@@ -417,7 +455,7 @@ with tab_scan:
                                           index=1, key="uni_size",
                                           help="More coins means more API calls and a longer wait.")
             uni_direction = u2.selectbox("Direction", ["Auto", "Long", "Short"], key="uni_dir")
-            uni_min_rr = u3.number_input("Min R:R", min_value=1.0, value=2.0,
+            uni_min_rr = u3.number_input("Min R:R", min_value=3.0, value=3.0,
                                           step=0.5, key="uni_rr")
 
         per_coin = 0.6 if CRYPTO_SOURCE == "exchange" else 1.4   # 4 calls/coin: 4H, 1D, 1H, spot
@@ -501,14 +539,26 @@ with tab_scan:
             bar.empty()
             st.session_state.ranked = ranked
             if st.session_state.get("track_signals", True):
-                added = tracking.record_from_ranked(ranked, VENUE_TAGS)
+                added = tracking.record_from_ranked(ranked, VENUE_TAGS, min_rr=MIN_RR)
                 if added:
                     st.toast(f"Recorded {added} new signal(s) for forward tracking.")
 
         ranked = st.session_state.get("ranked")
         if ranked:
             scored_all = [r for r in ranked if r.error is None]
+            _rr_floor = MIN_RR if USE_TR else max(MIN_RR, uni_min_rr)
             failed = [r for r in ranked if r.error is not None]
+
+            _ev_raw, _ev_when = storage.load_value("evidence")
+            EVIDENCE = None
+            if _ev_raw:
+                if _ev_raw.get("config") == _config_signature(USE_TR, TR_PARAMS):
+                    EVIDENCE = expectancy.EvidenceBook.from_dict(_ev_raw)
+                else:
+                    st.warning(
+                        "Your backtest evidence was measured with different strategy "
+                        "settings (stop, target or strategy have changed since). It no "
+                        "longer applies, so it isn't used. Re-run the 🔁 Backtest.")
 
             f1, f2 = st.columns(2)
             min_score = f1.number_input(
@@ -517,14 +567,38 @@ with tab_scan:
                 help="Scores are whole numbers, so 8.5 behaves the same as 9. "
                      "A 9 or 10 appears in only a few percent of market states.")
             a_plus_only = f2.checkbox("A+ only", key="uni_aplus_only")
+            proven_only = st.checkbox(
+                "Only show setups with proven positive expectancy",
+                key="uni_proven_only", disabled=EVIDENCE is None,
+                help="Hides anything the backtest hasn't shown to make money over many "
+                     "trades. Run the backtest first to build the evidence.")
+            if EVIDENCE is None:
+                st.caption("ℹ️ No evidence yet — run the 🔁 Backtest to label setups with "
+                           "whether they've made money historically.")
+            else:
+                st.caption(f"Evidence from: {EVIDENCE.source}.")
+
+            def _evidence(r):
+                if EVIDENCE is None:
+                    return None, ""
+                return EVIDENCE.evidence_for(r.ticker, r.direction)
 
             ok = [r for r in scored_all
-                  if r.score >= min_score and (not a_plus_only or r.grade == "A+")]
+                  if r.score >= min_score and (not a_plus_only or r.grade == "A+")
+                  and r.reward_risk is not None and r.reward_risk >= _rr_floor - 1e-9
+                  and (not proven_only
+                       or _evidence(r)[0] == expectancy.PROVEN_POSITIVE)]
             hidden = len(scored_all) - len(ok)
 
             st.markdown(f"##### Results · {len(ok)} shown"
                         + (f", {hidden} hidden by filter" if hidden else "")
                         + (f", {len(failed)} failed" if failed else ""))
+            st.caption(f"Setups with reward:risk below {_rr_floor:g}:1 are never shown.")
+            if EVIDENCE is not None and ok:
+                with st.expander("Why each setup has the evidence label it does"):
+                    for r in ok:
+                        v, why = _evidence(r)
+                        st.caption(f"**{r.label} {r.direction or ''}** — {v}. {why}")
             if scored_all and not ok:
                 best = max(scored_all, key=lambda r: r.score)
                 st.info(
@@ -540,6 +614,13 @@ with tab_scan:
 
                 table = pd.DataFrame([{
                     "Instrument": r.label,
+                    "Trade plan": explain.short_plan(
+                        r.direction, _plan_stage(r, USE_TR), r.entry, r.stop, r.target,
+                        r.reward_risk, r.price),
+                    "Evidence": {expectancy.PROVEN_POSITIVE: "✅ Proven +",
+                                 expectancy.PROVEN_NEGATIVE: "❌ Proven −",
+                                 expectancy.UNPROVEN: "❔ Unproven",
+                                 expectancy.TOO_FEW: "— Too few"}.get(_evidence(r)[0], "—"),
                     "Venue": "/".join(VENUE_TAGS.get(r.label, [])) or "—",
                     "Score": f"{r.score:.1f}",
                     "Grade": r.grade,
@@ -553,7 +634,26 @@ with tab_scan:
                     ("Status" if USE_TR else "Regime"):
                         (r.entry_status or "—") if USE_TR else r.regime.title(),
                 } for r in ok])
-                st.dataframe(table, use_container_width=True, hide_index=True)
+                st.dataframe(table, use_container_width=True, hide_index=True,
+                             column_config={"Trade plan": st.column_config.TextColumn(
+                                 "Trade plan", width="large")})
+
+                _complete = [r for r in ok if None not in (r.entry, r.stop, r.target)]
+                if _complete:
+                    with st.expander(f"📋 Trade plans ({len(_complete)})",
+                                     expanded=len(_complete) <= 5):
+                        for r in _complete:
+                            _sm, _tm = _methods(USE_TR, TR_PARAMS, r.direction)
+                            _reasons = [x.strip() for x in (r.note or "").split(";") if x.strip()]
+                            with st.container(border=True):
+                                for line in explain.full_plan(
+                                        r.label, r.direction, _plan_stage(r, USE_TR),
+                                        r.entry, r.stop, r.target, r.reward_risk, r.price,
+                                        reasons=_reasons if USE_TR else None,
+                                        stop_method=_sm, target_method=_tm,
+                                        reentry_steps=(trend_retrace.reentry_plan_text(
+                                            r.direction) if USE_TR else None)):
+                                    st.markdown(line)
                 st.caption(
                     "**Entry** is the planned price to place your order at — a limit order "
                     "at a confluence zone, not the market price. **Entry vs live** shows how "
@@ -638,6 +738,17 @@ with tab_scan:
             for p_ in plan.problems:
                 st.warning(p_)
 
+            if plan.entry is not None:
+                _sm, _tm = _methods(True, TR_PARAMS, plan.direction)
+                with st.container(border=True):
+                    st.markdown("##### Trade plan")
+                    for line in explain.full_plan(
+                            plan.ticker, plan.direction, plan.stage, plan.entry, plan.stop,
+                            plan.target, plan.reward_risk, plan.current_price,
+                            reasons=[r_.reason for r_ in plan.rules.values()],
+                            stop_method=_sm, target_method=_tm):
+                        st.markdown(line)
+
             if plan.stage == trend_retrace.AT_ENTRY:
                 st.success("All three rules are met and price is at the entry level.")
             elif plan.stage == trend_retrace.WAIT_RETRACE:
@@ -671,7 +782,7 @@ with tab_scan:
         with s2:
             dir_choice = st.selectbox("Direction", ["Auto", "Long", "Short"], key="scan_dir")
         with s3:
-            min_rr = st.number_input("Min R:R", min_value=1.0, value=2.0, step=0.5, key="scan_rr")
+            min_rr = st.number_input("Min R:R", min_value=3.0, value=3.0, step=0.5, key="scan_rr")
 
         if st.button("🔍 Scan", use_container_width=True):
             with st.spinner(f"Analysing {scan_ticker} across 1D / 4H / 1H…"):
@@ -1165,6 +1276,40 @@ with tab_positions:
 # TAB: Risk calculator
 # ---------------------------------------------------------------------
 with tab_risk:
+    with st.expander("📊 What does long-run profitable actually look like?", expanded=False):
+        st.caption(
+            "Pick a win rate and see what trading it would be like over many trades. "
+            "Profitable doesn't mean few losses — at 3:1 you can lose most trades and "
+            "still make money, but you must be able to sit through the losing runs.")
+        w1, w2 = st.columns(2)
+        _wr = w1.slider("Win rate", min_value=5, max_value=70, value=30, step=1,
+                        format="%d%%", key="calc_wr") / 100
+        _crr = w2.number_input("Reward:risk", min_value=3.0, max_value=10.0, value=3.0,
+                               step=0.5, key="calc_rr")
+        w3, w4 = st.columns(2)
+        _crisk = w3.number_input("Risk per trade (%)", min_value=0.1, max_value=10.0,
+                                 value=1.0, step=0.1, key="calc_risk")
+        _cn = w4.selectbox("Number of trades", [50, 100, 200], index=1, key="calc_n")
+        _ce = expectancy.simulate_expectations(_wr, _crr, risk_pct=_crisk, n_trades=_cn)
+        _be = expectancy.break_even_win_rate(_crr)
+        k1, k2, k3 = st.columns(3)
+        k1.metric(f"Expected over {_cn} trades", f"{_ce.expected_total_pct:+.0f}%",
+                  f"{_ce.pct_per_trade:+.2f}% per trade")
+        k2.metric("Longest losing streak", f"{_ce.streak_typical} typical",
+                  f"up to {_ce.streak_bad}", delta_color="off")
+        k3.metric("Deepest drop", f"{_ce.drawdown_typical_pct:.0f}% typical",
+                  f"up to {_ce.drawdown_bad_pct:.0f}%", delta_color="off")
+        if _wr < _be:
+            st.error(f"Below the {_be:.0%} break-even rate at {_crr:g}:1 — this loses money "
+                     f"over time however it's traded.")
+        else:
+            st.caption(f"Break-even at {_crr:g}:1 is {_be:.0%}. Chance of still being down "
+                       f"after {_cn} trades, purely from luck: **{_ce.chance_of_loss_pct:.0f}%**.")
+        if _crisk > 2:
+            st.warning(f"At {_crisk:g}% per trade, a bad losing run could take "
+                       f"{_ce.drawdown_bad_pct:.0f}% off your account. Most traders keep risk "
+                       f"at 1–2% so a normal streak is survivable.")
+
     st.subheader("Position sizing & risk")
     pre = st.session_state.get("prefill", {})
     if pre:
@@ -1411,6 +1556,12 @@ with tab_backtest:
                                                        fee_r=trb_fee, enable_reentry=False)
         bar.empty()
         st.session_state.trb = (results_on, results_off, failures)
+        if results_on:
+            _ev = expectancy.EvidenceBook.from_trades(
+                results_on, source=f"Trend Retrace backtest, {trb_size} coins, "
+                                   f"{days} days").to_dict()
+            _ev["config"] = _config_signature(True, TR_PARAMS)
+            storage.save_value("evidence", _ev)
 
     trb = st.session_state.get("trb")
     if trb is not None:
@@ -1457,6 +1608,35 @@ with tab_backtest:
                 "break-even before costs (about 33% wins at 2R) and lose roughly the cost per "
                 "trade after costs. So an edge has to show up as clearly positive, after "
                 "costs, across plenty of trades.")
+            _all = next(x for x in stats if x.group == "All")
+            if _all.entries >= 10 and _all.win_rate is not None:
+                st.markdown("##### What trading this would feel like")
+                _rr = TR_PARAMS.target_r if TR_PARAMS else 3.0
+                _risk = st.number_input("Risk per trade (% of account)", min_value=0.1,
+                                        max_value=10.0, value=1.0, step=0.1, key="exp_risk")
+                ex = expectancy.simulate_expectations(_all.win_rate, _rr, risk_pct=_risk,
+                                                       n_trades=100)
+                x1, x2, x3 = st.columns(3)
+                x1.metric("Expected over 100 trades", f"{ex.expected_total_pct:+.0f}%",
+                          f"{ex.pct_per_trade:+.2f}% per trade")
+                x2.metric("Longest losing streak", f"{ex.streak_typical} typical",
+                          f"up to {ex.streak_bad} in a bad run", delta_color="off")
+                x3.metric("Deepest drop from a peak", f"{ex.drawdown_typical_pct:.0f}% typical",
+                          f"up to {ex.drawdown_bad_pct:.0f}% in a bad run", delta_color="off")
+                be = expectancy.break_even_win_rate(_rr)
+                st.caption(
+                    f"Based on the backtest's **{_all.win_rate:.0%} win rate** at {_rr:g}:1 "
+                    f"(break-even is {be:.0%}). Even if that edge is real, there's a "
+                    f"**{ex.chance_of_loss_pct:.0f}% chance of being down after 100 trades** "
+                    f"purely from luck. A losing streak of the length above is normal — it is "
+                    f"not a sign the strategy has stopped working, and it's the moment people "
+                    f"most often abandon a good system or raise their risk to win it back.")
+                if _all.verdict != "Clearly positive":
+                    st.warning(
+                        "These projections assume the backtest's win rate is the true one. "
+                        "Your result is not yet distinguishable from luck, so treat them as "
+                        "illustrative until the evidence is stronger.")
+
             with st.expander(f"All {len(res_on)} trade records"):
                 st.dataframe(pd.DataFrame([{
                     "Coin": t.ticker, "Type": t.kind, "Dir": t.direction,
@@ -1491,7 +1671,7 @@ with tab_backtest:
       b1, b2, b3 = st.columns(3)
       bt_size = b1.selectbox("Coins", [5, 10, 20], index=1, key="bt_size",
                               help="More coins = more trades = more trustworthy, but slower.")
-      bt_rr = b2.number_input("Min R:R", min_value=1.0, value=2.0, step=0.5, key="bt_rr")
+      bt_rr = b2.number_input("Min R:R", min_value=3.0, value=3.0, step=0.5, key="bt_rr")
       bt_expiry = b3.selectbox("Limit order valid for", ["1 day", "3 days", "5 days"],
                                 index=1, key="bt_exp")
       expiry_bars = {"1 day": 6, "3 days": 18, "5 days": 30}[bt_expiry]
@@ -1531,6 +1711,11 @@ with tab_backtest:
                                                    df_1h=h1)
           bar.empty()
           st.session_state.bt_trades = all_trades
+          if all_trades:
+              _ev = expectancy.EvidenceBook.from_trades(
+                  all_trades, source=f"Confluence backtest, {bt_size} coins").to_dict()
+              _ev["config"] = _config_signature(False, None)
+              storage.save_value("evidence", _ev)
           st.session_state.bt_failures = failures
           st.session_state.bt_kraken_1h = kraken_short_1h
 
@@ -1558,7 +1743,7 @@ with tab_backtest:
               st.caption(
                   "**Avg R / trade** is the key column: +0.30R means that, on average, each "
                   "trade returned 30% of the amount risked. Win rate alone can mislead — a "
-                  "40% win rate at 2:1 is profitable, a 60% win rate at 0.5:1 is not.")
+                  "30% win rate at 3:1 is profitable, a 60% win rate at 0.5:1 is not.")
               st.caption(
                   "**Baseline for comparison:** on random price data, where no edge exists, "
                   "this backtester returns roughly **−0.35R per trade** before fees. That is "

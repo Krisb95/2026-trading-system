@@ -29,11 +29,17 @@ UNRESOLVED = (PENDING, FILLED)
 
 def record_from_ranked(ranked, tags: Optional[Dict[str, List[str]]] = None,
                         expiry_hours: float = DEFAULT_EXPIRY_HOURS,
-                        grades=TRACKED_GRADES, db_path: str = storage.DEFAULT_DB_PATH) -> int:
-    """Store every qualifying setup from a universe scan. Returns count added."""
+                        grades=TRACKED_GRADES, db_path: str = storage.DEFAULT_DB_PATH,
+                        min_rr: float = 0.0) -> int:
+    """Store every qualifying setup from a universe scan. Returns count added.
+
+    min_rr: setups below this reward:risk are not recorded — tracking only
+    what you would actually trade keeps the track record meaningful."""
     added = 0
     for r in ranked:
         if r.error or r.grade not in grades:
+            continue
+        if r.reward_risk is None or r.reward_risk < min_rr - 1e-9:
             continue
         if None in (r.entry, r.stop, r.target, r.direction):
             continue
