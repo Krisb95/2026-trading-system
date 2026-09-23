@@ -308,3 +308,22 @@ looked like whale data without being it would be worse than leaving it out.
 Reward:risk can be displayed as `3.00` (reward:risk) or `1:3` (risk:reward) —
 the same trade written two ways. The scanner table shows essentials only by
 default, with a toggle for every column.
+
+## Bybit, 24h change and the coin glossary
+
+**Bybit** is a selectable crypto data source (prices, candles, 24h change,
+open interest, funding) and the default venue filter. Note that Bybit blocks
+requests from some regions including the US, and Streamlit Cloud is US-hosted,
+so these calls usually fail there — the app says so and falls back to
+Binance/Kraken. Running the app locally from a region Bybit serves works
+normally. Bybit's alternate domain (api.bytick.com) is tried automatically.
+
+**The Market tab** shows the 24-hour change in both percent and dollars,
+coloured green or red, alongside the price.
+
+**"What coins do"** is a glossary: one plain-English line per coin covering 72
+projects across 12 categories, searchable and filterable, ordered by market
+cap. Descriptions are written from general knowledge and do not update
+themselves, so verify anything before acting on it. Any other ticker can be
+looked up live from CoinGecko, which returns the project's own description —
+useful for what a coin does, not for whether it is any good.

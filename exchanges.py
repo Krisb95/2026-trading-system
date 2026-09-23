@@ -302,3 +302,112 @@ def fetch_binance_history(ticker: str, interval: str, total_bars: int
     out = raw.set_index("ts")[["Open", "High", "Low", "Close", "Volume"]].astype(float)
     out = out[out["Close"].notna()].sort_index()
     return out, None
+
+
+# ---------------------------------------------------------------------
+# Bybit
+#
+# Bybit blocks requests from some regions (notably the US) with HTTP 403.
+# Streamlit Cloud is US-hosted, so these calls usually fail there while
+# working fine from a local machine elsewhere. api.bytick.com is Bybit's
+# alternate domain and is tried automatically in case it is reachable.
+# ---------------------------------------------------------------------
+
+BYBIT_HOSTS = ["https://api.bybit.com", "https://api.bytick.com"]
+BYBIT_INTERVALS = {"5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}
+
+
+def to_bybit_symbol(ticker: str) -> str:
+    return f"{base_asset(ticker)}USDT"
+
+
+def _bybit_get(path: str, params: dict):
+    """Try each Bybit host. Returns (payload, error)."""
+    last_error = None
+    for host in BYBIT_HOSTS:
+        resp, err = _get(host + path, params)
+        if resp is None:
+            last_error = err
+            continue
+        try:
+            payload = resp.json()
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            continue
+        if payload.get("retCode") not in (0, None):
+            last_error = f"Bybit error: {payload.get('retMsg')}"
+            continue
+        return payload, None
+    if last_error and ("403" in last_error or "451" in last_error):
+        last_error = ("Bybit blocks requests from this server's location (the app is "
+                      "hosted in the US). It works from a machine in a region Bybit serves.")
+    return None, last_error
+
+
+def fetch_bybit_tickers() -> Tuple[Dict[str, dict], Optional[str]]:
+    """Every USDT perp with price, 24h change, volume, OI and funding."""
+    payload, err = _bybit_get("/v5/market/tickers", {"category": "linear"})
+    if payload is None:
+        return {}, err
+    out = {}
+    for row in (payload.get("result") or {}).get("list") or []:
+        sym = row.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        try:
+            last = float(row.get("lastPrice") or 0)
+            prev = float(row.get("prevPrice24h") or 0)
+            if last <= 0:
+                continue
+            out[sym[:-4]] = {
+                "symbol": sym, "last": last, "prev_24h": prev,
+                "change_pct": float(row.get("price24hPcnt") or 0) * 100,
+                "change_abs": last - prev if prev else 0.0,
+                "high_24h": float(row.get("highPrice24h") or 0),
+                "low_24h": float(row.get("lowPrice24h") or 0),
+                "turnover_24h": float(row.get("turnover24h") or 0),
+                "open_interest_usd": float(row.get("openInterestValue") or 0),
+                "funding_rate": float(row.get("fundingRate") or 0),
+            }
+        except (TypeError, ValueError):
+            continue
+    return (out, None) if out else ({}, "Bybit returned no USDT perpetuals.")
+
+
+def fetch_bybit_klines(ticker: str, interval: str, limit: int = 500
+                        ) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    """OHLCV candles from Bybit, oldest first (Bybit returns newest first)."""
+    if interval not in BYBIT_INTERVALS:
+        return None, f"Unsupported interval {interval!r}"
+    payload, err = _bybit_get("/v5/market/kline", {
+        "category": "linear", "symbol": to_bybit_symbol(ticker),
+        "interval": BYBIT_INTERVALS[interval], "limit": min(limit, 1000)})
+    if payload is None:
+        return None, err
+    rows = (payload.get("result") or {}).get("list") or []
+    if not rows:
+        return None, "Bybit returned no candles (symbol may not be listed)."
+    try:
+        df = pd.DataFrame(rows, columns=["start", "Open", "High", "Low", "Close",
+                                          "Volume", "turnover"])
+        df["ts"] = pd.to_datetime(df["start"].astype("int64"), unit="ms", utc=True)
+        df = df.set_index("ts")[["Open", "High", "Low", "Close", "Volume"]].astype(float)
+        df = df[df["Close"].notna()].sort_index()
+    except (KeyError, ValueError, TypeError) as e:
+        return None, f"Malformed Bybit candles: {type(e).__name__}"
+    return (df, None) if not df.empty else (None, "All Bybit candles were empty.")
+
+
+def fetch_bybit_price(ticker: str) -> Tuple[Optional[float], Optional[str]]:
+    payload, err = _bybit_get("/v5/market/tickers",
+                              {"category": "linear", "symbol": to_bybit_symbol(ticker)})
+    if payload is None:
+        return None, err
+    rows = (payload.get("result") or {}).get("list") or []
+    if not rows:
+        return None, "Not listed on Bybit."
+    try:
+        price = float(rows[0].get("lastPrice"))
+        return (price, None) if price > 0 else (None, "Non-positive price.")
+    except (TypeError, ValueError) as e:
+        return None, f"{type(e).__name__}"

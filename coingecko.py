@@ -384,3 +384,33 @@ def search_coins(symbol: str, timeout: int = 10):
         return (exact, None) if exact else ([], f"No coin on CoinGecko has the ticker {sym}.")
     except Exception as e:
         return [], f"{type(e).__name__}: {e}"
+
+
+COIN_URL = "https://api.coingecko.com/api/v3/coins/{coin_id}"
+
+
+def fetch_description(coin_id: str, timeout: int = 15):
+    """A coin's own description from CoinGecko, trimmed to a readable length.
+
+    One call per coin, which is why the app only does this on request rather
+    than for a whole list. Returns (text, homepage, error).
+    """
+    try:
+        resp, err = _throttled_get(COIN_URL.format(coin_id=coin_id), {
+            "localization": "false", "tickers": "false", "market_data": "false",
+            "community_data": "false", "developer_data": "false", "sparkline": "false",
+        }, timeout)
+        if resp is None:
+            return None, None, err
+        data = resp.json() or {}
+        text = ((data.get("description") or {}).get("en") or "").strip()
+        if not text:
+            return None, None, "CoinGecko has no description for this coin."
+        import re as _re
+        text = _re.sub(r"<[^>]+>", "", text)           # strip the HTML links
+        text = _re.sub(r"\s+", " ", text).strip()
+        links = (data.get("links") or {}).get("homepage") or []
+        home = next((h for h in links if h), None)
+        return text, home, None
+    except Exception as e:
+        return None, None, f"{type(e).__name__}: {e}"

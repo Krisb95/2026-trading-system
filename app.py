@@ -57,10 +57,11 @@ import sentiment
 import watchlist as watchlist_mod
 import market_tools
 import theme
+import coin_info
 from formatting import format_price, format_rr, RR_STYLES, RR_REWARD_FIRST
 
 _REQUIRED = {
-    coingecko: ['build_frames_v2', 'fetch_ohlc', 'fetch_period_changes', 'fetch_spot_price', 'has_api_key', 'search_coins', 'set_api_key'],
+    coingecko: ['build_frames_v2', 'fetch_description', 'fetch_ohlc', 'fetch_period_changes', 'fetch_spot_price', 'has_api_key', 'search_coins', 'set_api_key'],
     hyperliquid_data: ['MarketContext', 'fetch_candles', 'fetch_market_contexts', 'is_hl_ticker', 'rank_by_volume'],
     watchlist_mod: ['DEFAULT_WATCHLIST', '_normalise', 'parse_aliases', 'parse_list', 'resolve', 'search_markets', 'suggest'],
     sentiment: ['bucket', 'fetch_fear_greed', 'set_cmc_api_key'],
@@ -74,7 +75,8 @@ _REQUIRED = {
     explain: ['AT_ENTRY', 'NO_TREND', 'WAIT_RETRACE', 'full_plan', 'short_plan'],
     trend_retrace: ['AT_ENTRY', 'KIND_INITIAL', 'STOP_BELOW_4H_CANDLE', 'STOP_BELOW_SUPPORT', 'StrategyParams', 'WAIT_RETRACE', 'analyze', 'atr', 'backtest_stats', 'drop_forming', 'reentry_plan_text', 'run_backtest', 'scan_universe_tr'],
     tracking: ['record_from_ranked', 'tracked_stats', 'tracked_trades', 'update_all'],
-    exchanges: ['build_frames', 'fetch_binance_history', 'fetch_binance_klines', 'fetch_kraken_ohlc', 'fetch_spot'],
+    exchanges: ['build_frames', 'fetch_binance_history', 'fetch_binance_klines', 'fetch_bybit_klines', 'fetch_bybit_tickers', 'fetch_kraken_ohlc', 'fetch_spot'],
+    coin_info: ['CATEGORIES', 'COINS', 'coverage', 'describe'],
 }
 
 _stale = sorted({f"{m.__name__.split('.')[-1]}.py" for m, attrs in _REQUIRED.items()
@@ -133,6 +135,41 @@ def _render_learned(model):
                 ta = f"{c.test_avg:+.2f}R (n={c.test_n})" if c.test_avg is not None else "n/a"
                 st.caption(f"**{c.description}** — learning {c.train_avg:+.2f}R "
                            f"(n={c.train_n}), unseen {ta}. {c.verdict}")
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _daily_change(ticker: str, price: float):
+    """(change in price, change %, previous close) over the last 24h, or Nones.
+
+    Sourced to match wherever the price came from: Hyperliquid's own previous
+    daily price for HL markets, otherwise daily candles from the exchange, and
+    Yahoo for stocks and commodities.
+    """
+    if not price:
+        return None, None, None
+    prev = None
+    if hyperliquid_data.is_hl_ticker(ticker):
+        ctxs, _e = _cached_hl_contexts()
+        row = next((c for c in ctxs if c["ticker"] == ticker), None)
+        if row and row.get("change") is not None:
+            prev = price / (1 + row["change"] / 100) if row["change"] != -100 else None
+    if prev is None:
+        df, _e = exchanges.fetch_binance_klines(ticker, "1d", limit=2)
+        if df is None:
+            df, _e = exchanges.fetch_kraken_ohlc(ticker, "1d")
+        if df is not None and len(df) >= 2:
+            prev = float(df["Close"].iloc[-2])
+    if prev is None:
+        try:
+            hist = yf.Ticker(ticker).history(period="5d")
+            hist = hist[hist["Close"].notna()]
+            if len(hist) >= 2:
+                prev = float(hist["Close"].iloc[-2])
+        except Exception:
+            prev = None
+    if not prev:
+        return None, None, None
+    return price - prev, (price - prev) / prev * 100, prev
 
 
 def _size_plan(direction, entry, stop, target, ticker=None):
@@ -228,7 +265,11 @@ def _review_inputs(ticker, entry_time):
         price = m.mark_price if m else None
     else:
         for tf, n in (("4h", 30), ("1h", 1000), ("5m", 1000)):
-            df, _e = exchanges.fetch_binance_klines(ticker, tf, limit=n)
+            df = None
+            if CRYPTO_SOURCE == "bybit":
+                df, _e = exchanges.fetch_bybit_klines(ticker, tf, limit=n)
+            if df is None:
+                df, _e = exchanges.fetch_binance_klines(ticker, tf, limit=n)
             if df is None:
                 df, _e = exchanges.fetch_kraken_ohlc(ticker, tf)
             frames[tf] = trend_retrace.drop_forming(df if df is not None else pd.DataFrame(),
@@ -250,7 +291,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-23-b40 (live price in the compact scanner view)"
+APP_BUILD = "2026-09-23-b41 (Bybit source, 24h change, coin glossary)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -437,12 +478,18 @@ def _exchange_has(symbol: str):
     return None, None
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_bybit_tickers():
+    return exchanges.fetch_bybit_tickers()
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _cached_hl_contexts():
     ctxs, err = hyperliquid_data.fetch_market_contexts()
     return ([{"name": c.name, "ticker": c.ticker, "label": c.label,
               "volume": c.day_volume_usd, "mark": c.mark_price,
-              "oi": c.open_interest_usd, "funding": c.funding_rate} for c in ctxs], err)
+              "oi": c.open_interest_usd, "funding": c.funding_rate,
+              "change": c.change_24h_pct} for c in ctxs], err)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -472,13 +519,15 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("Tradable universe")
 venue_mode = st.sidebar.radio(
     "Restrict coins to",
-    ["Hyperliquid only", "Bybit or Hyperliquid", "Bybit AND Hyperliquid", "All top-100"],
+    ["Bybit only", "Hyperliquid only", "Bybit or Hyperliquid",
+     "Bybit AND Hyperliquid", "All top-100"],
     key="venue_mode",
     help="Market-cap rank includes exchange tokens (WBT, OKB) and wrapped assets you "
          "cannot trade as perpetuals. Filtering to your venue keeps the scan actionable. "
          "Bybit blocks requests from the US server this app runs on, so its list may be "
          "unavailable.")
-_VENUE_MODES = {"Hyperliquid only": venues_mod.MODE_HYPERLIQUID,
+_VENUE_MODES = {"Bybit only": venues_mod.MODE_BYBIT,
+                "Hyperliquid only": venues_mod.MODE_HYPERLIQUID,
                 "Bybit or Hyperliquid": venues_mod.MODE_EITHER,
                 "Bybit AND Hyperliquid": venues_mod.MODE_BOTH}
 
@@ -506,14 +555,15 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("Data source")
 crypto_source = st.sidebar.radio(
     "Crypto prices from",
-    ["Exchange (recommended)", "CoinGecko", "Yahoo Finance"],
+    ["Bybit", "Exchange (Binance/Kraken)", "CoinGecko", "Yahoo Finance"],
     key="crypto_source",
     help=("Exchange uses Binance, falling back to Kraken. It gives true OHLCV at every "
           "interval with no meaningful rate limit — the best option. CoinGecko covers "
           "more obscure coins but rate-limits hard and has no true daily OHLC. Yahoo "
           "misses newer listings. Sources fall back to each other automatically."),
 )
-CRYPTO_SOURCE = ("exchange" if crypto_source.startswith("Exchange")
+CRYPTO_SOURCE = ("bybit" if crypto_source == "Bybit"
+                 else "exchange" if crypto_source.startswith("Exchange")
                  else "coingecko" if crypto_source.startswith("CoinGecko")
                  else "yahoo")
 CRYPTO_PREFERS_CG = CRYPTO_SOURCE == "coingecko"
@@ -521,6 +571,16 @@ st.sidebar.caption(
     "Stocks and commodities always use Yahoo Finance — CoinGecko has no equities "
     "or futures data."
 )
+BYBIT_TICKERS = {}
+if CRYPTO_SOURCE == "bybit":
+    BYBIT_TICKERS, _bybit_err = _cached_bybit_tickers()
+    if BYBIT_TICKERS:
+        st.sidebar.caption(f"Bybit: {len(BYBIT_TICKERS)} USDT perps.")
+    else:
+        st.sidebar.error(
+            f"Bybit unreachable — {_bybit_err} Prices will come from Binance/Kraken "
+            f"instead. Running the app on your own machine in a region Bybit serves "
+            f"would fix this.")
 
 st.sidebar.markdown("---")
 st.sidebar.caption(f"curl_cffi installed: **{curl_cffi_is_available()}**")
@@ -539,10 +599,10 @@ st.sidebar.warning(
     "Export your journal to CSV after any session that matters."
 )
 
-(tab_market, tab_tools, tab_scan, tab_positions, tab_risk, tab_journal,
+(tab_market, tab_tools, tab_learn, tab_scan, tab_positions, tab_risk, tab_journal,
  tab_track, tab_backtest) = st.tabs(
-    ["🌍 Market", "🌡️ Market tools", "🎯 Scanner", "📋 Positions", "🧮 Risk",
-     "📓 Journal", "📈 Tracking", "🔁 Backtest"]
+    ["🌍 Market", "🌡️ Market tools", "📚 What coins do", "🎯 Scanner", "📋 Positions",
+     "🧮 Risk", "📓 Journal", "📈 Tracking", "🔁 Backtest"]
 )
 
 # ---------------------------------------------------------------------
@@ -653,11 +713,37 @@ with tab_market:
     else:
         icons = {DataStatus.LIVE: "🟢", DataStatus.DELAYED: "🟡",
                  DataStatus.STALE: "🟠", DataStatus.UNAVAILABLE: "🔴"}
+
+        # 24h change, from whichever source knows it.
+        _chg_pct = _chg_abs = None
+        _base = ticker.upper().replace("-USD", "")
+        if BYBIT_TICKERS.get(_base):
+            _chg_pct = BYBIT_TICKERS[_base]["change_pct"]
+            _chg_abs = BYBIT_TICKERS[_base]["change_abs"]
+        elif asset_class == "crypto":
+            _hl, _ = _cached_hl_contexts()
+            _m = next((c for c in _hl if c["name"].upper() == _base), None)
+            if _m is None:
+                _prev, _e = exchanges.fetch_binance_klines(ticker, "1d", limit=2)
+                if _prev is not None and len(_prev) >= 2 and quote.price:
+                    _y = float(_prev["Close"].iloc[-2])
+                    _chg_abs = quote.price - _y
+                    _chg_pct = _chg_abs / _y * 100 if _y else None
+
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Instrument", quote.ticker)
-        m2.metric("Price", f"${format_price(quote.price)}" if quote.price else "—")
+        m2.metric("Price", f"${format_price(quote.price)}" if quote.price else "—",
+                  (f"{_chg_pct:+.2f}%  ({'+' if (_chg_abs or 0) >= 0 else '-'}$"
+                   f"{format_price(abs(_chg_abs))})") if _chg_pct is not None else None)
         m3.metric("Status", f"{icons[quote.status]} {quote.status.value}")
         m4.metric("Interval", quote.interval)
+        if _chg_pct is not None:
+            _up = _chg_pct >= 0
+            st.markdown(
+                theme.pill(f"{'▲' if _up else '▼'} {abs(_chg_pct):.2f}% in 24h "
+                           f"({'+' if _up else '-'}${format_price(abs(_chg_abs))})",
+                           theme.GREEN if _up else theme.RED),
+                unsafe_allow_html=True)
 
         age = (f"{quote.effective_age_seconds:,.0f}s past bar close"
                if quote.effective_age_seconds is not None else "—")
@@ -736,7 +822,7 @@ with tab_tools:
     _fl_ctxs, _fl_err = _cached_hl_contexts()
     if _fl_ctxs:
         _objs = [hyperliquid_data.MarketContext(c["name"], c["volume"], c["mark"],
-                                                 c["oi"], c["funding"], None, None)
+                                                 c["oi"], c["funding"], c.get("change"), None)
                  for c in _fl_ctxs if c["volume"] > 5e6]
         _rows = market_tools.flow_rows(_objs)
         _longs, _shorts = market_tools.most_crowded(_rows, limit=5)
@@ -816,6 +902,82 @@ with tab_tools:
         st.caption("Above 70 is conventionally 'overbought', below 30 'oversold'. In a strong "
                    "trend RSI can sit overbought for weeks while price keeps climbing, so "
                    "treat it as a description of momentum, not a reversal signal.")
+
+with tab_learn:
+    st.subheader("What each coin actually does")
+    st.caption(
+        "One line per coin, in plain English. These are written from general knowledge and "
+        "don't update themselves — projects pivot and change direction, so look anything up "
+        "properly before putting money into it. Nothing here is a view on whether a coin is "
+        "worth owning, only what it's for."
+    )
+
+    _g1, _g2 = st.columns([2, 1])
+    _q = _g1.text_input("Search", key="gloss_q", placeholder="e.g. sol, oracle, privacy")
+    _cats = ["All"] + sorted(coin_info.CATEGORIES)
+    _cat = _g2.selectbox("Category", _cats, key="gloss_cat")
+
+    _order = [t.replace("-USD", "") for t in CRYPTO_TICKERS_ALL.values()]
+    _ranked = [s for s in _order if coin_info.describe(s)]
+    _rest = sorted(s for s in coin_info.COINS if s not in _ranked)
+    _symbols = _ranked + _rest
+
+    def _matches(sym):
+        cat, text = coin_info.describe(sym)
+        if _cat != "All" and cat != _cat:
+            return False
+        if not _q:
+            return True
+        needle = _q.strip().lower()
+        return needle in sym.lower() or needle in text.lower() or needle in cat.lower()
+
+    _shown = [s for s in _symbols if _matches(s)]
+    _covered, _total = coin_info.coverage(_order)
+    st.caption(f"{len(_shown)} shown · {len(coin_info.COINS)} coins described, covering "
+               f"{_covered} of the top {_total} by market cap.")
+
+    _colours = {"Layer 1": theme.GREEN, "Layer 2": theme.BLUE, "DeFi": theme.PURPLE,
+                "Meme": theme.AMBER, "Exchange": theme.BLUE, "AI": theme.PURPLE,
+                "Infrastructure": theme.GREY, "Privacy": theme.GREY,
+                "Payments": theme.GREEN, "Gaming": theme.AMBER,
+                "Stablecoin": theme.GREY, "RWA": theme.BLUE}
+    for sym in _shown:
+        cat, text = coin_info.describe(sym)
+        rank = _order.index(sym) + 1 if sym in _order else None
+        with st.container(border=True):
+            st.markdown(
+                f"**{sym}**" + (f"  ·  #{rank} by market cap" if rank else "")
+                + "  " + theme.pill(cat, _colours.get(cat, theme.GREY)),
+                unsafe_allow_html=True)
+            st.write(text)
+
+    if not _shown:
+        st.info("Nothing matches. Try a different word, or look the coin up below.")
+
+    st.markdown("##### Look up any other coin")
+    st.caption("Fetches the project's own description from CoinGecko — one call, so it's "
+               "done on request rather than for a whole list.")
+    _lu = st.text_input("Ticker", key="gloss_lookup", placeholder="e.g. CARDS")
+    if st.button("Look it up", key="gloss_go") and _lu.strip():
+        with st.spinner("Searching…"):
+            _cands, _err = _coingecko_matches(_lu.strip().upper())
+        if not _cands:
+            st.warning(_err or "No coin found with that ticker.")
+        else:
+            for c in _cands[:3]:
+                with st.container(border=True):
+                    st.markdown(f"**{c['name']}** ({c['symbol']})"
+                                + (f"  ·  #{c['rank']} by market cap" if c["rank"] else ""))
+                    _txt, _home, _derr = coingecko.fetch_description(c["id"])
+                    if _txt:
+                        st.write(_txt[:700] + ("…" if len(_txt) > 700 else ""))
+                        if _home:
+                            st.caption(f"Project site: {_home}")
+                        st.caption("This is the project's own description of itself, so it "
+                                   "reads as marketing. Useful for what it does, not for "
+                                   "whether it's any good.")
+                    else:
+                        st.caption(_derr or "No description available.")
 
 # ---------------------------------------------------------------------
 # TAB: Scanner
@@ -1050,7 +1212,8 @@ with tab_scan:
                 hl_marks = {c["ticker"]: c["mark"] for c in _sel}
                 st.session_state.hl_info = {
                     c["ticker"]: hyperliquid_data.MarketContext(
-                        c["name"], c["volume"], c["mark"], c["oi"], c["funding"], None, None)
+                        c["name"], c["volume"], c["mark"], c["oi"], c["funding"],
+                        c.get("change"), None)
                     for c in _sel}
             elif HL_MODE:
                 _ctxs, _hl_err = hyperliquid_data.fetch_market_contexts()
@@ -1112,6 +1275,10 @@ with tab_scan:
                 ticker, coin_id = payload
                 if hyperliquid_data.is_hl_ticker(ticker):
                     return hl_marks.get(ticker)        # already fetched with the volumes
+                if CRYPTO_SOURCE == "bybit":
+                    _b = BYBIT_TICKERS.get(ticker.upper().replace("-USD", ""))
+                    if _b:
+                        return _b["last"]              # already fetched with the tickers
                 px, _src, _err = exchanges.fetch_spot(ticker)
                 if px is None and coin_id:
                     px, _upd, _e = coingecko.fetch_spot_price(coin_id)
@@ -1130,7 +1297,11 @@ with tab_scan:
                         out[tf] = df if df is not None else pd.DataFrame()
                     return out
                 for tf, lim in (("4h", 30), ("1h", 48), ("5m", 400)):
-                    df, _e = exchanges.fetch_binance_klines(ticker, tf, limit=lim)
+                    df = None
+                    if CRYPTO_SOURCE == "bybit":
+                        df, _e = exchanges.fetch_bybit_klines(ticker, tf, limit=lim)
+                    if df is None:
+                        df, _e = exchanges.fetch_binance_klines(ticker, tf, limit=lim)
                     if df is None:
                         df, _e = exchanges.fetch_kraken_ohlc(ticker, tf)
                     out[tf] = df if df is not None else pd.DataFrame()
@@ -1369,7 +1540,11 @@ with tab_scan:
             with st.spinner(f"Checking {tr_ticker}…"):
                 frames = {}
                 for tf, lim in (("4h", 30), ("1h", 48), ("5m", 400)):
-                    df, _e = exchanges.fetch_binance_klines(tr_ticker, tf, limit=lim)
+                    df = None
+                    if CRYPTO_SOURCE == "bybit":
+                        df, _e = exchanges.fetch_bybit_klines(tr_ticker, tf, limit=lim)
+                    if df is None:
+                        df, _e = exchanges.fetch_binance_klines(tr_ticker, tf, limit=lim)
                     if df is None:
                         df, _e = exchanges.fetch_kraken_ohlc(tr_ticker, tf)
                     frames[tf] = trend_retrace.drop_forming(

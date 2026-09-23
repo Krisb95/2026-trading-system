@@ -259,3 +259,79 @@ class TestBinanceHistoryPaging(unittest.TestCase):
     def test_unsupported_interval(self):
         df, err = exchanges.fetch_binance_history("BTC-USD", "7m", 100)
         self.assertIsNone(df)
+
+
+def bybit_ok(payload):
+    return FakeResp({"retCode": 0, "retMsg": "OK", "result": payload})
+
+
+class TestBybit(unittest.TestCase):
+    def setUp(self):
+        self.orig = exchanges.requests.get
+
+    def tearDown(self):
+        exchanges.requests.get = self.orig
+
+    def test_symbol_mapping(self):
+        self.assertEqual(exchanges.to_bybit_symbol("BTC-USD"), "BTCUSDT")
+
+    def test_tickers_include_change_in_percent_and_dollars(self):
+        exchanges.requests.get = lambda *a, **k: bybit_ok({"list": [
+            {"symbol": "BTCUSDT", "lastPrice": "82000", "prevPrice24h": "80000",
+             "price24hPcnt": "0.025", "turnover24h": "1000000",
+             "openInterestValue": "500000", "fundingRate": "0.0001",
+             "highPrice24h": "83000", "lowPrice24h": "79000"}]})
+        rows, err = exchanges.fetch_bybit_tickers()
+        self.assertIsNone(err)
+        self.assertAlmostEqual(rows["BTC"]["change_pct"], 2.5)
+        self.assertAlmostEqual(rows["BTC"]["change_abs"], 2000.0)
+
+    def test_non_usdt_pairs_ignored(self):
+        exchanges.requests.get = lambda *a, **k: bybit_ok({"list": [
+            {"symbol": "BTCUSDC", "lastPrice": "82000", "prevPrice24h": "80000"}]})
+        rows, err = exchanges.fetch_bybit_tickers()
+        self.assertEqual(rows, {})
+
+    def test_klines_returned_oldest_first(self):
+        base = 1758000000000
+        rows = [[str(base + i * 14400000), "1", "2", "0.5", "1.5", "10", "15"]
+                for i in range(5)][::-1]          # Bybit sends newest first
+        exchanges.requests.get = lambda *a, **k: bybit_ok({"list": rows})
+        df, err = exchanges.fetch_bybit_klines("BTC-USD", "4h")
+        self.assertIsNone(err)
+        self.assertTrue(df.index.is_monotonic_increasing)
+        self.assertEqual(len(df), 5)
+
+    def test_geo_block_explained_plainly(self):
+        exchanges.requests.get = lambda *a, **k: FakeResp({}, status_code=403)
+        rows, err = exchanges.fetch_bybit_tickers()
+        self.assertEqual(rows, {})
+        self.assertIn("blocks requests from this server's location", err)
+
+    def test_falls_back_to_the_alternate_domain(self):
+        seen = []
+
+        def _get(url, params=None, **k):
+            seen.append(url)
+            if "api.bybit.com" in url:
+                return FakeResp({}, status_code=403)
+            return bybit_ok({"list": [{"symbol": "BTCUSDT", "lastPrice": "82000",
+                                       "prevPrice24h": "80000", "price24hPcnt": "0.025"}]})
+
+        exchanges.requests.get = _get
+        rows, err = exchanges.fetch_bybit_tickers()
+        self.assertIsNone(err)
+        self.assertIn("BTC", rows)
+        self.assertTrue(any("bytick" in u for u in seen))
+
+    def test_api_level_error_reported(self):
+        exchanges.requests.get = lambda *a, **k: FakeResp(
+            {"retCode": 10001, "retMsg": "params error", "result": {}})
+        rows, err = exchanges.fetch_bybit_tickers()
+        self.assertIn("params error", err)
+
+    def test_price_lookup(self):
+        exchanges.requests.get = lambda *a, **k: bybit_ok(
+            {"list": [{"symbol": "BTCUSDT", "lastPrice": "82000"}]})
+        price, err = exchanges.fetch_bybit_price("BTC-USD")
+        self.assertAlmostEqual(price, 82000.0)
