@@ -59,6 +59,37 @@ import market_tools
 import theme
 from formatting import format_price, format_rr, RR_STYLES, RR_REWARD_FIRST
 
+_REQUIRED = {
+    coingecko: ['build_frames_v2', 'fetch_ohlc', 'fetch_period_changes', 'fetch_spot_price', 'has_api_key', 'search_coins', 'set_api_key'],
+    hyperliquid_data: ['MarketContext', 'fetch_candles', 'fetch_market_contexts', 'is_hl_ticker', 'rank_by_volume'],
+    watchlist_mod: ['DEFAULT_WATCHLIST', '_normalise', 'parse_aliases', 'parse_list', 'resolve', 'search_markets', 'suggest'],
+    sentiment: ['bucket', 'fetch_fear_greed', 'set_cmc_api_key'],
+    market_tools: ['OVERBOUGHT', 'OVERSOLD', 'altcoin_season_index', 'flow_rows', 'most_crowded', 'rsi_row', 'rsi_state', 'turnover_ratio'],
+    theme: ['AMBER', 'BLUE', 'CSS', 'GRADE_COLOURS', 'GREEN', 'GREY', 'PURPLE', 'RED', 'gauge', 'pill'],
+    storage: ['add_journal_entry', 'add_position', 'clear_all', 'close_journal_entry', 'delete_position', 'get_journal_df', 'get_positions', 'get_signals_df', 'import_journal_csv', 'import_signals_csv', 'init_db', 'journal_to_csv_bytes', 'load_value', 'save_value', 'signals_to_csv_bytes', 'update_journal_entry', 'update_position'],
+    trade_log: ['OUTCOMES', 'complete_trade', 'default_exit_price', 'learning_trades', 'open_scanner_trades', 'pl_status_for', 'realized_r', 'take_trade'],
+    trade_review: ['CLOSE', 'CLOSE_THESIS', 'HOLD', 'TIGHTEN', 'review'],
+    learning: ['LearnedModel', 'MIN_TRADES', 'learn'],
+    expectancy: ['EvidenceBook', 'PROVEN_NEGATIVE', 'PROVEN_POSITIVE', 'TOO_FEW', 'UNPROVEN', 'break_even_win_rate', 'simulate_expectations'],
+    explain: ['AT_ENTRY', 'NO_TREND', 'WAIT_RETRACE', 'full_plan', 'short_plan'],
+    trend_retrace: ['AT_ENTRY', 'KIND_INITIAL', 'STOP_BELOW_4H_CANDLE', 'STOP_BELOW_SUPPORT', 'StrategyParams', 'WAIT_RETRACE', 'analyze', 'atr', 'backtest_stats', 'drop_forming', 'reentry_plan_text', 'run_backtest', 'scan_universe_tr'],
+    tracking: ['record_from_ranked', 'tracked_stats', 'tracked_trades', 'update_all'],
+    exchanges: ['build_frames', 'fetch_binance_history', 'fetch_binance_klines', 'fetch_kraken_ohlc', 'fetch_spot'],
+}
+
+_stale = sorted({f"{m.__name__.split('.')[-1]}.py" for m, attrs in _REQUIRED.items()
+                 for a in attrs if not hasattr(m, a)})
+if _stale:
+    # A module is present but older than app.py expects. This is always a
+    # part-finished upload, and it surfaces as a confusing AttributeError deep
+    # in the page, so it is caught here instead.
+    st.error(
+        "**These files are out of date:** " + ", ".join(f"`{f}`" for f in _stale) +
+        "\n\nUpload **every `.py` file** from the latest download together — they're "
+        "released as a set and expect each other's newest versions."
+    )
+    st.stop()
+
 MIN_RR = 3.0   # reward:risk floor — nothing below this is shown, tracked or traded
 
 
@@ -178,7 +209,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-23-b37 (watchlist: exchange then CoinGecko fallback)"
+APP_BUILD = "2026-09-23-b38 (startup file check; notice removed)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -789,13 +820,6 @@ with tab_scan:
                         _elsewhere.append((u, _sym, _tk, _venue))
                     else:
                         _still_missing.append(u)
-                if _elsewhere:
-                    st.info("Not on Hyperliquid, but tradable elsewhere — these will be "
-                            "scanned using that venue's candles: "
-                            + "; ".join(f"**{u}** → {sym} on {v}"
-                                        for u, sym, _t, v in _elsewhere)
-                            + ". You can't trade them on Hyperliquid, so check where you'd "
-                              "actually place the order.")
                 # Last resort: CoinGecko covers coins no exchange here lists.
                 _via_cg = []
                 _truly_missing = []
