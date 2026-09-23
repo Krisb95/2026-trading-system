@@ -250,7 +250,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-23-b39 (position size shown on every trade plan)"
+APP_BUILD = "2026-09-23-b40 (live price in the compact scanner view)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -1284,8 +1284,8 @@ with tab_scan:
                 _detail = st.toggle("Show every column", value=False, key="uni_detail",
                                     help="Off keeps the essentials only — easier to read on "
                                          "a phone.")
-                _essential = ["Instrument", "Dir", "Entry", "Stop", "Target", "R:R",
-                              "Status", "Grade"]
+                _essential = ["Instrument", "Dir", "Live price", "Entry", "Entry vs live",
+                              "Stop", "Target", "R:R", "Status", "Grade"]
                 _view = table if _detail else table[[c for c in _essential
                                                      if c in table.columns]]
                 st.dataframe(_view, use_container_width=True, hide_index=True,
@@ -1293,8 +1293,8 @@ with tab_scan:
                                  "Trade plan", width="large")})
                 if not _detail:
                     st.caption("Showing the essentials. Turn on **Show every column** for "
-                               "live price, distance to entry, venue, volume, evidence and "
-                               "the one-line plan.")
+                               "venue, volume, funding, evidence, the learned check and the "
+                               "one-line plan.")
 
                 _complete = [r for r in ok if None not in (r.entry, r.stop, r.target)]
                 if _complete:
