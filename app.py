@@ -19,7 +19,9 @@ from scoring import (score_setup, weakest_components, trade_policy_for_grade,
 from readiness import (determine_readiness, ReadinessInputs, Readiness, display_label,
                         ENTRY_SEQUENCE_STAGES, missing_entry_sequence_stages,
                         READINESS_DESCRIPTIONS)
-from risk_calc import calculate_risk, InvalidRiskInputError
+from risk_calc import (calculate_risk, InvalidRiskInputError,
+                        stop_from_pct as calc_stop_from_pct,
+                        liquidation_price, stop_is_beyond_liquidation)
 from backtest import (run_backtest, compute_metrics, split_in_out_sample,
                        example_sma_crossover_signals)
 from portfolio import OpenPosition, summarize_portfolio_risk
@@ -40,6 +42,8 @@ import learning
 import trade_log
 import hyperliquid_data
 import trade_review
+import sentiment
+import watchlist as watchlist_mod
 from formatting import format_price
 
 MIN_RR = 3.0   # reward:risk floor — nothing below this is shown, tracked or traded
@@ -161,7 +165,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-21-b30 (trade review)"
+APP_BUILD = "2026-09-21-b31 (fear+greed, watchlist, position calculator)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
@@ -297,6 +301,41 @@ except Exception:
     _cg_key = ""
 if _cg_key:
     coingecko.set_api_key(_cg_key)
+
+_cmc_key = ""
+try:
+    _cmc_key = st.secrets.get("COINMARKETCAP_API_KEY", "")
+except Exception:
+    _cmc_key = ""
+if _cmc_key:
+    sentiment.set_cmc_api_key(_cmc_key)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_hl_contexts():
+    ctxs, err = hyperliquid_data.fetch_market_contexts()
+    return ([{"name": c.name, "ticker": c.ticker, "label": c.label,
+              "volume": c.day_volume_usd, "mark": c.mark_price,
+              "oi": c.open_interest_usd, "funding": c.funding_rate} for c in ctxs], err)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _cached_fear_greed():
+    fg, err = sentiment.fetch_fear_greed()
+    if fg is None:
+        return None, err
+    return {"value": fg.value, "classification": fg.classification, "source": fg.source,
+            "previous": fg.previous, "direction": fg.direction}, err
+
+_fg, _fg_err = _cached_fear_greed()
+if _fg:
+    st.sidebar.metric("Fear & Greed", f"{_fg['value']} · {_fg['classification']}",
+                      (f"{_fg['direction']} from {_fg['previous']}"
+                       if _fg.get("previous") is not None else None), delta_color="off")
+    st.sidebar.caption(f"Source: {_fg['source']}. A whole-market mood gauge — it says "
+                       f"nothing about any single setup.")
+elif _fg_err:
+    st.sidebar.caption(f"Fear & Greed unavailable: {_fg_err}")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Tradable universe")
@@ -532,13 +571,40 @@ with tab_scan:
     if mode == "Rank the universe":
         coin_source = st.radio(
             "Which coins",
-            ["Top by market cap", "High volume, outside the top 20 (Hyperliquid)"],
+            ["Top by market cap", "High volume, outside the top 20 (Hyperliquid)",
+             "My watchlist"],
             key="uni_coin_source",
             help="The second option ranks Hyperliquid perps by their 24-hour volume on "
                  "Hyperliquid — the liquidity you'd actually trade into — and skips the "
                  "largest coins by market cap.")
-        HL_MODE = coin_source.startswith("High volume")
-        if HL_MODE:
+        WATCHLIST_MODE = coin_source == "My watchlist"
+        HL_MODE = coin_source.startswith("High volume") or WATCHLIST_MODE
+        if WATCHLIST_MODE:
+            wl_text = st.text_area(
+                "Coins to scan", value=watchlist_mod.DEFAULT_WATCHLIST, height=90,
+                key="wl_text",
+                help="Separate with commas. Full names work too (stacks, immutable). "
+                     "Anything that can't be matched is listed below rather than guessed.")
+            _wl_markets = []
+            _wl_ctxs, _wl_err = _cached_hl_contexts()
+            if _wl_ctxs:
+                _wl_markets = [c["name"] for c in _wl_ctxs]
+            _wl_found, _wl_missing = watchlist_mod.resolve(wl_text, _wl_markets)
+            if _wl_markets:
+                st.caption(f"Matched {len(_wl_found)} of "
+                           f"{len(watchlist_mod.parse_list(wl_text))} entries on Hyperliquid: "
+                           + ", ".join(sorted({r.market for r in _wl_found})))
+                if _wl_missing:
+                    _hints = []
+                    for u in _wl_missing:
+                        s_ = watchlist_mod.suggest(u, _wl_markets)
+                        _hints.append(f"**{u}**" + (f" → did you mean {', '.join(s_)}?"
+                                                    if s_ else " (not on Hyperliquid)"))
+                    st.warning("Couldn't match: " + "; ".join(_hints)
+                               + ". Correct the spelling above, or leave them out.")
+            else:
+                st.error(f"Couldn't load Hyperliquid's market list: {_wl_err}")
+        elif HL_MODE:
             v1, v2, v3 = st.columns(3)
             hl_exclude_n = v1.number_input("Skip the top N by market cap", min_value=0,
                                            max_value=100, value=20, step=5, key="hl_excl")
@@ -559,7 +625,9 @@ with tab_scan:
                 "all three rules scores 10/10; the score is a checklist count, not a "
                 "probability of profit."
             )
-            if HL_MODE:
+            if WATCHLIST_MODE:
+                universe_size = len(_wl_found)
+            elif HL_MODE:
                 universe_size = hl_count
             else:
                 universe_size = st.selectbox("How many coins", [10, 20, 30, 50], index=1,
@@ -574,7 +642,9 @@ with tab_scan:
                 "full single-instrument scan on anything promising."
             )
             u1, u2, u3 = st.columns(3)
-            if HL_MODE:
+            if WATCHLIST_MODE:
+                universe_size = len(_wl_found)
+            elif HL_MODE:
                 universe_size = hl_count
             else:
                 universe_size = u1.selectbox("How many coins", [10, 20, 30, 50],
@@ -588,6 +658,8 @@ with tab_scan:
         if HL_MODE:
             st.caption(f"Roughly {universe_size * 4.5 + 2:.0f}s for {universe_size} coins — "
                        f"Hyperliquid limits request rates, so calls are paced.")
+            if WATCHLIST_MODE and not _wl_found:
+                st.info("Nothing to scan yet — fix the unmatched entries above.")
         else:
             per_coin = 0.6 if CRYPTO_SOURCE == "exchange" else 1.4   # 4 calls/coin
             est = universe_size * per_coin
@@ -603,7 +675,17 @@ with tab_scan:
 
         if st.button("🔎 Scan universe", use_container_width=True):
             hl_marks = {}
-            if HL_MODE:
+            if WATCHLIST_MODE:
+                _all, _e = _cached_hl_contexts()
+                _by_name = {c["name"]: c for c in _all}
+                _sel = [_by_name[r.market] for r in _wl_found if r.market in _by_name]
+                instruments = [(c["label"], c["ticker"], (c["ticker"], None)) for c in _sel]
+                hl_marks = {c["ticker"]: c["mark"] for c in _sel}
+                st.session_state.hl_info = {
+                    c["ticker"]: hyperliquid_data.MarketContext(
+                        c["name"], c["volume"], c["mark"], c["oi"], c["funding"], None, None)
+                    for c in _sel}
+            elif HL_MODE:
                 _ctxs, _hl_err = hyperliquid_data.fetch_market_contexts()
                 if not _ctxs:
                     st.error(f"Couldn't load Hyperliquid volumes: {_hl_err}")
@@ -689,9 +771,10 @@ with tab_scan:
 
             if USE_TR:
                 with st.spinner("Scanning…"):
+                    _extra = {"sentiment": sentiment.bucket(_fg["value"])} if _fg else None
                     ranked = trend_retrace.scan_universe_tr(
                         instruments, _tr_loader, spot_loader=_spot, params=TR_PARAMS,
-                        progress=_progress)
+                        progress=_progress, extra_features=_extra)
             else:
                 with st.spinner("Scanning…"):
                     ranked = scan_universe(
@@ -1534,18 +1617,51 @@ with tab_risk:
     direction = k3.selectbox("Direction", ["Long", "Short"],
                               index=0 if pre.get("direction", "Long") == "Long" else 1)
 
+    stop_style = st.radio("Set the stop as", ["A price", "A % from entry"],
+                          horizontal=True, key="risk_stop_style")
     k4, k5, k6 = st.columns(3)
-    entry = k4.number_input("Entry", min_value=0.0, value=float(pre.get("entry", 100.0)), step=0.01)
-    stop = k5.number_input("Stop", min_value=0.0, value=float(pre.get("stop", 95.0)), step=0.01)
-    target = k6.number_input("Target", min_value=0.0, value=float(pre.get("target", 115.0)), step=0.01)
+    entry = k4.number_input("Entry", min_value=0.0, value=float(pre.get("entry", 100.0)),
+                            step=0.01, format="%.8f")
+    if stop_style == "A price":
+        stop = k5.number_input("Stop", min_value=0.0, value=float(pre.get("stop", 95.0)),
+                               step=0.01, format="%.8f")
+        stop_pct_display = (abs(entry - stop) / entry * 100) if entry else 0.0
+    else:
+        stop_pct = k5.number_input("Stop distance (%)", min_value=0.01, max_value=99.0,
+                                   value=1.5, step=0.1, key="risk_stop_pct",
+                                   help="How far against you price can go before you're wrong.")
+        try:
+            stop = calc_stop_from_pct(entry, stop_pct, direction)
+        except InvalidRiskInputError:
+            stop = 0.0
+        stop_pct_display = stop_pct
+        k5.caption(f"= {format_price(stop)}")
+    target = k6.number_input("Target", min_value=0.0, value=float(pre.get("target", 115.0)),
+                             step=0.01, format="%.8f")
 
     k7, k8, k9 = st.columns(3)
     leverage = k7.number_input("Leverage", min_value=1.0, value=1.0, step=0.5)
     fee = k8.number_input("Fee rate", min_value=0.0, value=0.0006, step=0.0001, format="%.4f")
     slip = k9.number_input("Slippage", min_value=0.0, value=0.0005, step=0.0001, format="%.4f")
 
+    mmr = st.number_input("Maintenance margin (%)", min_value=0.0, max_value=10.0, value=0.5,
+                          step=0.1, key="risk_mmr",
+                          help="Used to estimate the liquidation price. Exchanges raise this "
+                               "for larger positions — check yours for the real figure.")
     spec_ticker = st.text_input("Contract-spec ticker (optional, e.g. GC=F)",
                                  value=pre.get("ticker", ""))
+
+    if entry > 0 and leverage > 1:
+        _liq = liquidation_price(entry, leverage, direction, mmr)
+        if _liq:
+            _gap = abs(entry - _liq) / entry * 100
+            st.caption(f"Estimated liquidation around **{format_price(_liq)}** "
+                       f"({_gap:.2f}% from entry) at {leverage:g}x — an estimate, not the "
+                       f"exchange's figure.")
+            if stop > 0 and stop_is_beyond_liquidation(entry, stop, leverage, direction, mmr):
+                st.error("⚠️ Your stop sits beyond the estimated liquidation price — you'd be "
+                         "liquidated before the stop protects you. Reduce leverage or tighten "
+                         "the stop.")
 
     if st.button("Calculate", use_container_width=True):
         try:
@@ -1567,6 +1683,10 @@ with tab_risk:
             if res.net_reward_risk is not None:
                 g.metric("Net R:R", f"{res.net_reward_risk:.2f}")
 
+            st.caption(f"Stop is {res.stop_distance_pct * 100:.2f}% from entry "
+                       f"({format_price(res.stop_distance_price)} per coin). Position "
+                       f"{res.quantity:g} coins = {format_price(res.position_notional)} "
+                       f"notional on {format_price(res.margin_required)} margin.")
             if res.exceeds_account_equity:
                 st.error("⚠️ Required margin exceeds account equity.")
             if res.liquidation_warning:

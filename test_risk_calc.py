@@ -192,3 +192,51 @@ class TestRealizedPnL(unittest.TestCase):
         from risk_calc import realized_pnl
         self.assertAlmostEqual(realized_pnl(2000, 2050, 1, "Long", contract_multiplier=100),
                                 5000.0)
+
+
+class TestPercentageStops(unittest.TestCase):
+    def test_long_stop_below_entry(self):
+        from risk_calc import stop_from_pct
+        self.assertAlmostEqual(stop_from_pct(100, 1.5, "Long"), 98.5)
+
+    def test_short_stop_above_entry(self):
+        from risk_calc import stop_from_pct
+        self.assertAlmostEqual(stop_from_pct(100, 1.5, "Short"), 101.5)
+
+    def test_rejects_bad_inputs(self):
+        from risk_calc import stop_from_pct
+        with self.assertRaises(InvalidRiskInputError):
+            stop_from_pct(100, 0, "Long")
+        with self.assertRaises(InvalidRiskInputError):
+            stop_from_pct(0, 1.5, "Long")
+
+
+class TestLiquidationEstimate(unittest.TestCase):
+    def test_long_liquidation_is_below_entry(self):
+        from risk_calc import liquidation_price
+        liq = liquidation_price(100, 10, "Long", maintenance_margin_pct=0.5)
+        self.assertAlmostEqual(liq, 90.5)
+
+    def test_short_liquidation_is_above_entry(self):
+        from risk_calc import liquidation_price
+        self.assertAlmostEqual(liquidation_price(100, 10, "Short", 0.5), 109.5)
+
+    def test_higher_leverage_moves_liquidation_closer(self):
+        from risk_calc import liquidation_price
+        self.assertGreater(liquidation_price(100, 20, "Long"),
+                           liquidation_price(100, 5, "Long"))
+
+    def test_no_liquidation_without_leverage(self):
+        from risk_calc import liquidation_price
+        self.assertIsNone(liquidation_price(100, 1, "Long"))
+
+    def test_detects_stop_beyond_liquidation(self):
+        from risk_calc import stop_is_beyond_liquidation
+        # 20x: liquidation near 95.5, so a stop at 94 never gets hit
+        self.assertTrue(stop_is_beyond_liquidation(100, 94, 20, "Long"))
+        self.assertFalse(stop_is_beyond_liquidation(100, 97, 20, "Long"))
+
+    def test_short_stop_beyond_liquidation(self):
+        from risk_calc import stop_is_beyond_liquidation
+        self.assertTrue(stop_is_beyond_liquidation(100, 106, 20, "Short"))
+        self.assertFalse(stop_is_beyond_liquidation(100, 103, 20, "Short"))

@@ -299,3 +299,57 @@ def realized_pnl(entry: float, exit_price: float, quantity: float, direction: st
     gross = move * unit
     costs = (entry * unit) * (fee_rate + slippage_pct)
     return gross - costs
+
+
+# ---------------------------------------------------------------------
+# Percentage-based stops and liquidation estimates
+# ---------------------------------------------------------------------
+
+def stop_from_pct(entry: float, stop_pct: float, direction: str) -> float:
+    """Stop price from a percentage distance off the entry.
+
+    Some traders think in "I'm wrong if it moves 1.5% against me" rather than
+    in price levels. stop_pct is that distance as a percentage (1.5 = 1.5%).
+    """
+    if entry <= 0:
+        raise InvalidRiskInputError("entry must be positive")
+    if not (0 < stop_pct < 100):
+        raise InvalidRiskInputError("stop_pct must be between 0 and 100")
+    move = entry * stop_pct / 100.0
+    return entry - move if direction.capitalize() == "Long" else entry + move
+
+
+def liquidation_price(entry: float, leverage: float, direction: str,
+                      maintenance_margin_pct: float = 0.5) -> Optional[float]:
+    """ESTIMATED isolated-margin liquidation price.
+
+        long:  entry x (1 - 1/leverage + mmr)
+        short: entry x (1 + 1/leverage - mmr)
+
+    This is an approximation. Real liquidation prices depend on the exchange's
+    maintenance-margin tiers (which rise with position size), unrealised PnL on
+    other positions, and funding paid while the position is open. Treat it as a
+    rough guide and confirm the real figure on the exchange before sizing a
+    leveraged trade close to it.
+    """
+    if entry <= 0 or leverage <= 0:
+        return None
+    if leverage <= 1:
+        return None          # unleveraged spot can't be liquidated
+    mmr = maintenance_margin_pct / 100.0
+    if direction.capitalize() == "Long":
+        price = entry * (1 - 1 / leverage + mmr)
+    else:
+        price = entry * (1 + 1 / leverage - mmr)
+    return price if price > 0 else None
+
+
+def stop_is_beyond_liquidation(entry: float, stop: float, leverage: float,
+                               direction: str,
+                               maintenance_margin_pct: float = 0.5) -> bool:
+    """True when the position would be liquidated BEFORE the stop is reached —
+    the stop would never protect you."""
+    liq = liquidation_price(entry, leverage, direction, maintenance_margin_pct)
+    if liq is None:
+        return False
+    return stop <= liq if direction.capitalize() == "Long" else stop >= liq

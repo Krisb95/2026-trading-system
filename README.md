@@ -232,3 +232,26 @@ winners go sideways first, so closing stale trades can cut off the wins that
 pay for the losses. A broken 4H thesis is the clearer signal — though it is
 rare, because most trades end within a few hours while a 4H reversal needs
 at least eight hours to form.
+
+## Fear & Greed, watchlists and the position calculator
+
+**Fear & Greed** appears in the sidebar (0 = extreme fear, 100 = extreme greed).
+CoinMarketCap's index is used when `COINMARKETCAP_API_KEY` is set in secrets;
+otherwise the free Alternative.me feed, which needs no key. It is a whole-market
+mood gauge and says nothing about any individual setup — so rather than acting
+on it, the app records the band with every setup, letting the learner test
+whether setups taken in greed or fear actually perform differently.
+
+**My watchlist** is a scanner mode: type coins (commas, full names or tickers)
+and it matches them against Hyperliquid's live market list. Old tickers and
+names resolve via aliases (rndr → RENDER, stacks → STX, immutable → IMX).
+Anything it can't match confidently is reported with suggestions rather than
+guessed, because scanning the wrong coin looks identical to scanning the right
+one.
+
+**The position calculator** accepts the stop either as a price or as a
+percentage from entry, and estimates the isolated-margin liquidation price. It
+warns when a stop sits beyond liquidation — where the position would be closed
+out before the stop could protect it. Liquidation figures are estimates:
+exchanges raise maintenance margin for larger positions, so confirm on the
+venue.

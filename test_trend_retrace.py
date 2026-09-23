@@ -532,3 +532,23 @@ class TestReviewExitsInBacktest(unittest.TestCase):
         trades = run_backtest(self.m5, self.h1, self.h4, "X")
         reasons = {t.exit_reason for t in trades if t.status in ("WIN", "LOSS")}
         self.assertTrue(reasons <= {"stop", "target"})
+
+
+class TestExtraFeatures(unittest.TestCase):
+    def test_market_context_is_recorded_with_the_setup(self):
+        p = analyze("X", uptrend_4h(), bullish_1h(), five_min_with_support(),
+                    live_price=103.0, extra_features={"sentiment": "Greed"})
+        self.assertEqual(p.features["sentiment"], "Greed")
+
+    def test_none_values_are_not_recorded(self):
+        p = analyze("X", uptrend_4h(), bullish_1h(), five_min_with_support(),
+                    live_price=103.0, extra_features={"sentiment": None})
+        self.assertNotIn("sentiment", p.features)
+
+    def test_universe_scan_passes_context_through(self):
+        out = tr.scan_universe_tr(
+            [("Full", "FULL-USD", "full")],
+            lambda k: {"4h": uptrend_4h(), "1h": bullish_1h(), "5m": five_min_with_support()},
+            spot_loader=lambda k: 103.0, now=pd.Timestamp("2030-01-01", tz="UTC"),
+            extra_features={"sentiment": "Fear"})
+        self.assertEqual(out[0].features["sentiment"], "Fear")

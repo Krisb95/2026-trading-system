@@ -235,7 +235,8 @@ def _grade(score: float) -> str:
 def analyze(ticker: str, df_4h: pd.DataFrame, df_1h: pd.DataFrame,
             df_5m: pd.DataFrame, live_price: Optional[float] = None,
             params: Optional[StrategyParams] = None,
-            direction_override: Optional[str] = None) -> TrendRetracePlan:
+            direction_override: Optional[str] = None,
+            extra_features: Optional[Dict[str, object]] = None) -> TrendRetracePlan:
     """Apply the three rules to closed candles and produce a plan.
 
     The candle frames passed in must contain CLOSED candles only; the caller
@@ -287,6 +288,11 @@ def analyze(ticker: str, df_4h: pd.DataFrame, df_1h: pd.DataFrame,
                 pd.Timestamp.now(tz="UTC")
             plan.features = compute_features(direction, price, level, stop, df_4h, df_1h,
                                               df_5m, _when, params.trend_candles)
+            if extra_features:
+                # Market-wide context (e.g. the Fear & Greed band) recorded with
+                # the setup, so the learner can test whether it matters.
+                plan.features.update({k: v for k, v in extra_features.items()
+                                      if v is not None})
         else:
             plan.problems.append(how)
     return plan
@@ -620,7 +626,8 @@ def drop_forming(df: pd.DataFrame, bar: str, now: Optional[pd.Timestamp] = None
 
 def scan_universe_tr(instruments, frame_loader, spot_loader=None,
                       params: Optional[StrategyParams] = None,
-                      progress=None, now: Optional[pd.Timestamp] = None):
+                      progress=None, now: Optional[pd.Timestamp] = None,
+                      extra_features: Optional[Dict[str, object]] = None):
     """Apply the strategy to many instruments and rank them.
 
     instruments:  list of (label, ticker, fetch_key)
@@ -650,7 +657,8 @@ def scan_universe_tr(instruments, frame_loader, spot_loader=None,
                     live = spot_loader(key)
                 except Exception:
                     live = None
-            plan = analyze(ticker, f4, f1, f5, live_price=live, params=params)
+            plan = analyze(ticker, f4, f1, f5, live_price=live, params=params,
+                            extra_features=extra_features)
             out.append(RankedCandidate(
                 ticker=ticker, label=label, direction=plan.direction, score=plan.score,
                 grade=plan.grade, regime=plan.stage, price=plan.current_price,
