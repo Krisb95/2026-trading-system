@@ -330,3 +330,44 @@ class TestPeriodChanges(unittest.TestCase):
         changes, err = coingecko.fetch_period_changes()
         self.assertEqual(changes, {})
         self.assertIn("ConnectionError", err)
+
+
+class TestCoinSearch(unittest.TestCase):
+    def setUp(self):
+        self.original = coingecko.requests.get
+
+    def tearDown(self):
+        coingecko.requests.get = self.original
+
+    def test_returns_only_exact_ticker_matches(self):
+        coingecko.requests.get = patch_get({"coins": [
+            {"id": "derive", "symbol": "drv", "name": "Derive", "market_cap_rank": 300},
+            {"id": "curve-dao-token", "symbol": "crv", "name": "Curve", "market_cap_rank": 90},
+        ]})
+        found, err = coingecko.search_coins("DRV")
+        self.assertIsNone(err)
+        self.assertEqual([c["id"] for c in found], ["derive"])
+
+    def test_several_projects_sharing_a_ticker_are_all_returned(self):
+        coingecko.requests.get = patch_get({"coins": [
+            {"id": "derive", "symbol": "drv", "name": "Derive", "market_cap_rank": 300},
+            {"id": "other-drv", "symbol": "drv", "name": "Other DRV", "market_cap_rank": None},
+        ]})
+        found, _ = coingecko.search_coins("drv")
+        self.assertEqual(len(found), 2)
+        self.assertEqual(found[0]["id"], "derive")     # ranked coin first
+
+    def test_no_match_reported(self):
+        coingecko.requests.get = patch_get({"coins": []})
+        found, err = coingecko.search_coins("ZZZZ")
+        self.assertEqual(found, [])
+        self.assertIn("ZZZZ", err)
+
+    def test_empty_symbol(self):
+        self.assertEqual(coingecko.search_coins("")[0], [])
+
+    def test_network_failure(self):
+        coingecko.requests.get = patch_get(exc=ConnectionError("down"))
+        found, err = coingecko.search_coins("DRV")
+        self.assertEqual(found, [])
+        self.assertIn("ConnectionError", err)

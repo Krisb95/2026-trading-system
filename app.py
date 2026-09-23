@@ -178,7 +178,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-23-b35 (colour, market tools, R:R display, compact table)"
+APP_BUILD = "2026-09-23-b37 (watchlist: exchange then CoinGecko fallback)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -327,6 +327,25 @@ except Exception:
     _cmc_key = ""
 if _cmc_key:
     sentiment.set_cmc_api_key(_cmc_key)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _coingecko_matches(symbol: str):
+    return coingecko.search_coins(symbol)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _exchange_has(symbol: str):
+    """Is this symbol tradable on Binance/Kraken? A two-candle request is the
+    cheapest reliable check. Used for watchlist names Hyperliquid doesn't list."""
+    ticker = f"{symbol.upper()}-USD"
+    df, _e = exchanges.fetch_binance_klines(ticker, "4h", limit=2)
+    if df is not None and not df.empty:
+        return ticker, "Binance"
+    df, _e = exchanges.fetch_kraken_ohlc(ticker, "4h")
+    if df is not None and not df.empty:
+        return ticker, "Kraken"
+    return None, None
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -753,17 +772,78 @@ with tab_scan:
             _aliases, _bad_alias = watchlist_mod.parse_aliases(_alias_text)
             _wl_found, _wl_missing = watchlist_mod.resolve(wl_text, _wl_markets,
                                                             aliases=_aliases)
+            _elsewhere = []      # set below; defined here so a failed market
+            _via_cg = []         # list can't crash the rest of the page
             if _wl_markets:
                 st.caption(f"Matched {len(_wl_found)} of "
                            f"{len(watchlist_mod.parse_list(wl_text))} entries on Hyperliquid: "
                            + ", ".join(sorted({r.market for r in _wl_found})))
-                if _wl_missing:
+                # Anything Hyperliquid doesn't list may still trade elsewhere.
+                _elsewhere = []
+                _still_missing = []
+                for u in _wl_missing:
+                    _sym = watchlist_mod._normalise(_aliases.get(
+                        watchlist_mod._normalise(u), u))
+                    _tk, _venue = _exchange_has(_sym)
+                    if _tk:
+                        _elsewhere.append((u, _sym, _tk, _venue))
+                    else:
+                        _still_missing.append(u)
+                if _elsewhere:
+                    st.info("Not on Hyperliquid, but tradable elsewhere — these will be "
+                            "scanned using that venue's candles: "
+                            + "; ".join(f"**{u}** → {sym} on {v}"
+                                        for u, sym, _t, v in _elsewhere)
+                            + ". You can't trade them on Hyperliquid, so check where you'd "
+                              "actually place the order.")
+                # Last resort: CoinGecko covers coins no exchange here lists.
+                _via_cg = []
+                _truly_missing = []
+                _cg_choice = storage.load_value("wl_cg_ids")[0] or {}
+                for u in _still_missing:
+                    _sym = watchlist_mod._normalise(_aliases.get(
+                        watchlist_mod._normalise(u), u))
+                    _cands, _cg_err = _coingecko_matches(_sym)
+                    if not _cands:
+                        _truly_missing.append((u, _cg_err))
+                        continue
+                    _chosen = _cg_choice.get(_sym)
+                    if len(_cands) == 1:
+                        _chosen = _chosen or _cands[0]["id"]
+                    if _chosen:
+                        _pick = next((c for c in _cands if c["id"] == _chosen), _cands[0])
+                        _via_cg.append((u, _sym, _pick))
+                    else:
+                        # Several projects share this ticker — the trader picks.
+                        st.warning(f"**{u}** matches {len(_cands)} different projects with "
+                                   f"the ticker {_sym}. Choose which one you mean:")
+                        _opt = st.selectbox(
+                            f"Which {_sym}?",
+                            [f"{c['name']} ({c['id']})"
+                             + (f" · rank {c['rank']}" if c["rank"] else " · unranked")
+                             for c in _cands],
+                            key=f"cgpick_{_sym}")
+                        if st.button(f"Use this for {_sym}", key=f"cgset_{_sym}"):
+                            _cg_choice[_sym] = _cands[
+                                [f"{c['name']} ({c['id']})"
+                                 + (f" · rank {c['rank']}" if c["rank"] else " · unranked")
+                                 for c in _cands].index(_opt)]["id"]
+                            storage.save_value("wl_cg_ids", _cg_choice)
+                            st.rerun()
+
+                if _via_cg:
+                    st.info("Not on any exchange here, so CoinGecko's candles will be used: "
+                            + "; ".join(f"**{u}** → {p['name']}" for u, _s, p in _via_cg)
+                            + ". CoinGecko aggregates across exchanges and has no true daily "
+                              "OHLC, so these scans are coarser — and you still need a venue "
+                              "that actually lists the coin to trade it.")
+                if _truly_missing:
                     _hints = []
-                    for u in _wl_missing:
+                    for u, why in _truly_missing:
                         s_ = watchlist_mod.suggest(u, _wl_markets)
                         _hints.append(f"**{u}**" + (f" → did you mean {', '.join(s_)}?"
-                                                    if s_ else " (not on Hyperliquid)"))
-                    st.warning("Couldn't match: " + "; ".join(_hints)
+                                                    if s_ else f" ({why})"))
+                    st.warning("Couldn't find anywhere: " + "; ".join(_hints)
                                + ". Use the tools below to find the right name, or map it "
                                  "yourself — nothing is guessed for you, because scanning "
                                  "the wrong coin looks exactly like scanning the right one.")
@@ -826,7 +906,7 @@ with tab_scan:
                 "probability of profit."
             )
             if WATCHLIST_MODE:
-                universe_size = len(_wl_found)
+                universe_size = len(_wl_found) + len(_elsewhere) + len(_via_cg)
             elif HL_MODE:
                 universe_size = hl_count
             else:
@@ -843,7 +923,7 @@ with tab_scan:
             )
             u1, u2, u3 = st.columns(3)
             if WATCHLIST_MODE:
-                universe_size = len(_wl_found)
+                universe_size = len(_wl_found) + len(_elsewhere) + len(_via_cg)
             elif HL_MODE:
                 universe_size = hl_count
             else:
@@ -880,6 +960,11 @@ with tab_scan:
                 _by_name = {c["name"]: c for c in _all}
                 _sel = [_by_name[r.market] for r in _wl_found if r.market in _by_name]
                 instruments = [(c["label"], c["ticker"], (c["ticker"], None)) for c in _sel]
+                # Watchlist coins that live on another venue.
+                instruments += [(f"{sym} ({venue})", tk, (tk, None))
+                                for _u, sym, tk, venue in _elsewhere]
+                instruments += [(f"{sym} (CoinGecko)", f"{sym}-USD", (f"{sym}-USD", p["id"]))
+                                for _u, sym, p in _via_cg]
                 hl_marks = {c["ticker"]: c["mark"] for c in _sel}
                 st.session_state.hl_info = {
                     c["ticker"]: hyperliquid_data.MarketContext(
@@ -967,6 +1052,11 @@ with tab_scan:
                     if df is None:
                         df, _e = exchanges.fetch_kraken_ohlc(ticker, tf)
                     out[tf] = df if df is not None else pd.DataFrame()
+                if all(f.empty for f in out.values()) and _coin_id:
+                    # Not on any exchange here — CoinGecko is the last resort.
+                    cg_frames, _p = _cached_cg_frames(_coin_id)
+                    return {k: (cg_frames.get(k) if cg_frames.get(k) is not None
+                                else pd.DataFrame()) for k in ("4h", "1h", "5m")}
                 return out
 
             if USE_TR:

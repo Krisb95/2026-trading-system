@@ -69,8 +69,10 @@ class TestResolving(unittest.TestCase):
     def test_default_watchlist_mostly_resolves(self):
         found, missing = resolve(DEFAULT_WATCHLIST, MARKETS)
         self.assertGreaterEqual(len(found), 18)
-        for ambiguous in ("CC", "CARDS", "DRV", "LIGHTER"):
-            self.assertIn(ambiguous, missing)
+
+    def test_default_watchlist_resolves_fully_on_a_venue_listing_everything(self):
+        found, missing = resolve(DEFAULT_WATCHLIST, MARKETS + ["LIT", "DRV"])
+        self.assertEqual(missing, [])
 
     def test_empty_input(self):
         self.assertEqual(resolve("", MARKETS), ([], []))

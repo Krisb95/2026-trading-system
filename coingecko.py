@@ -357,3 +357,30 @@ def fetch_period_changes(days: str = "90d", limit: int = 100, timeout: int = 15)
         return (out, None) if out else ({}, "No usable change data.")
     except Exception as e:
         return {}, f"{type(e).__name__}: {e}"
+
+
+SEARCH_URL = "https://api.coingecko.com/api/v3/search"
+
+
+def search_coins(symbol: str, timeout: int = 10):
+    """Coins whose ticker exactly matches `symbol`, best-known first.
+
+    Tickers are reused constantly — several projects use DRV — so this returns
+    every exact match with its full name and market-cap rank rather than
+    picking one. The caller shows them and lets the trader choose.
+    """
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return [], "No symbol given."
+    try:
+        resp, err = _throttled_get(SEARCH_URL, {"query": sym}, timeout)
+        if resp is None:
+            return [], err
+        coins = (resp.json() or {}).get("coins") or []
+        exact = [{"id": c.get("id"), "symbol": str(c.get("symbol", "")).upper(),
+                  "name": c.get("name"), "rank": c.get("market_cap_rank")}
+                 for c in coins if str(c.get("symbol", "")).upper() == sym and c.get("id")]
+        exact.sort(key=lambda c: (c["rank"] is None, c["rank"] or 0))
+        return (exact, None) if exact else ([], f"No coin on CoinGecko has the ticker {sym}.")
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"

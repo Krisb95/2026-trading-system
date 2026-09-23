@@ -17,8 +17,8 @@ import difflib
 import re
 
 # The trader's list, as given.
-DEFAULT_WATCHLIST = ("RSR, BTC, ETH, SOL, ZEC, HYPE, LIGHTER, TAO, NEAR, CC, PUMP, CARDS, "
-                     "DRV, SUI, UNI, RNDR, COMP, STACKS, IMMUTABLE, LINK, XRP, AVAX, INJ, ONDO")
+DEFAULT_WATCHLIST = ("RSR, BTC, ETH, SOL, ZEC, HYPE, LIGHTER, TAO, NEAR, PUMP, DRV, "
+                     "SUI, UNI, RNDR, COMP, STACKS, IMMUTABLE, LINK, XRP, AVAX, INJ, ONDO")
 
 # Common names and old tickers mapped to the symbol venues use.
 ALIASES: Dict[str, str] = {
