@@ -1,0 +1,12 @@
+[theme]
+# Dark trading-desk palette: high contrast for numbers, a vivid accent for
+# actions, and enough colour to make status obvious at a glance.
+base = "dark"
+primaryColor = "#00E5A0"
+backgroundColor = "#0B1020"
+secondaryBackgroundColor = "#151B31"
+textColor = "#E8ECF8"
+font = "sans serif"
+
+[client]
+showErrorDetails = true

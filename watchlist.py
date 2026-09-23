@@ -29,6 +29,10 @@ ALIASES: Dict[str, str] = {
     "RNDR": "RENDER", "RENDERTOKEN": "RENDER",
     "RESERVERIGHTS": "RSR", "PUMPFUN": "PUMP", "DERIVE": "DRV", "NEARPROTOCOL": "NEAR",
     "POLKADOT": "DOT", "CARDANO": "ADA", "LITECOIN": "LTC", "DOGECOIN": "DOGE",
+    # Confirmed by the trader. Tickers get reused across projects, so these are
+    # their call, not a guess: LIT is the market they mean by "Lighter", and DRV
+    # by "Derive"/"Derivative".
+    "LIGHTER": "LIT", "DERIVE": "DRV", "DERIVATIVE": "DRV",
 }
 
 
@@ -125,3 +129,32 @@ def suggest(entry: str, markets: Sequence[str], limit: int = 3) -> List[str]:
         if by_norm[n] not in hits:
             hits.append(by_norm[n])
     return hits[:limit]
+
+
+def parse_aliases(text: str) -> Tuple[Dict[str, str], List[str]]:
+    """Parse user-defined mappings, one per line: 'lighter = LIT'.
+
+    Lets the trader resolve names the built-in aliases can't, without anyone
+    guessing on their behalf. Returns (aliases, bad_lines) so mistakes are
+    shown rather than silently ignored.
+    """
+    aliases: Dict[str, str] = {}
+    bad: List[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = re.split(r"[=:>]+", line, maxsplit=1)
+        if len(parts) != 2 or not _normalise(parts[0]) or not _normalise(parts[1]):
+            bad.append(line)
+            continue
+        aliases[_normalise(parts[0])] = _normalise(parts[1])
+    return aliases, bad
+
+
+def search_markets(query: str, markets: Sequence[str], limit: int = 40) -> List[str]:
+    """Markets whose name contains the query (empty query returns them all)."""
+    key = _normalise(query)
+    if not key:
+        return sorted(markets)[:limit]
+    return sorted([m for m in markets if key in _normalise(m)])[:limit]

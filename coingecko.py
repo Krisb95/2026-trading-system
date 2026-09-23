@@ -319,3 +319,41 @@ def build_frames_v2(coin_id: str) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
         frames["1h"] = series_to_ohlc(fine, "1h")
 
     return frames, problems
+
+
+MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
+
+
+def fetch_period_changes(days: str = "90d", limit: int = 100, timeout: int = 15):
+    """{symbol: percent change} over the period, in market-cap order.
+
+    Used for the altcoin season index, which compares how many large coins
+    outperformed Bitcoin. Stablecoins are excluded — they never move, so
+    including them would drag the index down artificially.
+    """
+    from universe import EXCLUDED_SYMBOLS
+    try:
+        resp, err = _throttled_get(MARKETS_URL, {
+            "vs_currency": "usd", "order": "market_cap_desc",
+            "per_page": min(limit, 250), "page": 1, "sparkline": "false",
+            "price_change_percentage": days,
+        }, timeout)
+        if resp is None:
+            return {}, err
+        rows = resp.json()
+        if not isinstance(rows, list) or not rows:
+            return {}, "CoinGecko returned no market data."
+        key = f"price_change_percentage_{days}_in_currency"
+        out = {}
+        for r in rows:
+            sym = str(r.get("symbol", "")).upper()
+            change = r.get(key)
+            if not sym or change is None or sym in EXCLUDED_SYMBOLS:
+                continue
+            try:
+                out[sym] = float(change)
+            except (TypeError, ValueError):
+                continue
+        return (out, None) if out else ({}, "No usable change data.")
+    except Exception as e:
+        return {}, f"{type(e).__name__}: {e}"

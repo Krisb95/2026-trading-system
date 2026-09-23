@@ -255,3 +255,56 @@ warns when a stop sits beyond liquidation — where the position would be closed
 out before the stop could protect it. Liquidation figures are estimates:
 exchanges raise maintenance margin for larger positions, so confirm on the
 venue.
+
+## Market tools
+
+A dark theme with colour used to carry meaning — grades, data status, verdicts
+and direction — always paired with text so nothing depends on colour alone.
+
+The **Market tools** tab adds whole-market context:
+
+- **Fear & Greed** with a gauge, source and daily direction
+- **Altcoin season index** — how many of the top 50 coins beat Bitcoin over 90
+  days (75+ altcoin season, 25 or below Bitcoin season)
+- **Funding & open interest** on Hyperliquid — who is paying whom, annualised,
+  with crowding flags and a turnover ratio
+- **RSI heatmap** across 1h, 4h and 1d for the highest-volume markets
+
+None of these is a trade signal and none has been shown to improve the
+strategy. They are context. The Fear & Greed band is recorded with every setup
+so the learner can test whether it actually matters.
+
+Not included: whale tracking and liquidation feeds. Both need paid data or
+per-wallet scraping — Hyperliquid exposes positions only for addresses you
+already know, and there is no free liquidation stream — so building them would
+mean showing something that looks like whale data but isn't.
+
+## Look and market tools
+
+The app uses a dark trading-desk theme (`.streamlit/config.toml`) with colour
+that carries meaning rather than decoration — grades, data status, verdicts and
+direction each have a fixed colour, always paired with a word or symbol so the
+meaning survives without colour.
+
+**Market tools** tab:
+
+- **Fear & Greed** with a gauge (CoinMarketCap if a key is set, otherwise the
+  free Alternative.me feed)
+- **Altcoin season index** — how many of the top 50 coins beat Bitcoin over 90
+  days; 75+ is conventionally "altcoin season", 25 or less "Bitcoin season"
+- **Funding & open interest** on Hyperliquid — who is paying whom, crowding
+  flags, open interest and turnover
+- **RSI heatmap** across 1H, 4H and 1D
+
+None of these is a trade signal and none has been shown to improve the
+strategy. The Fear & Greed band is recorded with each setup so the learner can
+test whether it matters.
+
+**Not implemented:** whale tracking and liquidation feeds. Both need paid data
+or per-wallet scraping — Hyperliquid exposes positions only for addresses you
+already know, and there is no free liquidation stream. Building something that
+looked like whale data without being it would be worse than leaving it out.
+
+Reward:risk can be displayed as `3.00` (reward:risk) or `1:3` (risk:reward) —
+the same trade written two ways. The scanner table shows essentials only by
+default, with a toggle for every column.

@@ -82,3 +82,71 @@ class TestSuggestions(unittest.TestCase):
 
     def test_no_suggestion_for_nonsense(self):
         self.assertEqual(suggest("", MARKETS), [])
+
+
+class TestCustomAliases(unittest.TestCase):
+    def test_parses_user_mappings(self):
+        from watchlist import parse_aliases
+        aliases, bad = parse_aliases("lighter = LIT\nderive: DRV\n")
+        self.assertEqual(aliases, {"LIGHTER": "LIT", "DERIVE": "DRV"})
+        self.assertEqual(bad, [])
+
+    def test_reports_bad_lines_rather_than_ignoring_them(self):
+        from watchlist import parse_aliases
+        aliases, bad = parse_aliases("lighter = LIT\nnonsense line\n")
+        self.assertEqual(list(aliases), ["LIGHTER"])
+        self.assertEqual(bad, ["nonsense line"])
+
+    def test_comments_and_blanks_skipped(self):
+        from watchlist import parse_aliases
+        aliases, bad = parse_aliases("# my notes\n\nlighter=LIT")
+        self.assertEqual(aliases, {"LIGHTER": "LIT"})
+        self.assertEqual(bad, [])
+
+    def test_custom_alias_resolves_a_name(self):
+        aliases, _ = __import__("watchlist").parse_aliases("lighter = LIT")
+        found, missing = resolve("LIGHTER", MARKETS + ["LIT"], aliases=aliases)
+        self.assertEqual(found[0].market, "LIT")
+        self.assertEqual(missing, [])
+
+    def test_custom_alias_to_a_market_that_does_not_exist_still_unmatched(self):
+        aliases, _ = __import__("watchlist").parse_aliases("cards = CARDS")
+        found, missing = resolve("CARDS", MARKETS, aliases=aliases)
+        self.assertEqual(found, [])
+        self.assertEqual(missing, ["CARDS"])
+
+
+class TestMarketSearch(unittest.TestCase):
+    def test_finds_by_fragment(self):
+        from watchlist import search_markets
+        self.assertIn("LINK", search_markets("lin", MARKETS))
+
+    def test_empty_query_lists_markets(self):
+        from watchlist import search_markets
+        self.assertEqual(len(search_markets("", MARKETS, limit=5)), 5)
+
+
+class TestTraderConfirmedAliases(unittest.TestCase):
+    """Mappings the trader confirmed. An alias only helps if the venue lists
+    that market — it cannot conjure one into existence."""
+
+    def test_lighter_resolves_to_lit_when_listed(self):
+        found, missing = resolve("LIGHTER", MARKETS + ["LIT"])
+        self.assertEqual(found[0].market, "LIT")
+        self.assertTrue(found[0].via_alias)
+
+    def test_derivative_and_derive_both_resolve_to_drv(self):
+        for name in ("Derivative", "Derive", "DRV"):
+            found, _ = resolve(name, MARKETS + ["DRV"])
+            self.assertEqual(found[0].market, "DRV", name)
+
+    def test_alias_does_not_help_if_the_market_is_not_listed(self):
+        found, missing = resolve("LIGHTER, Derivative", MARKETS)   # no LIT, no DRV
+        self.assertEqual(found, [])
+        self.assertEqual(missing, ["LIGHTER", "Derivative"])
+
+    def test_cards_matches_only_when_the_venue_lists_it(self):
+        self.assertEqual(resolve("CARDS", MARKETS)[1], ["CARDS"])
+        found, missing = resolve("CARDS", MARKETS + ["CARDS"])
+        self.assertEqual(found[0].market, "CARDS")
+        self.assertEqual(missing, [])

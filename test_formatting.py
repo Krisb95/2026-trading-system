@@ -98,3 +98,29 @@ class TestDecimalsFor(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRewardRiskFormatting(unittest.TestCase):
+    def test_reward_first_is_a_plain_number(self):
+        from formatting import format_rr, RR_REWARD_FIRST
+        self.assertEqual(format_rr(3.0, RR_REWARD_FIRST), "3.00")
+
+    def test_risk_first_puts_the_one_in_front(self):
+        from formatting import format_rr, RR_RISK_FIRST
+        self.assertEqual(format_rr(3.0, RR_RISK_FIRST), "1:3")
+
+    def test_fractional_values_keep_precision(self):
+        from formatting import format_rr, RR_RISK_FIRST, RR_REWARD_FIRST
+        self.assertEqual(format_rr(2.47, RR_REWARD_FIRST), "2.47")
+        self.assertEqual(format_rr(2.47, RR_RISK_FIRST), "1:2.47")
+
+    def test_both_styles_describe_the_same_trade(self):
+        from formatting import format_rr, RR_RISK_FIRST, RR_REWARD_FIRST
+        self.assertEqual(format_rr(3.0, RR_REWARD_FIRST), "3.00")
+        self.assertEqual(format_rr(3.0, RR_RISK_FIRST), "1:3")
+
+    def test_missing_and_invalid(self):
+        from formatting import format_rr
+        self.assertEqual(format_rr(None), "—")
+        self.assertEqual(format_rr(0), "—")
+        self.assertEqual(format_rr(float("nan")), "—")

@@ -55,7 +55,9 @@ import hyperliquid_data
 import trade_review
 import sentiment
 import watchlist as watchlist_mod
-from formatting import format_price
+import market_tools
+import theme
+from formatting import format_price, format_rr, RR_STYLES, RR_REWARD_FIRST
 
 MIN_RR = 3.0   # reward:risk floor — nothing below this is shown, tracked or traded
 
@@ -176,9 +178,10 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-21-b32 (clear message on partial uploads)"
+APP_BUILD = "2026-09-23-b35 (colour, market tools, R:R display, compact table)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
+st.markdown(theme.CSS, unsafe_allow_html=True)
 
 DB_READY = True
 DB_ERROR = None
@@ -291,6 +294,10 @@ if USE_TR:
 else:
     TR_PARAMS = None
 
+RR_STYLE = st.sidebar.radio("Show reward:risk as", RR_STYLES, key="rr_style",
+                            help="Two ways of writing the same thing: risking 1 to make 3 "
+                                 "is '3.00' as reward:risk, or '1:3' as risk:reward.")
+
 with st.sidebar.expander("Advanced settings"):
     st.caption("Data-freshness rules and display timezone. The defaults rarely need "
                "changing — crypto prices come live from the exchange regardless.")
@@ -328,6 +335,11 @@ def _cached_hl_contexts():
     return ([{"name": c.name, "ticker": c.ticker, "label": c.label,
               "volume": c.day_volume_usd, "mark": c.mark_price,
               "oi": c.open_interest_usd, "funding": c.funding_rate} for c in ctxs], err)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_period_changes():
+    return coingecko.fetch_period_changes("90d", limit=100)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -419,9 +431,10 @@ st.sidebar.warning(
     "Export your journal to CSV after any session that matters."
 )
 
-tab_market, tab_scan, tab_positions, tab_risk, tab_journal, tab_track, tab_backtest = st.tabs(
-    ["🌍 Market", "🎯 Scanner", "📋 Positions", "🧮 Risk", "📓 Journal",
-     "📈 Tracking", "🔁 Backtest"]
+(tab_market, tab_tools, tab_scan, tab_positions, tab_risk, tab_journal,
+ tab_track, tab_backtest) = st.tabs(
+    ["🌍 Market", "🌡️ Market tools", "🎯 Scanner", "📋 Positions", "🧮 Risk",
+     "📓 Journal", "📈 Tracking", "🔁 Backtest"]
 )
 
 # ---------------------------------------------------------------------
@@ -561,6 +574,141 @@ with tab_market:
         elif quote.status == DataStatus.DELAYED:
             st.warning("Price is DELAYED — fine for planning, risky for timing-sensitive entries.")
 
+with tab_tools:
+    st.subheader("Market tools")
+    st.caption(
+        "Conditions across the whole market. None of these is a trade signal, and none "
+        "has been shown to improve this strategy — they're context you read beside the "
+        "scanner. Where a reading has a conventional meaning it's given as convention, "
+        "not prediction."
+    )
+
+    # --- Fear & Greed ---------------------------------------------------
+    st.markdown("##### Fear & Greed")
+    if _fg:
+        _v = _fg["value"]
+        _col = (theme.RED if _v <= 24 else theme.AMBER if _v <= 44 else
+                theme.GREY if _v <= 55 else theme.BLUE if _v <= 74 else theme.GREEN)
+        g1, g2 = st.columns([1, 2])
+        g1.metric("Index", f"{_v}", _fg["classification"], delta_color="off")
+        with g2:
+            st.markdown(theme.gauge(_v, "0 · Extreme fear", "100 · Extreme greed", _col),
+                        unsafe_allow_html=True)
+            st.caption(f"Source: {_fg['source']}"
+                       + (f" · {_fg['direction']} from {_fg['previous']} yesterday"
+                          if _fg.get("previous") is not None else ""))
+        st.caption("Often read as a contrarian gauge — fear as opportunity, greed as "
+                   "caution — but that's folklore until tested. The band is recorded with "
+                   "every setup so the learner can check whether it matters for you.")
+    else:
+        st.info("Fear & Greed unavailable right now.")
+
+    # --- Altcoin season -------------------------------------------------
+    st.markdown("##### Altcoin season")
+    _changes, _ch_err = _cached_period_changes()
+    _alt = market_tools.altcoin_season_index(_changes) if _changes else None
+    if _alt:
+        a1, a2 = st.columns([1, 2])
+        a1.metric("Index", f"{_alt.index}", _alt.label, delta_color="off")
+        with a2:
+            _acol = (theme.PURPLE if _alt.index >= 75 else
+                     theme.AMBER if _alt.index >= 25 else theme.BLUE)
+            st.markdown(theme.gauge(_alt.index, "0 · Bitcoin season",
+                                    "100 · Altcoin season", _acol), unsafe_allow_html=True)
+            st.caption(f"{_alt.outperformers} of the top {_alt.sample} coins beat Bitcoin "
+                       f"over 90 days (Bitcoin itself: {_alt.btc_change_pct:+.1f}%).")
+        st.caption("A description of the last 90 days, not a forecast. It matters for this "
+                   "strategy mainly as context: in Bitcoin season, altcoin longs are "
+                   "swimming against the tide.")
+    else:
+        st.info(f"Altcoin season unavailable: {_ch_err or 'no data'}")
+
+    # --- Perp flow ------------------------------------------------------
+    st.markdown("##### Funding & open interest (Hyperliquid)")
+    _fl_ctxs, _fl_err = _cached_hl_contexts()
+    if _fl_ctxs:
+        _objs = [hyperliquid_data.MarketContext(c["name"], c["volume"], c["mark"],
+                                                 c["oi"], c["funding"], None, None)
+                 for c in _fl_ctxs if c["volume"] > 5e6]
+        _rows = market_tools.flow_rows(_objs)
+        _longs, _shorts = market_tools.most_crowded(_rows, limit=5)
+        f1, f2 = st.columns(2)
+        with f1:
+            st.markdown(theme.pill("Longs paying most", theme.RED), unsafe_allow_html=True)
+            for r_ in _longs:
+                st.caption(f"**{r_.name}** · {r_.funding_rate * 100:+.4f}%/h "
+                           f"({r_.funding_annual_pct:+.0f}%/yr) · OI "
+                           f"${r_.open_interest_usd / 1e6:,.0f}M")
+        with f2:
+            st.markdown(theme.pill("Shorts paying most", theme.GREEN), unsafe_allow_html=True)
+            for r_ in _shorts:
+                st.caption(f"**{r_.name}** · {r_.funding_rate * 100:+.4f}%/h "
+                           f"({r_.funding_annual_pct:+.0f}%/yr) · OI "
+                           f"${r_.open_interest_usd / 1e6:,.0f}M")
+        st.caption("Positive funding means longs pay shorts — more traders sit long, and a "
+                   "stretched reading often precedes a flush of those longs. It shows "
+                   "positioning, not direction: crowded longs can stay crowded while price "
+                   "keeps rising.")
+        with st.expander("All markets by open interest"):
+            _top_oi = sorted(_rows, key=lambda r_: r_.open_interest_usd, reverse=True)[:25]
+            st.dataframe(pd.DataFrame([{
+                "Market": r_.name,
+                "Funding /h": f"{r_.funding_rate * 100:+.4f}%",
+                "Funding /yr": f"{r_.funding_annual_pct:+.0f}%",
+                "Open interest": f"${r_.open_interest_usd / 1e6:,.0f}M",
+                "24h volume": f"${r_.volume_usd / 1e6:,.0f}M",
+                "Turnover": (f"{market_tools.turnover_ratio(r_):.1f}x"
+                             if market_tools.turnover_ratio(r_) else "—"),
+                "Crowding": r_.crowded or "—",
+            } for r_ in _top_oi]), use_container_width=True, hide_index=True)
+    else:
+        st.info(f"Hyperliquid data unavailable: {_fl_err or ''}")
+
+    # --- RSI heatmap ----------------------------------------------------
+    st.markdown("##### RSI heatmap")
+    rsi_count = st.selectbox("Coins", [10, 20, 30], index=0, key="rsi_count",
+                             help="Uses Hyperliquid candles; requests are paced, so more "
+                                  "coins take longer.")
+    if st.button("Load RSI heatmap", use_container_width=True):
+        _ctxs2, _ = _cached_hl_contexts()
+        _pick = sorted(_ctxs2, key=lambda c: c["volume"], reverse=True)[:rsi_count]
+        bar = st.progress(0.0, text="Loading…")
+        rows = []
+        for i_, c in enumerate(_pick):
+            bar.progress(i_ / max(len(_pick), 1), text=f"{i_ + 1}/{len(_pick)} · {c['name']}")
+            frames = {}
+            for tf, n in (("1h", 120), ("4h", 120), ("1d", 120)):
+                df, _e = hyperliquid_data.fetch_candles(c["ticker"], tf, n)
+                frames[tf] = df if df is not None else pd.DataFrame()
+            vals = market_tools.rsi_row(frames)
+            rows.append({"Market": c["name"],
+                         **{f"RSI {tf}": (round(v, 1) if v is not None else None)
+                            for tf, v in vals.items()},
+                         "1d state": market_tools.rsi_state(vals.get("1d"))})
+        bar.empty()
+        st.session_state.rsi_rows = rows
+
+    if st.session_state.get("rsi_rows"):
+        def _mark(v):
+            # Colour without a charting dependency: a dot carries the band and
+            # the number stays readable on any background.
+            if v is None:
+                return "—"
+            dot = "🔴" if v >= market_tools.OVERBOUGHT else (
+                "🟢" if v <= market_tools.OVERSOLD else "⚪")
+            return f"{dot} {v:.0f}"
+
+        _df = pd.DataFrame([{
+            "Market": r_["Market"],
+            **{k: _mark(r_[k]) for k in ("RSI 1h", "RSI 4h", "RSI 1d") if k in r_},
+            "1d state": r_["1d state"],
+        } for r_ in st.session_state.rsi_rows])
+        st.dataframe(_df, use_container_width=True, hide_index=True)
+        st.caption("🔴 overbought (70+) · ⚪ neutral · 🟢 oversold (30 or less)")
+        st.caption("Above 70 is conventionally 'overbought', below 30 'oversold'. In a strong "
+                   "trend RSI can sit overbought for weeks while price keeps climbing, so "
+                   "treat it as a description of momentum, not a reversal signal.")
+
 # ---------------------------------------------------------------------
 # TAB: Scanner
 # ---------------------------------------------------------------------
@@ -600,7 +748,11 @@ with tab_scan:
             _wl_ctxs, _wl_err = _cached_hl_contexts()
             if _wl_ctxs:
                 _wl_markets = [c["name"] for c in _wl_ctxs]
-            _wl_found, _wl_missing = watchlist_mod.resolve(wl_text, _wl_markets)
+            _alias_text, _ = storage.load_value("wl_aliases")
+            _alias_text = _alias_text or ""
+            _aliases, _bad_alias = watchlist_mod.parse_aliases(_alias_text)
+            _wl_found, _wl_missing = watchlist_mod.resolve(wl_text, _wl_markets,
+                                                            aliases=_aliases)
             if _wl_markets:
                 st.caption(f"Matched {len(_wl_found)} of "
                            f"{len(watchlist_mod.parse_list(wl_text))} entries on Hyperliquid: "
@@ -612,7 +764,44 @@ with tab_scan:
                         _hints.append(f"**{u}**" + (f" → did you mean {', '.join(s_)}?"
                                                     if s_ else " (not on Hyperliquid)"))
                     st.warning("Couldn't match: " + "; ".join(_hints)
-                               + ". Correct the spelling above, or leave them out.")
+                               + ". Use the tools below to find the right name, or map it "
+                                 "yourself — nothing is guessed for you, because scanning "
+                                 "the wrong coin looks exactly like scanning the right one.")
+
+                with st.expander(f"🔎 Browse all {len(_wl_markets)} Hyperliquid markets"):
+                    _q = st.text_input("Search", key="wl_search",
+                                       placeholder="e.g. light, card, drv")
+                    _hits = watchlist_mod.search_markets(_q, _wl_markets, limit=60)
+                    if _hits:
+                        st.write(" · ".join(f"`{m}`" for m in _hits))
+                        st.caption("Copy the exact name into your list above. If a coin isn't "
+                                   "here, Hyperliquid doesn't list it as a perpetual and it "
+                                   "can't be scanned or traded there.")
+                    else:
+                        st.caption("No market contains that text.")
+
+                with st.expander("🔗 My name mappings"):
+                    st.caption("One per line, e.g. `lighter = LIT`. Use this when you know "
+                               "which market a name refers to. Check the project on "
+                               "Hyperliquid first — tickers are reused across projects, and "
+                               "mapping to the wrong one would silently scan the wrong coin.")
+                    _new_alias = st.text_area("Mappings", value=_alias_text, height=90,
+                                              key="wl_alias_text")
+                    if st.button("Save mappings", key="wl_alias_save"):
+                        _parsed, _badlines = watchlist_mod.parse_aliases(_new_alias)
+                        _unknown = [f"{k} → {v}" for k, v in _parsed.items()
+                                    if v not in {watchlist_mod._normalise(m)
+                                                 for m in _wl_markets}]
+                        storage.save_value("wl_aliases", _new_alias)
+                        if _badlines:
+                            st.warning("Couldn't read: " + "; ".join(_badlines))
+                        if _unknown:
+                            st.warning("Saved, but these point at markets Hyperliquid doesn't "
+                                       "list: " + "; ".join(_unknown))
+                        st.rerun()
+                    if _bad_alias:
+                        st.warning("Existing lines that couldn't be read: "
+                                   + "; ".join(_bad_alias))
             else:
                 st.error(f"Couldn't load Hyperliquid's market list: {_wl_err}")
         elif HL_MODE:
@@ -916,13 +1105,24 @@ with tab_scan:
                     "Entry vs live": _gap(r),
                     "Stop": format_price(r.stop),
                     "Target": format_price(r.target),
-                    "R:R": f"{r.reward_risk:.2f}" if r.reward_risk else "—",
+                    "R:R": format_rr(r.reward_risk, RR_STYLE),
                     ("Status" if USE_TR else "Regime"):
                         (r.entry_status or "—") if USE_TR else r.regime.title(),
                 } for r in ok])
-                st.dataframe(table, use_container_width=True, hide_index=True,
+                _detail = st.toggle("Show every column", value=False, key="uni_detail",
+                                    help="Off keeps the essentials only — easier to read on "
+                                         "a phone.")
+                _essential = ["Instrument", "Dir", "Entry", "Stop", "Target", "R:R",
+                              "Status", "Grade"]
+                _view = table if _detail else table[[c for c in _essential
+                                                     if c in table.columns]]
+                st.dataframe(_view, use_container_width=True, hide_index=True,
                              column_config={"Trade plan": st.column_config.TextColumn(
                                  "Trade plan", width="large")})
+                if not _detail:
+                    st.caption("Showing the essentials. Turn on **Show every column** for "
+                               "live price, distance to entry, venue, volume, evidence and "
+                               "the one-line plan.")
 
                 _complete = [r for r in ok if None not in (r.entry, r.stop, r.target)]
                 if _complete:
@@ -955,6 +1155,12 @@ with tab_scan:
                     "far price must travel to fill it. Stop, target and R:R are all measured "
                     "from that entry. A price marked * is the last 4H close because the live "
                     "spot fetch failed.")
+
+                _counts = {g: sum(1 for r in ok if r.grade == g) for g in ("A+", "B", "C")}
+                st.markdown(
+                    " ".join(theme.pill(f"{g} · {n}", theme.GRADE_COLOURS[g])
+                             for g, n in _counts.items() if n),
+                    unsafe_allow_html=True)
 
                 tradeable = [r for r in ok if r.grade in ("A+", "B")]
                 if tradeable:
@@ -1025,7 +1231,7 @@ with tab_scan:
                 e1.metric("Entry (limit)", format_price(plan.entry))
                 e2.metric("Stop", format_price(plan.stop))
                 e3.metric("Target", format_price(plan.target))
-                e4.metric("R:R", f"{plan.reward_risk:.2f}" if plan.reward_risk else "—")
+                e4.metric("R:R", format_rr(plan.reward_risk, RR_STYLE))
                 if plan.current_price:
                     gap = (plan.entry - plan.current_price) / plan.current_price * 100
                     st.caption(f"Entry is {gap:+.2f}% from the live price — a limit order "
@@ -1692,7 +1898,7 @@ with tab_risk:
             if res.net_profit_at_target is not None:
                 f.metric("Profit at target", f"${res.net_profit_at_target:,.2f}")
             if res.net_reward_risk is not None:
-                g.metric("Net R:R", f"{res.net_reward_risk:.2f}")
+                g.metric("Net R:R", format_rr(res.net_reward_risk, RR_STYLE))
 
             st.caption(f"Stop is {res.stop_distance_pct * 100:.2f}% from entry "
                        f"({format_price(res.stop_distance_price)} per coin). Position "

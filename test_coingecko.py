@@ -293,3 +293,40 @@ class TestRateLimitHandling(unittest.TestCase):
         self.assertFalse(frames["4h"].empty)       # good data preserved
         self.assertTrue(frames["1d"].empty)        # failed frame is empty
         self.assertTrue(any("429" in p or "rate limit" in p.lower() for p in problems))
+
+
+class TestPeriodChanges(unittest.TestCase):
+    def setUp(self):
+        self.original = coingecko.requests.get
+
+    def tearDown(self):
+        coingecko.requests.get = self.original
+
+    def test_returns_symbol_to_change(self):
+        coingecko.requests.get = patch_get([
+            {"symbol": "btc", "price_change_percentage_90d_in_currency": 12.5},
+            {"symbol": "eth", "price_change_percentage_90d_in_currency": 30.0},
+        ])
+        changes, err = coingecko.fetch_period_changes()
+        self.assertIsNone(err)
+        self.assertEqual(changes, {"BTC": 12.5, "ETH": 30.0})
+
+    def test_stablecoins_excluded(self):
+        coingecko.requests.get = patch_get([
+            {"symbol": "btc", "price_change_percentage_90d_in_currency": 5.0},
+            {"symbol": "usdt", "price_change_percentage_90d_in_currency": 0.01},
+        ])
+        self.assertNotIn("USDT", coingecko.fetch_period_changes()[0])
+
+    def test_missing_change_skipped(self):
+        coingecko.requests.get = patch_get([
+            {"symbol": "btc", "price_change_percentage_90d_in_currency": 5.0},
+            {"symbol": "new", "price_change_percentage_90d_in_currency": None},
+        ])
+        self.assertEqual(list(coingecko.fetch_period_changes()[0]), ["BTC"])
+
+    def test_failure_reported(self):
+        coingecko.requests.get = patch_get(exc=ConnectionError("down"))
+        changes, err = coingecko.fetch_period_changes()
+        self.assertEqual(changes, {})
+        self.assertIn("ConnectionError", err)
