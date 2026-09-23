@@ -135,8 +135,47 @@ def _render_learned(model):
                            f"(n={c.train_n}), unseen {ta}. {c.verdict}")
 
 
+def _size_plan(direction, entry, stop, target, ticker=None):
+    """Position size for a plan, from the account settings in the sidebar.
+    Returns None when the plan is incomplete or the numbers don't work."""
+    if None in (direction, entry, stop) or not entry or not stop:
+        return None
+    try:
+        return calculate_risk(
+            account_equity=ACCOUNT_EQUITY, risk_pct=RISK_PCT, entry=float(entry),
+            stop=float(stop), direction=direction,
+            target=float(target) if target else None, leverage=LEVERAGE,
+            ticker=ticker, fee_rate=FEE_RATE, slippage_pct=SLIPPAGE)
+    except InvalidRiskInputError:
+        return None
+
+
+def _render_size(res, key=""):
+    """Show the size beside a trade plan, so no tab-hopping is needed."""
+    if res is None:
+        return
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Buy / sell", f"{res.quantity:,.6g}".rstrip("0").rstrip(".") + " units")
+    s2.metric("Position value", f"${res.position_notional:,.2f}")
+    s3.metric("Risk if stopped", f"-${res.net_loss_at_stop:,.2f}")
+    if res.net_profit_at_target is not None:
+        s4.metric("Gain at target", f"${res.net_profit_at_target:,.2f}")
+    bits = [f"Margin ${res.margin_required:,.2f}"]
+    if LEVERAGE > 1:
+        bits.append(f"{LEVERAGE:g}x leverage")
+    bits.append(f"after ${res.fees_and_slippage_cost:,.2f} costs")
+    st.caption(" · ".join(bits) + ". Sized from your sidebar settings: "
+               f"${ACCOUNT_EQUITY:,.0f} equity, {RISK_PCT:g}% risk.")
+    if res.exceeds_account_equity:
+        st.error("Required margin exceeds your account equity.")
+    for w in res.warnings:
+        st.warning(w)
+    if res.liquidation_warning and "could be liquidated" in res.liquidation_warning.lower():
+        st.error(res.liquidation_warning)
+
+
 def _take_trade_widget(key, ticker, direction, entry, stop, target, features=None,
-                       score=None, grade=None, reason=""):
+                       score=None, grade=None, reason="", suggested_qty=0.0):
     """'I took this trade' — records a recommended setup in the journal, with the
     setup snapshot the learner needs. Same control on every recommendation."""
     if None in (direction, entry, stop, target):
@@ -147,11 +186,13 @@ def _take_trade_widget(key, ticker, direction, entry, stop, target, features=Non
     fill = c1.number_input("Your actual entry price", value=float(entry), format="%.8f",
                            key=f"tk_fill_{key}",
                            help="What you were really filled at. Leave as-is if it matched.")
-    qty = c2.number_input("Quantity (coins, optional)", min_value=0.0, value=0.0,
+    qty = c2.number_input("Quantity", min_value=0.0, value=float(suggested_qty or 0.0),
                           format="%.8f", key=f"tk_qty_{key}",
-                          help="Lets the journal show dollar P&L. R is worked out either way.")
+                          help="Pre-filled from your sidebar risk settings. Change it if you "
+                               "sized differently.")
     c3, c4 = st.columns(2)
-    lev = c3.number_input("Leverage", min_value=1.0, value=1.0, step=0.5, key=f"tk_lev_{key}")
+    lev = c3.number_input("Leverage", min_value=1.0, value=float(LEVERAGE), step=0.5,
+                          key=f"tk_lev_{key}")
     followed = c4.checkbox("I followed the rules", value=True, key=f"tk_rules_{key}",
                            help="Untick if you entered early, skipped a rule or changed the "
                                 "stop. Only rule-following trades teach the strategy.")
@@ -209,7 +250,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-23-b38 (startup file check; notice removed)"
+APP_BUILD = "2026-09-23-b39 (position size shown on every trade plan)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -325,6 +366,23 @@ if USE_TR:
 else:
     TR_PARAMS = None
 
+st.sidebar.subheader("Your account")
+ACCOUNT_EQUITY = st.sidebar.number_input("Account equity ($)", min_value=0.0, value=10000.0,
+                                          step=100.0, key="acct_equity")
+RISK_PCT = st.sidebar.number_input("Risk per trade (%)", min_value=0.1, max_value=100.0,
+                                    value=1.0, step=0.1, key="acct_risk",
+                                    help="The most you'll lose if the stop is hit. Used "
+                                         "everywhere — plans, positions and the calculator.")
+LEVERAGE = st.sidebar.number_input("Leverage", min_value=1.0, max_value=50.0, value=1.0,
+                                    step=0.5, key="acct_lev")
+with st.sidebar.expander("Costs"):
+    FEE_RATE = st.number_input("Fee rate (round trip)", min_value=0.0, value=0.0006,
+                               step=0.0001, format="%.4f", key="acct_fee")
+    SLIPPAGE = st.number_input("Slippage", min_value=0.0, value=0.0005, step=0.0001,
+                               format="%.4f", key="acct_slip")
+st.sidebar.caption(f"Risking **${ACCOUNT_EQUITY * RISK_PCT / 100:,.2f}** per trade.")
+
+st.sidebar.markdown("---")
 RR_STYLE = st.sidebar.radio("Show reward:risk as", RR_STYLES, key="rr_style",
                             help="Two ways of writing the same thing: risking 1 to make 3 "
                                  "is '3.00' as reward:risk, or '1:3' as risk:reward.")
@@ -1258,11 +1316,15 @@ with tab_scan:
                                         reentry_steps=(trend_retrace.reentry_plan_text(
                                             r.direction) if USE_TR else None)):
                                     st.markdown(line)
+                                _sz = _size_plan(r.direction, r.entry, r.stop, r.target,
+                                                  r.ticker)
+                                _render_size(_sz)
                                 _take_trade_widget(
                                     f"u_{r.ticker}_{r.direction}", r.ticker, r.direction,
                                     r.entry, r.stop, r.target, features=r.features,
                                     score=r.score, grade=r.grade,
-                                    reason=f"Scanner: {r.entry_status or ''}")
+                                    reason=f"Scanner: {r.entry_status or ''}",
+                                    suggested_qty=_sz.quantity if _sz else 0.0)
                 st.caption(
                     "**Entry** is the planned price to place your order at — a limit order "
                     "at a confluence zone, not the market price. **Entry vs live** shows how "
@@ -1363,11 +1425,15 @@ with tab_scan:
                             reasons=[r_.reason for r_ in plan.rules.values()],
                             stop_method=_sm, target_method=_tm):
                         st.markdown(line)
+                    _sz = _size_plan(plan.direction, plan.entry, plan.stop, plan.target,
+                                      plan.ticker)
+                    _render_size(_sz)
                     _take_trade_widget(
                         f"s_{plan.ticker}_{plan.direction}", plan.ticker, plan.direction,
                         plan.entry, plan.stop, plan.target, features=plan.features,
                         score=plan.score, grade=plan.grade,
-                        reason=f"Single-coin check: {plan.stage}")
+                        reason=f"Single-coin check: {plan.stage}",
+                        suggested_qty=_sz.quantity if _sz else 0.0)
 
             if plan.stage == trend_retrace.AT_ENTRY:
                 st.success("All three rules are met and price is at the entry level.")
@@ -1660,12 +1726,9 @@ with tab_positions:
         "closing into the journal. Stored in the database, so it survives refreshes."
     )
 
-    pos_equity = st.number_input(
-        "Account equity ($) — used for risk percentages",
-        min_value=0.0, value=10000.0, step=100.0, key="pos_equity")
-    pos_max_risk = st.number_input(
-        "Max risk per trade (% of equity)", min_value=0.1, max_value=100.0,
-        value=1.0, step=0.1, key="pos_max_risk")
+    pos_equity, pos_max_risk = ACCOUNT_EQUITY, RISK_PCT
+    st.caption(f"Using your sidebar settings: **${pos_equity:,.0f}** equity, "
+               f"**{pos_max_risk:g}%** risk per trade.")
 
     with st.expander("➕ Add a position"):
         with st.form("add_pos"):
@@ -1941,10 +2004,13 @@ with tab_risk:
     if pre:
         st.success(f"Using levels sent from the scanner for {pre.get('ticker','')}.")
 
+    st.caption("Defaults come from your sidebar settings — change them here just to try "
+               "'what if' variations.")
     k1, k2, k3 = st.columns(3)
-    equity = k1.number_input("Account equity ($)", min_value=0.0, value=10000.0, step=100.0)
+    equity = k1.number_input("Account equity ($)", min_value=0.0,
+                             value=float(ACCOUNT_EQUITY), step=100.0)
     risk_pct = k2.number_input("Risk % per trade", min_value=0.1, max_value=100.0,
-                                value=1.0, step=0.1)
+                                value=float(RISK_PCT), step=0.1)
     direction = k3.selectbox("Direction", ["Long", "Short"],
                               index=0 if pre.get("direction", "Long") == "Long" else 1)
 
@@ -1971,9 +2037,11 @@ with tab_risk:
                              step=0.01, format="%.8f")
 
     k7, k8, k9 = st.columns(3)
-    leverage = k7.number_input("Leverage", min_value=1.0, value=1.0, step=0.5)
-    fee = k8.number_input("Fee rate", min_value=0.0, value=0.0006, step=0.0001, format="%.4f")
-    slip = k9.number_input("Slippage", min_value=0.0, value=0.0005, step=0.0001, format="%.4f")
+    leverage = k7.number_input("Leverage", min_value=1.0, value=float(LEVERAGE), step=0.5)
+    fee = k8.number_input("Fee rate", min_value=0.0, value=float(FEE_RATE), step=0.0001,
+                          format="%.4f")
+    slip = k9.number_input("Slippage", min_value=0.0, value=float(SLIPPAGE), step=0.0001,
+                           format="%.4f")
 
     mmr = st.number_input("Maintenance margin (%)", min_value=0.0, max_value=10.0, value=0.5,
                           step=0.1, key="risk_mmr",
