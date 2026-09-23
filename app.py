@@ -13,29 +13,40 @@ import pandas as pd
 from datetime import datetime, timezone
 import zoneinfo
 
-from data_layer import fetch_quote, DataStatus, to_local_display, curl_cffi_is_available
-from scoring import (score_setup, weakest_components, trade_policy_for_grade,
-                      POSITIVE_COMPONENTS, NEGATIVE_COMPONENTS)
-from readiness import (determine_readiness, ReadinessInputs, Readiness, display_label,
-                        ENTRY_SEQUENCE_STAGES, missing_entry_sequence_stages,
-                        READINESS_DESCRIPTIONS)
-from risk_calc import (calculate_risk, InvalidRiskInputError,
-                        stop_from_pct as calc_stop_from_pct,
-                        liquidation_price, stop_is_beyond_liquidation)
-from backtest import (run_backtest, compute_metrics, split_in_out_sample,
-                       example_sma_crossover_signals)
-from portfolio import OpenPosition, summarize_portfolio_risk
-from stops import StopManager, suggest_management_label
-from position_math import PositionSnapshot, analyse_scale_in, ScaleVerdict
-from scanner import fetch_multi_timeframe, analyze_candidate, scan_universe
-from strategy_backtest import run_strategy_backtest, stats_by_grade, verdict
-from universe import fetch_top_cryptos
-import coingecko
-import exchanges
-import venues as venues_mod
-import storage
-import tracking
-import trend_retrace
+try:
+    from data_layer import fetch_quote, DataStatus, to_local_display, curl_cffi_is_available
+    from scoring import (score_setup, weakest_components, trade_policy_for_grade,
+                          POSITIVE_COMPONENTS, NEGATIVE_COMPONENTS)
+    from readiness import (determine_readiness, ReadinessInputs, Readiness, display_label,
+                            ENTRY_SEQUENCE_STAGES, missing_entry_sequence_stages,
+                            READINESS_DESCRIPTIONS)
+    from risk_calc import (calculate_risk, InvalidRiskInputError,
+                            stop_from_pct as calc_stop_from_pct,
+                            liquidation_price, stop_is_beyond_liquidation)
+    from backtest import (run_backtest, compute_metrics, split_in_out_sample,
+                           example_sma_crossover_signals)
+    from portfolio import OpenPosition, summarize_portfolio_risk
+    from stops import StopManager, suggest_management_label
+    from position_math import PositionSnapshot, analyse_scale_in, ScaleVerdict
+    from scanner import fetch_multi_timeframe, analyze_candidate, scan_universe
+    from strategy_backtest import run_strategy_backtest, stats_by_grade, verdict
+    from universe import fetch_top_cryptos
+    import coingecko
+    import exchanges
+    import venues as venues_mod
+    import storage
+    import tracking
+    import trend_retrace
+except ImportError as _e:
+    # Almost always a part-finished upload: a new app.py alongside older module
+    # files. Say so plainly instead of showing a bare ImportError.
+    st.error(
+        f"**Some files are out of date or missing.**\n\n`{_e}`\n\n"
+        f"This happens when only some files were uploaded. Upload **every `.py` file** "
+        f"from the latest download together — they're released as a set and expect each "
+        f"other's newest versions."
+    )
+    st.stop()
 import expectancy
 import explain
 import learning
@@ -165,7 +176,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-21-b31 (fear+greed, watchlist, position calculator)"
+APP_BUILD = "2026-09-21-b32 (clear message on partial uploads)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 
