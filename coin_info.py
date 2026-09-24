@@ -140,6 +140,21 @@ COINS: Dict[str, Tuple[str, str]] = {
                                "cloud servers."),
     "KAS": ("Layer 1", "A proof-of-work chain using a block structure that allows fast "
                         "confirmation."),
+    "PYTH": ("Infrastructure", "A price oracle fed directly by exchanges and trading firms, "
+                                "used by most Solana apps and many other chains."),
+    "HNT": ("Infrastructure", "Pays people to run wireless hotspots, building a real "
+                               "physical network from consumer hardware."),
+    "AKT": ("Infrastructure", "A marketplace for renting server capacity, an open "
+                               "alternative to cloud providers."),
+    "ENS": ("Infrastructure", "Readable names for wallet addresses, so you can send to "
+                               "'name.eth' instead of a long string."),
+    "ETHFI": ("DeFi", "Staking that keeps your ETH liquid, and one of the largest pools of "
+                       "restaked collateral."),
+    "EIGEN": ("Infrastructure", "Lets staked ETH secure other services besides Ethereum "
+                                 "itself."),
+    "SYRUP": ("RWA", "Institutional lending with a real loan book, on-chain."),
+    "RAY": ("DeFi", "A long-running Solana exchange and liquidity venue."),
+    "JTO": ("DeFi", "Solana staking that also captures block-ordering revenue."),
 }
 
 

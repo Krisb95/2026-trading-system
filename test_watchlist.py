@@ -72,7 +72,8 @@ class TestResolving(unittest.TestCase):
 
     def test_default_watchlist_resolves_fully_on_a_venue_listing_everything(self):
         found, missing = resolve(DEFAULT_WATCHLIST,
-                                 MARKETS + ["LIT", "FET", "PONS", "CASHCAT"])
+                                 MARKETS + ["LIT", "FET", "PONS", "WLD", "GRT", "AAVE",
+                                            "LDO", "PYTH", "TIA", "ARB", "ATOM"])
         self.assertEqual(missing, [])
 
     def test_empty_input(self):
@@ -149,8 +150,11 @@ class TestTraderConfirmedAliases(unittest.TestCase):
         self.assertNotIn("WBT", DEFAULT_WATCHLIST)
 
     def test_new_coins_are_in_the_default_list(self):
-        for name in ("PONS", "FETCH.AI", "CASHCAT"):
+        for name in ("PONS", "FETCH.AI", "WLD", "PYTH", "GRT"):
             self.assertIn(name, DEFAULT_WATCHLIST)
+
+    def test_cashcat_removed(self):
+        self.assertNotIn("CASHCAT", DEFAULT_WATCHLIST)
 
     def test_alias_does_not_help_if_the_market_is_not_listed(self):
         found, missing = resolve("LIGHTER, Derivative", MARKETS)   # no LIT, no DRV

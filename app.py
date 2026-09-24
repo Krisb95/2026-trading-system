@@ -391,7 +391,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-24-b47 (scan stocks, commodities and FX)"
+APP_BUILD = "2026-09-24-b49 (commodities: Bybit perps only)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -457,11 +457,20 @@ def _load_venue_listings():
     listings = venues_mod.fetch_listings()
     return listings.bybit, listings.hyperliquid, listings.problems
 
+# Only commodities that exist as Bybit perpetuals, so every setup is tradable.
+# The values are the Yahoo symbols used for CANDLES: Bybit's own API is blocked
+# from US-hosted servers, and spot gold/silver track the XAU/XAG perps closely.
 COMMODITY_TICKERS = {
-    "Gold (Futures)": "GC=F", "Silver (Futures)": "SI=F", "Platinum (Futures)": "PL=F",
-    "Copper (Futures)": "HG=F", "WTI Crude Oil (Futures)": "CL=F",
-    "Brent Crude Oil (Futures)": "BZ=F", "Natural Gas (Futures)": "NG=F",
-    "Gold ETF (GLD)": "GLD", "Silver ETF (SLV)": "SLV", "Energy Sector ETF (XLE)": "XLE",
+    "Gold — XAUUSDT": "XAUUSD=X",
+    "Silver — XAGUSDT": "XAGUSD=X",
+    "Crude Oil — CLUSDT": "CL=F",
+}
+
+# What you'd actually place the order on, for each of the above.
+COMMODITY_PERPS = {
+    "XAUUSD=X": "XAUUSDT (Bybit, up to 75x)",
+    "XAGUSD=X": "XAGUSDT (Bybit, up to 75x)",
+    "CL=F": "CLUSDT (Bybit, up to 50x)",
 }
 
 STOCK_TICKERS = {
@@ -1158,9 +1167,16 @@ with tab_scan:
                     "FX prices are indicative rather than a broker's dealable quotes.")
             else:
                 st.caption(
-                    "Futures trade nearly around the clock on weekdays, so they fit the "
-                    "strategy reasonably well. ETFs in this list (GLD, SLV, XLE) follow "
-                    "stock-market hours and carry the same gap risk.")
+                    "Only commodities Bybit lists as perpetuals — gold, silver and crude — "
+                    "so every setup is one you can actually place. They trade 24/7 with "
+                    "funding every four hours, which suits the strategy better than stocks.")
+                st.caption(
+                    "Candles come from Yahoo (spot gold and silver, and the crude futures "
+                    "contract) because Bybit's API is blocked from this server. Those track "
+                    "the perps closely but aren't identical — check the price on Bybit "
+                    "before placing an order. Crude futures also pause briefly each day and "
+                    "close at weekends, so crude may read STALE while CLUSDT is still "
+                    "trading.")
             st.caption("None of this has been backtested — the backtest only covers crypto.")
 
         coin_source = st.radio(
@@ -1709,6 +1725,8 @@ with tab_scan:
                                 _sz = _size_plan(r.direction, r.entry, r.stop, r.target,
                                                   r.ticker)
                                 _render_size(_sz)
+                                if r.ticker in COMMODITY_PERPS:
+                                    st.caption(f"Place this on **{COMMODITY_PERPS[r.ticker]}**.")
                                 _lv = st.session_state.get("uni_levels", {}).get(r.ticker)
                                 if _lv:
                                     _render_grid(f"u_{r.ticker}", r.direction, r.price,
