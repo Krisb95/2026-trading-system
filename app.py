@@ -398,7 +398,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-24-b51 (fix commodities scan crash)"
+APP_BUILD = "2026-09-24-b52 (parallel scanning within the rate budget)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -1424,9 +1424,10 @@ with tab_scan:
             st.caption(f"Roughly {universe_size * 3:.0f}s for {universe_size} instruments — "
                        f"Yahoo is slower than an exchange API.")
         elif HL_MODE:
-            st.caption(f"Roughly {universe_size * 1.6 + 2:.0f}s for {universe_size} coins. "
-                       f"One request each: 4H and 1H candles are built from the 5m data "
-                       f"rather than fetched separately.")
+            st.caption(f"Usually under {max(8, universe_size * 0.4):.0f}s for "
+                       f"{universe_size} coins — one request each, sent in parallel within "
+                       f"Hyperliquid's per-minute budget, with 4H and 1H built from the 5m "
+                       f"candles.")
             if WATCHLIST_MODE and not _wl_found:
                 st.info("Nothing to scan yet — fix the unmatched entries above.")
         else:
@@ -1589,8 +1590,26 @@ with tab_scan:
                     _extra = {"sentiment": sentiment.bucket(_fg["value"])} if _fg else None
                     _level_cache = {}
 
+                    # Fetch every Hyperliquid coin's candles at once. The venue
+                    # limits total weight per minute, not the gap between
+                    # calls, so 20 coins fit comfortably inside one window and
+                    # finish in seconds instead of one request at a time.
+                    _bulk = {}
+                    _hl_names = [t for _l, t, _k in instruments
+                                 if hyperliquid_data.is_hl_ticker(t)]
+                    if _hl_names:
+                        bar.progress(0.0, text=f"Fetching {len(_hl_names)} coins…")
+                        _bulk = hyperliquid_data.fetch_candles_many(
+                            _hl_names, "5m", 1000,
+                            progress=lambda i, n, nm: bar.progress(
+                                min(i / max(n, 1), 1.0), text=f"{i}/{n} · {nm}"))
+
                     def _tr_loader_capture(payload):
-                        frames = _tr_loader(payload)
+                        _tk = payload[0]
+                        if _tk in _bulk and _bulk[_tk] is not None and len(_bulk[_tk]) >= 720:
+                            frames = trend_retrace.frames_from_5m(_bulk[_tk])
+                        else:
+                            frames = _tr_loader(payload)
                         # Keep the 5m structure so a ladder can be offered later
                         # without re-fetching everything.
                         _level_cache[payload[0]] = {
