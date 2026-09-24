@@ -646,3 +646,46 @@ class TestQualityFilters(unittest.TestCase):
         strict = run_backtest(m5, h1, h4, "X", params=StrategyParams(
             min_h1_body_ratio=0.4, min_trend_move_atr=0.8, max_extension_atr=3.0))
         self.assertLess(len(strict), len(loose))
+
+
+class TestFramesFrom5m(unittest.TestCase):
+    """Aggregating 5m candles must give exactly the same 1H and 4H candles as
+    fetching them separately — otherwise the speed-up would change results."""
+
+    def _market(self):
+        return market(seed=11, days=10)
+
+    def test_four_hour_candles_match_a_direct_fetch(self):
+        from trend_retrace import frames_from_5m
+        m5, h1, h4 = self._market()
+        built = frames_from_5m(m5)["4h"]
+        common = built.index.intersection(h4.index)
+        self.assertGreater(len(common), 20)
+        for col in ("Open", "High", "Low", "Close"):
+            pd.testing.assert_series_equal(built.loc[common, col], h4.loc[common, col],
+                                           check_names=False)
+
+    def test_one_hour_candles_match_a_direct_fetch(self):
+        from trend_retrace import frames_from_5m
+        m5, h1, h4 = self._market()
+        built = frames_from_5m(m5)["1h"]
+        common = built.index.intersection(h1.index)
+        self.assertGreater(len(common), 100)
+        pd.testing.assert_series_equal(built.loc[common, "Close"], h1.loc[common, "Close"],
+                                       check_names=False)
+
+    def test_analysis_is_unchanged_by_the_speed_up(self):
+        from trend_retrace import frames_from_5m
+        m5, h1, h4 = self._market()
+        f = frames_from_5m(m5)
+        direct = analyze("X", h4, h1, m5, live_price=float(m5["Close"].iloc[-1]))
+        derived = analyze("X", f["4h"], f["1h"], f["5m"],
+                          live_price=float(m5["Close"].iloc[-1]))
+        self.assertEqual(direct.direction, derived.direction)
+        self.assertEqual(direct.stage, derived.stage)
+        self.assertEqual(direct.score, derived.score)
+
+    def test_empty_input(self):
+        from trend_retrace import frames_from_5m
+        out = frames_from_5m(pd.DataFrame())
+        self.assertTrue(all(v.empty for v in out.values()))

@@ -8,6 +8,7 @@ win-probability estimates, edge claims, or profitability guarantees.
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timezone
@@ -59,6 +60,9 @@ import market_tools
 import theme
 import coin_info
 import grid as grid_mod
+import charting
+import patterns
+import uihelpers
 from formatting import format_price, format_rr
 
 _REQUIRED = {
@@ -72,13 +76,16 @@ _REQUIRED = {
     trade_log: ['OUTCOMES', 'complete_trade', 'default_exit_price', 'learning_trades', 'open_scanner_trades', 'pl_status_for', 'realized_r', 'take_trade'],
     trade_review: ['CLOSE', 'CLOSE_THESIS', 'HOLD', 'STILL_VALID', 'TIGHTEN', 'review', 'setup_still_viable'],
     learning: ['LearnedModel', 'MIN_TRADES', 'learn'],
-    expectancy: ['EvidenceBook', 'PROVEN_NEGATIVE', 'PROVEN_POSITIVE', 'TOO_FEW', 'UNPROVEN', 'break_even_win_rate', 'simulate_expectations'],
+    expectancy: ['EvidenceBook', 'PROVEN_NEGATIVE', 'PROVEN_POSITIVE', 'TOO_FEW', 'UNPROVEN', 'break_even_win_rate', 'required_rr', 'simulate_expectations'],
     explain: ['AT_ENTRY', 'NO_TREND', 'WAIT_RETRACE', 'full_plan', 'short_plan'],
-    trend_retrace: ['AT_ENTRY', 'KIND_INITIAL', 'STOP_BELOW_4H_CANDLE', 'STOP_BELOW_SUPPORT', 'StrategyParams', 'WAIT_RETRACE', 'analyze', 'atr', 'backtest_stats', 'drop_forming', 'five_minute_levels', 'reentry_plan_text', 'run_backtest', 'scan_universe_tr'],
+    trend_retrace: ['AT_ENTRY', 'KIND_INITIAL', 'STOP_BELOW_4H_CANDLE', 'STOP_BELOW_SUPPORT', 'StrategyParams', 'WAIT_RETRACE', 'analyze', 'atr', 'backtest_stats', 'drop_forming', 'five_minute_levels', 'frames_from_5m', 'reentry_plan_text', 'run_backtest', 'scan_universe_tr'],
     tracking: ['record_from_ranked', 'tracked_stats', 'tracked_trades', 'update_all'],
     exchanges: ['build_frames', 'fetch_binance_history', 'fetch_binance_klines', 'fetch_bybit_klines', 'fetch_bybit_tickers', 'fetch_kraken_ohlc', 'fetch_spot'],
     coin_info: ['CATEGORIES', 'COINS', 'coverage', 'describe'],
     grid_mod: ['MIN_LEVELS', 'WEIGHTINGS', 'build_grid', 'usable_levels'],
+    charting: ['INTERVALS', 'to_tradingview_symbol', 'widget_html'],
+    patterns: ['bias_of', 'contradicts', 'detect', 'summarise'],
+    uihelpers: ['scan_count'],
 }
 
 _stale = sorted({f"{m.__name__.split('.')[-1]}.py" for m, attrs in _REQUIRED.items()
@@ -391,7 +398,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-24-b49 (commodities: Bybit perps only)"
+APP_BUILD = "2026-09-24-b51 (fix commodities scan crash)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -743,10 +750,10 @@ st.sidebar.warning(
     "import them back afterwards."
 )
 
-(tab_market, tab_tools, tab_learn, tab_scan, tab_positions, tab_risk, tab_journal,
- tab_track, tab_backtest) = st.tabs(
-    ["🌍 Market", "🌡️ Market tools", "📚 What coins do", "🎯 Scanner", "📋 Positions",
-     "🧮 Risk", "📓 Journal", "📈 Tracking", "🔁 Backtest"]
+(tab_market, tab_chart, tab_tools, tab_learn, tab_scan, tab_positions, tab_risk,
+ tab_journal, tab_track, tab_backtest) = st.tabs(
+    ["🌍 Market", "📉 Charts", "🌡️ Market tools", "📚 What coins do", "🎯 Scanner",
+     "📋 Positions", "🧮 Risk", "📓 Journal", "📈 Tracking", "🔁 Backtest"]
 )
 
 # ---------------------------------------------------------------------
@@ -911,6 +918,40 @@ with tab_market:
             st.error("🚫 DATA ERROR — NO TRADE. This data is not reliable enough to act on.")
         elif quote.status == DataStatus.DELAYED:
             st.warning("Price is DELAYED — fine for planning, risky for timing-sensitive entries.")
+
+with tab_chart:
+    st.subheader("Charts")
+
+    c1, c2, c3 = st.columns([2, 1, 1])
+    _all_lists = {"Crypto": CRYPTO_TICKERS_ALL, "Stocks": STOCK_TICKERS,
+                  "Commodities": COMMODITY_TICKERS, "FX": FX_TICKERS}
+    _ch_market = c1.selectbox("Market", list(_all_lists), key="ch_market")
+    _ch_names = list(_all_lists[_ch_market])
+    _ch_pick = c2.selectbox("Instrument", _ch_names, key="ch_pick")
+    _ch_interval = c3.selectbox("Timeframe", list(charting.INTERVALS), index=3,
+                                key="ch_interval")
+
+    _default_symbol = charting.to_tradingview_symbol(
+        _all_lists[_ch_market][_ch_pick], _ch_market,
+        exchange=("BYBIT" if CRYPTO_SOURCE == "bybit" else "BYBIT"))
+    _symbol = st.text_input("TradingView symbol", value=_default_symbol, key="ch_symbol",
+                            help="Edit this for anything not in the lists, or use the "
+                                 "search inside the chart itself.")
+    components.html(charting.widget_html(_symbol, _ch_interval, height=640), height=660)
+
+    st.caption(
+        "Full TradingView drawing tools are in the toolbar on the left of the chart — "
+        "trend lines, Fibonacci retracements, boxes and text. **Drawings are not saved**: "
+        "the embedded chart has no account attached, so they disappear when the page "
+        "reloads or you switch tabs. For anything you want to keep, draw it on "
+        "tradingview.com itself."
+    )
+    st.caption(
+        "This chart is TradingView's own data feed, not the candles the scanner used. "
+        "Prices should agree closely, but a level read off here can differ slightly from "
+        "one the scanner calculated — the scanner's numbers are the ones its plans are "
+        "based on."
+    )
 
 with tab_tools:
     st.subheader("Market tools")
@@ -1334,9 +1375,13 @@ with tab_scan:
                 "probability of profit."
             )
             if NON_CRYPTO:
-                universe_size = st.slider(f"How many {market.lower()} to scan", 3,
-                                           len(_list), min(10, len(_list)),
-                                           key="uni_noncrypto_n")
+                _lo, _hi, _default_n = uihelpers.scan_count(len(_list))
+                if _lo is None:
+                    universe_size = _default_n
+                    st.caption(f"Scanning all {universe_size} — there are only a few.")
+                else:
+                    universe_size = st.slider(f"How many {market.lower()} to scan",
+                                               _lo, _hi, _default_n, key="uni_noncrypto_n")
             elif WATCHLIST_MODE:
                 universe_size = len(_wl_found) + len(_elsewhere) + len(_via_cg)
             elif HL_MODE:
@@ -1355,9 +1400,13 @@ with tab_scan:
             )
             u1, u2, u3 = st.columns(3)
             if NON_CRYPTO:
-                universe_size = st.slider(f"How many {market.lower()} to scan", 3,
-                                           len(_list), min(10, len(_list)),
-                                           key="uni_noncrypto_n")
+                _lo, _hi, _default_n = uihelpers.scan_count(len(_list))
+                if _lo is None:
+                    universe_size = _default_n
+                    st.caption(f"Scanning all {universe_size} — there are only a few.")
+                else:
+                    universe_size = st.slider(f"How many {market.lower()} to scan",
+                                               _lo, _hi, _default_n, key="uni_noncrypto_n")
             elif WATCHLIST_MODE:
                 universe_size = len(_wl_found) + len(_elsewhere) + len(_via_cg)
             elif HL_MODE:
@@ -1375,8 +1424,9 @@ with tab_scan:
             st.caption(f"Roughly {universe_size * 3:.0f}s for {universe_size} instruments — "
                        f"Yahoo is slower than an exchange API.")
         elif HL_MODE:
-            st.caption(f"Roughly {universe_size * 4.5 + 2:.0f}s for {universe_size} coins — "
-                       f"Hyperliquid limits request rates, so calls are paced.")
+            st.caption(f"Roughly {universe_size * 1.6 + 2:.0f}s for {universe_size} coins. "
+                       f"One request each: 4H and 1H candles are built from the 5m data "
+                       f"rather than fetched separately.")
             if WATCHLIST_MODE and not _wl_found:
                 st.info("Nothing to scan yet — fix the unmatched entries above.")
         else:
@@ -1499,10 +1549,20 @@ with tab_scan:
                     return frames
                 out = {}
                 if hyperliquid_data.is_hl_ticker(ticker):
+                    # One request for 5m candles, then build 1H and 4H from
+                    # them. Identical data, a third of the requests, and the
+                    # venue's rate limit is what makes scans slow.
+                    df, _e = hyperliquid_data.fetch_candles(ticker, "5m", 1000)
+                    if df is not None and len(df) >= 720:
+                        return trend_retrace.frames_from_5m(df)
                     for tf, lim in (("4h", 30), ("1h", 48), ("5m", 400)):
-                        df, _e = hyperliquid_data.fetch_candles(ticker, tf, lim)
-                        out[tf] = df if df is not None else pd.DataFrame()
+                        df2, _e = hyperliquid_data.fetch_candles(ticker, tf, lim)
+                        out[tf] = df2 if df2 is not None else pd.DataFrame()
                     return out
+                if CRYPTO_SOURCE == "bybit":
+                    df, _e = exchanges.fetch_bybit_klines(ticker, "5m", limit=1000)
+                    if df is not None and len(df) >= 720:
+                        return trend_retrace.frames_from_5m(df)
                 for tf, lim in (("4h", 30), ("1h", 48), ("5m", 400)):
                     df = None
                     if CRYPTO_SOURCE == "bybit":
@@ -1800,6 +1860,11 @@ with tab_scan:
                     params=TR_PARAMS,
                     direction_override=None if tr_dir == "Auto" else tr_dir)
                 _p = st.session_state.tr_plan
+                _pats = patterns.detect(frames["5m"]) + patterns.detect(frames["1h"])
+                st.session_state.tr_patterns = _pats
+                if _p.features is not None and _pats:
+                    _p.features["pattern"] = patterns.summarise(_pats)
+                    _p.features["pattern_bias"] = patterns.bias_of(_pats)
                 st.session_state.tr_levels = {
                     "levels": (trend_retrace.five_minute_levels(
                         frames["5m"], _p.direction, _p.current_price or 0, TR_PARAMS)
@@ -1841,6 +1906,20 @@ with tab_scan:
                                f"waiting for the retrace, not a market buy.")
             for p_ in plan.problems:
                 st.warning(p_)
+            _pats = st.session_state.get("tr_patterns") or []
+            if _pats:
+                st.markdown("##### Candlestick patterns right now")
+                for _pt in _pats:
+                    _icon = {"bullish": "🟢", "bearish": "🔴"}.get(_pt.bias, "⚪")
+                    st.markdown(f"{_icon} **{_pt.name}** — {_pt.description}")
+                    st.caption(f"　{_pt.convention}")
+                if plan.direction and patterns.contradicts(_pats, plan.direction):
+                    st.warning(f"At least one pattern points against this "
+                               f"{plan.direction.lower()}.")
+                st.caption("Patterns describe what just happened; they don't predict what "
+                           "comes next. They're recorded with the setup so the learner can "
+                           "test whether they make any difference to your results.")
+
             if plan.quality_fails:
                 st.warning("**Weak setup — your three rules pass, but:**")
                 for q_ in plan.quality_fails:
