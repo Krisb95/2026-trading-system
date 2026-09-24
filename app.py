@@ -174,6 +174,21 @@ def _daily_change(ticker: str, price: float):
     return price - prev, (price - prev) / prev * 100, prev
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _yahoo_frames(ticker: str):
+    """5m, 1H and 4H candles for a stock, commodity or FX pair.
+
+    Yahoo has no 4H interval, so 4H is built from 1H bars. For anything that
+    doesn't trade round the clock those 4H candles span session breaks, which
+    is a real difference from crypto — see the warning shown beside the scan.
+    """
+    frames, problems = fetch_multi_timeframe(ticker, yf)
+    out = {"4h": frames.get("4h", pd.DataFrame()),
+           "1h": frames.get("1h", pd.DataFrame()),
+           "5m": frames.get("5m", pd.DataFrame())}
+    return out, problems
+
+
 def _backtest_frames(ticker, days):
     """5m, 1H and 4H history for a backtest, from whichever source this server
     can actually reach. Bybit and Binance are blocked from US-hosted servers;
@@ -376,7 +391,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-24-b46 (data fallback for blocked exchanges)"
+APP_BUILD = "2026-09-24-b47 (scan stocks, commodities and FX)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -447,6 +462,24 @@ COMMODITY_TICKERS = {
     "Copper (Futures)": "HG=F", "WTI Crude Oil (Futures)": "CL=F",
     "Brent Crude Oil (Futures)": "BZ=F", "Natural Gas (Futures)": "NG=F",
     "Gold ETF (GLD)": "GLD", "Silver ETF (SLV)": "SLV", "Energy Sector ETF (XLE)": "XLE",
+}
+
+STOCK_TICKERS = {
+    "Apple (AAPL)": "AAPL", "Microsoft (MSFT)": "MSFT", "Nvidia (NVDA)": "NVDA",
+    "Amazon (AMZN)": "AMZN", "Alphabet (GOOGL)": "GOOGL", "Meta (META)": "META",
+    "Tesla (TSLA)": "TSLA", "Broadcom (AVGO)": "AVGO", "AMD (AMD)": "AMD",
+    "Netflix (NFLX)": "NFLX", "JPMorgan (JPM)": "JPM", "Visa (V)": "V",
+    "Coinbase (COIN)": "COIN", "MicroStrategy (MSTR)": "MSTR", "Palantir (PLTR)": "PLTR",
+    "Berkshire (BRK-B)": "BRK-B", "Eli Lilly (LLY)": "LLY", "Exxon (XOM)": "XOM",
+    "S&P 500 ETF (SPY)": "SPY", "Nasdaq 100 ETF (QQQ)": "QQQ",
+}
+
+FX_TICKERS = {
+    "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X", "USD/JPY": "JPY=X",
+    "AUD/USD": "AUDUSD=X", "USD/CAD": "CAD=X", "USD/CHF": "CHF=X",
+    "NZD/USD": "NZDUSD=X", "EUR/GBP": "EURGBP=X", "EUR/JPY": "EURJPY=X",
+    "AUD/JPY": "AUDJPY=X", "GBP/JPY": "GBPJPY=X", "USD/SGD": "SGD=X",
+    "Dollar Index (DX-Y.NYB)": "DX-Y.NYB",
 }
 
 # ---------------------------------------------------------------------
@@ -696,8 +729,9 @@ else:
 if not CRYPTO_IS_LIVE:
     st.sidebar.warning(CRYPTO_NOTE)
 st.sidebar.warning(
-    "On free hosting the database is wiped when the Space rebuilds. "
-    "Export your journal to CSV after any session that matters."
+    "Streamlit Cloud wipes the database whenever the app redeploys — including every time "
+    "you upload new files. Export your journal and tracking CSVs before updating, then "
+    "import them back afterwards."
 )
 
 (tab_market, tab_tools, tab_learn, tab_scan, tab_positions, tab_risk, tab_journal,
@@ -1099,6 +1133,36 @@ with tab_scan:
     score_evidence, seq_evidence = {}, {}
 
     if mode == "Rank the universe":
+        market = st.radio("Market", ["Crypto", "Stocks", "Commodities", "FX"],
+                          horizontal=True, key="uni_market")
+        NON_CRYPTO = market != "Crypto"
+        if NON_CRYPTO:
+            _lists = {"Stocks": STOCK_TICKERS, "Commodities": COMMODITY_TICKERS,
+                      "FX": FX_TICKERS}
+            _list = _lists[market]
+            st.caption(
+                f"Your three rules applied to {market.lower()}, using Yahoo Finance data. "
+                f"Yahoo has no 4H interval, so 4H candles are built from 1H bars.")
+            if market == "Stocks":
+                st.warning(
+                    "**Stocks aren't crypto, and the strategy assumes they are.** They trade "
+                    "about 6.5 hours a day, so a '4H candle' spans session breaks, and "
+                    "overnight gaps can open straight past your stop — the loss can exceed "
+                    "1R, which never happens in the backtest. Outside market hours no limit "
+                    "order fills and prices are stale. Treat these setups with more caution "
+                    "than crypto ones, and size smaller.")
+            elif market == "FX":
+                st.caption(
+                    "FX trades 24 hours, five days a week, so it fits the strategy better "
+                    "than stocks — but weekend gaps can still open past a stop, and Yahoo's "
+                    "FX prices are indicative rather than a broker's dealable quotes.")
+            else:
+                st.caption(
+                    "Futures trade nearly around the clock on weekdays, so they fit the "
+                    "strategy reasonably well. ETFs in this list (GLD, SLV, XLE) follow "
+                    "stock-market hours and carry the same gap risk.")
+            st.caption("None of this has been backtested — the backtest only covers crypto.")
+
         coin_source = st.radio(
             "Which coins",
             ["Top by market cap", "High volume, outside the top 20 (Hyperliquid)",
@@ -1107,8 +1171,9 @@ with tab_scan:
             help="The second option ranks Hyperliquid perps by their 24-hour volume on "
                  "Hyperliquid — the liquidity you'd actually trade into — and skips the "
                  "largest coins by market cap.")
-        WATCHLIST_MODE = coin_source == "My watchlist"
-        HL_MODE = coin_source.startswith("High volume") or WATCHLIST_MODE
+        WATCHLIST_MODE = (coin_source == "My watchlist") and not NON_CRYPTO
+        HL_MODE = ((coin_source.startswith("High volume") or WATCHLIST_MODE)
+                   and not NON_CRYPTO)
         if WATCHLIST_MODE:
             wl_text = st.text_area(
                 "Coins to scan", value=watchlist_mod.DEFAULT_WATCHLIST, height=90,
@@ -1252,7 +1317,11 @@ with tab_scan:
                 "all three rules scores 10/10; the score is a checklist count, not a "
                 "probability of profit."
             )
-            if WATCHLIST_MODE:
+            if NON_CRYPTO:
+                universe_size = st.slider(f"How many {market.lower()} to scan", 3,
+                                           len(_list), min(10, len(_list)),
+                                           key="uni_noncrypto_n")
+            elif WATCHLIST_MODE:
                 universe_size = len(_wl_found) + len(_elsewhere) + len(_via_cg)
             elif HL_MODE:
                 universe_size = hl_count
@@ -1269,7 +1338,11 @@ with tab_scan:
                 "full single-instrument scan on anything promising."
             )
             u1, u2, u3 = st.columns(3)
-            if WATCHLIST_MODE:
+            if NON_CRYPTO:
+                universe_size = st.slider(f"How many {market.lower()} to scan", 3,
+                                           len(_list), min(10, len(_list)),
+                                           key="uni_noncrypto_n")
+            elif WATCHLIST_MODE:
                 universe_size = len(_wl_found) + len(_elsewhere) + len(_via_cg)
             elif HL_MODE:
                 universe_size = hl_count
@@ -1282,7 +1355,10 @@ with tab_scan:
             uni_min_rr = u3.number_input("Min R:R", min_value=3.0, value=3.0,
                                           step=0.5, key="uni_rr")
 
-        if HL_MODE:
+        if NON_CRYPTO:
+            st.caption(f"Roughly {universe_size * 3:.0f}s for {universe_size} instruments — "
+                       f"Yahoo is slower than an exchange API.")
+        elif HL_MODE:
             st.caption(f"Roughly {universe_size * 4.5 + 2:.0f}s for {universe_size} coins — "
                        f"Hyperliquid limits request rates, so calls are paced.")
             if WATCHLIST_MODE and not _wl_found:
@@ -1302,7 +1378,11 @@ with tab_scan:
 
         if st.button("🔎 Scan universe", use_container_width=True):
             hl_marks = {}
-            if WATCHLIST_MODE:
+            if NON_CRYPTO:
+                _names = list(_list)[:universe_size]
+                instruments = [(n, _list[n], (_list[n], None)) for n in _names]
+                st.session_state.hl_info = {}
+            elif WATCHLIST_MODE:
                 _all, _e = _cached_hl_contexts()
                 _by_name = {c["name"]: c for c in _all}
                 _sel = [_by_name[r.market] for r in _wl_found if r.market in _by_name]
@@ -1376,6 +1456,11 @@ with tab_scan:
                 """Live spot price for the Price column and entry maths. Without
                 this, 'Price' was the last 4H close — up to four hours stale."""
                 ticker, coin_id = payload
+                if NON_CRYPTO:
+                    q = fetch_quote(ticker, "stock" if market == "Stocks" else "commodity",
+                                     yf, live_threshold_seconds=live_threshold,
+                                     stale_threshold_seconds=stale_threshold, max_retries=1)
+                    return q.price if q and q.price else None
                 if hyperliquid_data.is_hl_ticker(ticker):
                     return hl_marks.get(ticker)        # already fetched with the volumes
                 if CRYPTO_SOURCE == "bybit":
@@ -1393,6 +1478,9 @@ with tab_scan:
             def _tr_loader(payload):
                 """4H, 1H and 5m candles for the Trend Retrace rules."""
                 ticker, _coin_id = payload
+                if NON_CRYPTO:
+                    frames, _p = _yahoo_frames(ticker)
+                    return frames
                 out = {}
                 if hyperliquid_data.is_hl_ticker(ticker):
                     for tf, lim in (("4h", 30), ("1h", 48), ("5m", 400)):
@@ -1564,7 +1652,8 @@ with tab_scan:
                                  expectancy.PROVEN_NEGATIVE: "❌ Proven −",
                                  expectancy.UNPROVEN: "❔ Unproven",
                                  expectancy.TOO_FEW: "— Too few"}.get(_evidence(r)[0], "—"),
-                    "Venue": ("HL" if hyperliquid_data.is_hl_ticker(r.ticker)
+                    "Venue": ("—" if NON_CRYPTO else
+                              "HL" if hyperliquid_data.is_hl_ticker(r.ticker)
                               else "/".join(VENUE_TAGS.get(r.label, [])) or "—"),
                     **({"24h volume": f"${_hlinfo[r.ticker].day_volume_usd / 1e6:,.0f}M",
                         "Open interest": f"${_hlinfo[r.ticker].open_interest_usd / 1e6:,.0f}M",
