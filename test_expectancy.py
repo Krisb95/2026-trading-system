@@ -146,3 +146,34 @@ class TestSimulatedExpectations(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWinRateRewardTradeoff(unittest.TestCase):
+    """You choose which side of the trade-off to sit on, not both."""
+
+    def test_eight_wins_in_ten_needs_a_small_reward(self):
+        from expectancy import required_rr
+        self.assertAlmostEqual(required_rr(0.80), 0.25)          # risk 4 to make 1
+
+    def test_eight_in_ten_with_a_real_edge_still_needs_under_one(self):
+        from expectancy import required_rr
+        self.assertAlmostEqual(required_rr(0.80, edge_per_trade=0.20), 0.50)
+
+    def test_three_to_one_needs_only_a_quarter_of_trades_to_win(self):
+        from expectancy import win_rate_needed
+        self.assertAlmostEqual(win_rate_needed(3.0), 0.25)
+
+    def test_the_two_functions_are_inverses(self):
+        from expectancy import required_rr, win_rate_needed
+        for p in (0.2, 0.35, 0.5, 0.8):
+            self.assertAlmostEqual(win_rate_needed(required_rr(p)), p, places=9)
+
+    def test_higher_win_rate_always_means_smaller_reward(self):
+        from expectancy import required_rr
+        self.assertLess(required_rr(0.80), required_rr(0.30))
+
+    def test_invalid_inputs(self):
+        from expectancy import required_rr, win_rate_needed
+        self.assertIsNone(required_rr(0))
+        self.assertIsNone(required_rr(1.5))
+        self.assertIsNone(win_rate_needed(0))

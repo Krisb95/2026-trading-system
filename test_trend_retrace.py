@@ -552,3 +552,97 @@ class TestExtraFeatures(unittest.TestCase):
             spot_loader=lambda k: 103.0, now=pd.Timestamp("2030-01-01", tz="UTC"),
             extra_features={"sentiment": "Fear"})
         self.assertEqual(out[0].features["sentiment"], "Fear")
+
+
+class TestMultipleSupportLevels(unittest.TestCase):
+    def test_returns_supports_below_price_nearest_first(self):
+        from trend_retrace import five_minute_levels
+        levels = five_minute_levels(five_min_with_support(), "Long", 103.0)
+        self.assertTrue(levels)
+        self.assertTrue(all(l < 103.0 for l in levels))
+        self.assertEqual(levels, sorted(levels, reverse=True))
+
+    def test_first_level_matches_the_single_entry_rule(self):
+        from trend_retrace import five_minute_levels, five_minute_support
+        df = five_min_with_support()
+        single, _ = five_minute_support(df, "Long", 103.0, StrategyParams())
+        levels = five_minute_levels(df, "Long", 103.0)
+        self.assertAlmostEqual(levels[0], single)
+
+    def test_short_returns_levels_above(self):
+        from trend_retrace import five_minute_levels
+        levels = five_minute_levels(five_min_with_support(), "Short", 99.0)
+        self.assertTrue(all(l > 99.0 for l in levels))
+
+    def test_empty_frame(self):
+        from trend_retrace import five_minute_levels
+        self.assertEqual(five_minute_levels(pd.DataFrame(), "Long", 100.0), [])
+
+
+class TestQualityFilters(unittest.TestCase):
+    """Optional gates beyond the three core rules. Off by default, and each
+    one explains itself when it rejects a setup."""
+
+    def _params(self, **kw):
+        base = dict(min_h1_body_ratio=0.0, min_trend_move_atr=0.0, max_extension_atr=0.0)
+        base.update(kw)
+        return StrategyParams(**base)
+
+    def test_off_by_default(self):
+        p = StrategyParams()
+        self.assertEqual((p.min_h1_body_ratio, p.min_trend_move_atr,
+                          p.max_extension_atr), (0.0, 0.0, 0.0))
+
+    def test_doji_1h_candle_is_rejected(self):
+        from trend_retrace import quality_check
+        doji = candles([(100, 105, 95, 100.1)], freq="1h")   # tiny body, huge range
+        fails = quality_check("Long", 100.0, uptrend_4h(), doji,
+                              self._params(min_h1_body_ratio=0.4))
+        self.assertTrue(any("body" in f for f in fails))
+
+    def test_strong_1h_candle_passes(self):
+        from trend_retrace import quality_check
+        strong = candles([(100, 104, 99.8, 103.8)], freq="1h")
+        fails = quality_check("Long", 100.0, uptrend_4h(), strong,
+                              self._params(min_h1_body_ratio=0.4))
+        self.assertFalse(any("body" in f for f in fails))
+
+    def test_barely_a_trend_is_rejected(self):
+        from trend_retrace import quality_check
+        flat = candles([(100, 100.2, 99.8, 100), (100, 100.3, 99.9, 100.1),
+                        (100.1, 100.4, 100.0, 100.2)] * 6, freq="4h")
+        fails = quality_check("Long", 100.0, flat, bullish_1h(),
+                              self._params(min_trend_move_atr=1.0))
+        self.assertTrue(any("barely a trend" in f for f in fails))
+
+    def test_extended_price_is_rejected(self):
+        from trend_retrace import quality_check
+        rows = [(100 + i, 100.5 + i, 99.5 + i, 100 + i) for i in range(25)]
+        df = candles(rows, freq="4h")
+        fails = quality_check("Long", 200.0, df, bullish_1h(),
+                              self._params(max_extension_atr=3.0))
+        self.assertTrue(any("extended" in f for f in fails))
+
+    def test_every_rejection_explains_itself(self):
+        from trend_retrace import quality_check
+        doji = candles([(100, 105, 95, 100.1)], freq="1h")
+        for f in quality_check("Long", 100.0, uptrend_4h(), doji,
+                               self._params(min_h1_body_ratio=0.4)):
+            self.assertGreater(len(f), 40)
+
+    def test_analysis_flags_a_weak_setup_instead_of_calling_it_a_plus(self):
+        from trend_retrace import LOW_QUALITY
+        doji = candles([(100, 105, 95, 100.1)], freq="1h")
+        p = analyze("X", uptrend_4h(), doji, five_min_with_support(), live_price=103.0,
+                    params=self._params(min_h1_body_ratio=0.4))
+        if p.rules["1h"].passed:          # the doji still closes green
+            self.assertEqual(p.stage, LOW_QUALITY)
+            self.assertNotEqual(p.grade, "A+")
+            self.assertTrue(p.quality_fails)
+
+    def test_backtest_with_filters_takes_fewer_trades(self):
+        m5, h1, h4 = market(seed=7, days=30)
+        loose = run_backtest(m5, h1, h4, "X", params=StrategyParams())
+        strict = run_backtest(m5, h1, h4, "X", params=StrategyParams(
+            min_h1_body_ratio=0.4, min_trend_move_atr=0.8, max_extension_atr=3.0))
+        self.assertLess(len(strict), len(loose))

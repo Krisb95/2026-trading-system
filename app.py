@@ -58,7 +58,8 @@ import watchlist as watchlist_mod
 import market_tools
 import theme
 import coin_info
-from formatting import format_price, format_rr, RR_STYLES, RR_REWARD_FIRST
+import grid as grid_mod
+from formatting import format_price, format_rr
 
 _REQUIRED = {
     coingecko: ['build_frames_v2', 'fetch_description', 'fetch_ohlc', 'fetch_period_changes', 'fetch_spot_price', 'has_api_key', 'search_coins', 'set_api_key'],
@@ -67,16 +68,17 @@ _REQUIRED = {
     sentiment: ['bucket', 'fetch_fear_greed', 'set_cmc_api_key'],
     market_tools: ['OVERBOUGHT', 'OVERSOLD', 'altcoin_season_index', 'flow_rows', 'most_crowded', 'rsi_row', 'rsi_state', 'turnover_ratio'],
     theme: ['AMBER', 'BLUE', 'CSS', 'GRADE_COLOURS', 'GREEN', 'GREY', 'PURPLE', 'RED', 'gauge', 'pill'],
-    storage: ['add_journal_entry', 'add_position', 'clear_all', 'close_journal_entry', 'delete_position', 'get_journal_df', 'get_positions', 'get_signals_df', 'import_journal_csv', 'import_signals_csv', 'init_db', 'journal_to_csv_bytes', 'load_value', 'save_value', 'signals_to_csv_bytes', 'update_journal_entry', 'update_position'],
+    storage: ['add_journal_entry', 'add_position', 'clear_all', 'close_journal_entry', 'delete_position', 'get_journal_df', 'get_positions', 'get_signals_df', 'import_journal_csv', 'import_signals_csv', 'init_db', 'journal_to_csv_bytes', 'load_value', 'save_value', 'signals_to_csv_bytes', 'update_journal_entry', 'update_position', 'update_signal'],
     trade_log: ['OUTCOMES', 'complete_trade', 'default_exit_price', 'learning_trades', 'open_scanner_trades', 'pl_status_for', 'realized_r', 'take_trade'],
-    trade_review: ['CLOSE', 'CLOSE_THESIS', 'HOLD', 'TIGHTEN', 'review'],
+    trade_review: ['CLOSE', 'CLOSE_THESIS', 'HOLD', 'STILL_VALID', 'TIGHTEN', 'review', 'setup_still_viable'],
     learning: ['LearnedModel', 'MIN_TRADES', 'learn'],
     expectancy: ['EvidenceBook', 'PROVEN_NEGATIVE', 'PROVEN_POSITIVE', 'TOO_FEW', 'UNPROVEN', 'break_even_win_rate', 'simulate_expectations'],
     explain: ['AT_ENTRY', 'NO_TREND', 'WAIT_RETRACE', 'full_plan', 'short_plan'],
-    trend_retrace: ['AT_ENTRY', 'KIND_INITIAL', 'STOP_BELOW_4H_CANDLE', 'STOP_BELOW_SUPPORT', 'StrategyParams', 'WAIT_RETRACE', 'analyze', 'atr', 'backtest_stats', 'drop_forming', 'reentry_plan_text', 'run_backtest', 'scan_universe_tr'],
+    trend_retrace: ['AT_ENTRY', 'KIND_INITIAL', 'STOP_BELOW_4H_CANDLE', 'STOP_BELOW_SUPPORT', 'StrategyParams', 'WAIT_RETRACE', 'analyze', 'atr', 'backtest_stats', 'drop_forming', 'five_minute_levels', 'reentry_plan_text', 'run_backtest', 'scan_universe_tr'],
     tracking: ['record_from_ranked', 'tracked_stats', 'tracked_trades', 'update_all'],
     exchanges: ['build_frames', 'fetch_binance_history', 'fetch_binance_klines', 'fetch_bybit_klines', 'fetch_bybit_tickers', 'fetch_kraken_ohlc', 'fetch_spot'],
     coin_info: ['CATEGORIES', 'COINS', 'coverage', 'describe'],
+    grid_mod: ['MIN_LEVELS', 'WEIGHTINGS', 'build_grid', 'usable_levels'],
 }
 
 _stale = sorted({f"{m.__name__.split('.')[-1]}.py" for m, attrs in _REQUIRED.items()
@@ -172,6 +174,37 @@ def _daily_change(ticker: str, price: float):
     return price - prev, (price - prev) / prev * 100, prev
 
 
+def _backtest_frames(ticker, days):
+    """5m, 1H and 4H history for a backtest, from whichever source this server
+    can actually reach. Bybit and Binance are blocked from US-hosted servers;
+    Hyperliquid is not, but only serves its most recent 5,000 candles — about
+    17 days of 5m data. Returns (m5, h1, h4, source, note)."""
+    bars5 = days * 288
+    m5, err = exchanges.fetch_bybit_klines(ticker, "5m", limit=1000)
+    if m5 is not None and len(m5) >= 500:
+        h1, _ = exchanges.fetch_bybit_klines(ticker, "1h", limit=1000)
+        h4, _ = exchanges.fetch_bybit_klines(ticker, "4h", limit=1000)
+        if h1 is not None and h4 is not None:
+            return m5, h1, h4, "Bybit", None
+    m5, err = exchanges.fetch_binance_history(ticker, "5m", bars5)
+    if m5 is not None and not m5.empty:
+        h1, _ = exchanges.fetch_binance_history(ticker, "1h", days * 24 + 48)
+        h4, _ = exchanges.fetch_binance_history(ticker, "4h", days * 6 + 30)
+        if h1 is not None and h4 is not None:
+            return m5, h1, h4, "Binance", None
+    base = ticker.upper().replace("-USD", "")
+    m5, hl_err = hyperliquid_data.fetch_candles(f"HL:{base}", "5m", min(bars5, 5000))
+    if m5 is not None and not m5.empty:
+        h1, _ = hyperliquid_data.fetch_candles(f"HL:{base}", "1h", 2000)
+        h4, _ = hyperliquid_data.fetch_candles(f"HL:{base}", "4h", 1000)
+        if h1 is not None and h4 is not None:
+            covered = len(m5) * 5 / 60 / 24
+            note = (f"Hyperliquid data ({covered:.0f} days — it only keeps its most recent "
+                    f"5,000 candles)") if covered < days - 1 else "Hyperliquid data"
+            return m5, h1, h4, "Hyperliquid", note
+    return None, None, None, None, (f"Bybit/Binance: {err} · Hyperliquid: {hl_err}")
+
+
 def _size_plan(direction, entry, stop, target, ticker=None):
     """Position size for a plan, from the account settings in the sidebar.
     Returns None when the plan is incomplete or the numbers don't work."""
@@ -209,6 +242,58 @@ def _render_size(res, key=""):
         st.warning(w)
     if res.liquidation_warning and "could be liquidated" in res.liquidation_warning.lower():
         st.error(res.liquidation_warning)
+
+
+def _render_grid(key, direction, price, levels, atr_value, target_r):
+    """Offer a laddered entry, but only when the chart really shows more than
+    one level. A single support means a single entry."""
+    usable = grid_mod.usable_levels(levels, direction, price, atr_value or 0.0)
+    if len(usable) < grid_mod.MIN_LEVELS:
+        return
+    if not st.toggle("Ladder the entry across several levels", key=f"gr_on_{key}",
+                     help="Your strategy specifies one entry. This spreads it over the "
+                          "supports below — optional, and untested by the backtest."):
+        return
+
+    c1, c2 = st.columns(2)
+    n = c1.slider("Levels", min_value=2, max_value=len(usable), value=min(3, len(usable)),
+                  key=f"gr_n_{key}")
+    style = c2.selectbox("Sizing", grid_mod.WEIGHTINGS, key=f"gr_w_{key}")
+    chosen = usable[:n]
+    buffer = (atr_value or 0.0) * (TR_PARAMS.stop_atr_mult if TR_PARAMS else 3.0)
+    stop = (min(chosen) - buffer) if direction == "Long" else (max(chosen) + buffer)
+    plan = grid_mod.build_grid(direction, chosen, price, stop,
+                               risk_amount=ACCOUNT_EQUITY * RISK_PCT / 100,
+                               target_r=target_r or 3.0, weighting=style)
+    if plan is None:
+        st.caption("These levels don't form a valid ladder.")
+        return
+
+    st.dataframe(pd.DataFrame([{
+        "#": l.index,
+        "Limit price": format_price(l.price),
+        "From live": f"{l.distance_pct:+.2f}%",
+        "Share": f"{l.weight * 100:.0f}%",
+        "Units": f"{l.units:,.6g}".rstrip("0").rstrip("."),
+        "Value": f"${l.notional:,.2f}",
+        "Risk if stopped here": f"${l.cumulative_risk:,.2f}",
+    } for l in plan.levels]), use_container_width=True, hide_index=True)
+
+    g1, g2, g3 = st.columns(3)
+    g1.metric("Average entry", format_price(plan.average_entry),
+              f"vs {format_price(plan.single_entry_price)} single")
+    g2.metric("Stop (below all levels)", format_price(plan.stop))
+    g3.metric("Target", format_price(plan.target),
+              f"{format_rr(plan.reward_risk)}")
+    st.caption(f"**All levels fill, then stopped: −${plan.total_risk:,.2f}** — the same as a "
+               f"single entry, not multiplied. All fill, then target: "
+               f"+${plan.reward_at_target:,.2f}.")
+    st.caption(plan.partial_fill_note)
+    for w in plan.warnings:
+        st.caption(f"⚠️ {w}")
+    st.caption("Place each line as its own limit order with the SAME stop. Log each fill "
+               "separately in the journal. The backtest only models single entries, so "
+               "there's no evidence yet that laddering helps this strategy.")
 
 
 def _take_trade_widget(key, ticker, direction, entry, stop, target, features=None,
@@ -291,7 +376,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-23-b41 (Bybit source, 24h change, coin glossary)"
+APP_BUILD = "2026-09-24-b46 (data fallback for blocked exchanges)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -393,17 +478,34 @@ if USE_TR:
                  "so your 'add 50% after a 1H candle' rule could never trigger. 3x lets "
                  "trades run for hours.")
         _target_r = st.number_input(
-            "Take profit (multiple of risk)", min_value=3.0, max_value=10.0, value=3.0,
-            step=0.5, key="tr_target_r",
-            help="Minimum 3:1. Note the win rate falls as the target moves further away — "
-                 "on random data it lands at the break-even rate for any multiple.")
+            "Take profit (multiple of risk)", min_value=0.25, max_value=10.0, value=3.0,
+            step=0.25, key="tr_target_r",
+            help="Sets the trade-off between how OFTEN you win and how MUCH. A big target "
+                 "wins rarely and large; a small one wins often and small.")
+        _be = expectancy.break_even_win_rate(_target_r)
+        st.caption(f"At **{_target_r:g}:1** you break even winning **{_be:.0%}** of trades "
+                   f"(about {_be * 10:.0f} in 10), and profit above that.")
         _trend_n = st.number_input("4H candles required", min_value=1, max_value=5,
                                     value=2, step=1, key="tr_trend_n")
+    with st.sidebar.expander("Setup quality filters", expanded=False):
+        st.caption("Extra gates beyond your three rules, because two 4H candles and one 1H "
+                   "candle fire often by chance. Each halves the signal count roughly; the "
+                   "backtest measures whether they help. Slide to 0 to switch one off.")
+        _q_body = st.slider("1H candle body, minimum share of its range", 0.0, 0.8, 0.40,
+                            0.05, key="q_body",
+                            help="A doji closes level — it confirms nothing.")
+        _q_trend = st.slider("4H trend move, minimum ATR", 0.0, 3.0, 0.80, 0.1,
+                             key="q_trend",
+                             help="Marginally higher highs happen constantly in a range.")
+        _q_ext = st.slider("Max distance from the 4H average (ATR)", 0.0, 8.0, 3.0, 0.5,
+                           key="q_ext",
+                           help="Stops you entering after price has already run. 0 = off.")
     TR_PARAMS = trend_retrace.StrategyParams(
         trend_candles=int(_trend_n),
         stop_mode=(trend_retrace.STOP_BELOW_4H_CANDLE if _stop_choice.startswith("Below the last")
                    else trend_retrace.STOP_BELOW_SUPPORT),
-        stop_atr_mult=_stop_atr, target_r=_target_r)
+        stop_atr_mult=_stop_atr, target_r=_target_r,
+        min_h1_body_ratio=_q_body, min_trend_move_atr=_q_trend, max_extension_atr=_q_ext)
 else:
     TR_PARAMS = None
 
@@ -424,10 +526,6 @@ with st.sidebar.expander("Costs"):
 st.sidebar.caption(f"Risking **${ACCOUNT_EQUITY * RISK_PCT / 100:,.2f}** per trade.")
 
 st.sidebar.markdown("---")
-RR_STYLE = st.sidebar.radio("Show reward:risk as", RR_STYLES, key="rr_style",
-                            help="Two ways of writing the same thing: risking 1 to make 3 "
-                                 "is '3.00' as reward:risk, or '1:3' as risk:reward.")
-
 with st.sidebar.expander("Advanced settings"):
     st.caption("Data-freshness rules and display timezone. The defaults rarely need "
                "changing — crypto prices come live from the exchange regardless.")
@@ -577,10 +675,13 @@ if CRYPTO_SOURCE == "bybit":
     if BYBIT_TICKERS:
         st.sidebar.caption(f"Bybit: {len(BYBIT_TICKERS)} USDT perps.")
     else:
-        st.sidebar.error(
-            f"Bybit unreachable — {_bybit_err} Prices will come from Binance/Kraken "
-            f"instead. Running the app on your own machine in a region Bybit serves "
-            f"would fix this.")
+        st.sidebar.warning(
+            "**Bybit can't be reached from this server** — it blocks US traffic and "
+            "Streamlit is US-hosted. Binance is blocked too. Candles are coming from "
+            "Hyperliquid instead; prices on majors are near-identical, so scans stay "
+            "accurate and you place the orders on Bybit. Running this app on your own "
+            "computer in Australia would use Bybit directly — see RUNNING_LOCALLY.md in "
+            "the download.")
 
 st.sidebar.markdown("---")
 st.sidebar.caption(f"curl_cffi installed: **{curl_cffi_is_available()}**")
@@ -1136,7 +1237,9 @@ with tab_scan:
                                          step=5.0, key="hl_minvol",
                                          help="Volume on Hyperliquid only. Thinner markets "
                                               "mean wider spreads and more slippage.")
-            hl_count = v3.selectbox("How many coins", [10, 20, 30], index=1, key="hl_count")
+            hl_count = v3.selectbox("How many coins", [10, 20, 30, 50, 100], index=1,
+                                    key="hl_count",
+                                    format_func=lambda n: f"Top {n} by volume")
             st.caption(
                 "⚠️ High volume outside the top coins often means a sharp move, news or a "
                 "pump. These markets are usually more volatile, and your strategy hasn't "
@@ -1154,10 +1257,10 @@ with tab_scan:
             elif HL_MODE:
                 universe_size = hl_count
             else:
-                universe_size = st.selectbox("How many coins", [10, 20, 30, 50], index=1,
-                                              key="uni_size",
-                                              help="More coins means more API calls and a "
-                                                   "longer wait.")
+                universe_size = st.selectbox(
+                    "Scan the top…", [10, 20, 30, 50, 100], index=1, key="uni_size",
+                    format_func=lambda n: f"Top {n} by market cap",
+                    help="More coins means more API calls and a longer wait.")
             uni_direction, uni_min_rr = "Auto", 3.0
         else:
             st.caption(
@@ -1171,10 +1274,10 @@ with tab_scan:
             elif HL_MODE:
                 universe_size = hl_count
             else:
-                universe_size = u1.selectbox("How many coins", [10, 20, 30, 50],
-                                              index=1, key="uni_size",
-                                              help="More coins means more API calls and a "
-                                                   "longer wait.")
+                universe_size = u1.selectbox(
+                    "Scan the top…", [10, 20, 30, 50, 100], index=1, key="uni_size",
+                    format_func=lambda n: f"Top {n} by market cap",
+                    help="More coins means more API calls and a longer wait.")
             uni_direction = u2.selectbox("Direction", ["Auto", "Long", "Short"], key="uni_dir")
             uni_min_rr = u3.number_input("Min R:R", min_value=3.0, value=3.0,
                                           step=0.5, key="uni_rr")
@@ -1304,6 +1407,11 @@ with tab_scan:
                         df, _e = exchanges.fetch_binance_klines(ticker, tf, limit=lim)
                     if df is None:
                         df, _e = exchanges.fetch_kraken_ohlc(ticker, tf)
+                    if df is None:
+                        # Bybit and Binance block US-hosted servers; Hyperliquid
+                        # doesn't, so it's the last exchange-quality fallback.
+                        df, _e = hyperliquid_data.fetch_candles(
+                            f"HL:{ticker.upper().replace('-USD', '')}", tf, lim)
                     out[tf] = df if df is not None else pd.DataFrame()
                 if all(f.empty for f in out.values()) and _coin_id:
                     # Not on any exchange here — CoinGecko is the last resort.
@@ -1315,9 +1423,29 @@ with tab_scan:
             if USE_TR:
                 with st.spinner("Scanning…"):
                     _extra = {"sentiment": sentiment.bucket(_fg["value"])} if _fg else None
+                    _level_cache = {}
+
+                    def _tr_loader_capture(payload):
+                        frames = _tr_loader(payload)
+                        # Keep the 5m structure so a ladder can be offered later
+                        # without re-fetching everything.
+                        _level_cache[payload[0]] = {
+                            "5m": frames.get("5m"),
+                            "atr": trend_retrace.atr(frames.get("5m"))}
+                        return frames
+
                     ranked = trend_retrace.scan_universe_tr(
-                        instruments, _tr_loader, spot_loader=_spot, params=TR_PARAMS,
-                        progress=_progress, extra_features=_extra)
+                        instruments, _tr_loader_capture, spot_loader=_spot,
+                        params=TR_PARAMS, progress=_progress, extra_features=_extra)
+                    st.session_state.uni_levels = {
+                        r.ticker: {
+                            "levels": trend_retrace.five_minute_levels(
+                                _level_cache.get(r.ticker, {}).get("5m"),
+                                r.direction, r.price or 0, TR_PARAMS),
+                            "atr": _level_cache.get(r.ticker, {}).get("atr"),
+                        }
+                        for r in ranked if r.direction and r.price
+                        and _level_cache.get(r.ticker, {}).get("5m") is not None}
             else:
                 with st.spinner("Scanning…"):
                     ranked = scan_universe(
@@ -1334,7 +1462,9 @@ with tab_scan:
         ranked = st.session_state.get("ranked")
         if ranked:
             scored_all = [r for r in ranked if r.error is None]
-            _rr_floor = MIN_RR if USE_TR else max(MIN_RR, uni_min_rr)
+            # Never hide setups that meet the target the trader chose.
+            _rr_floor = (min(MIN_RR, TR_PARAMS.target_r) if USE_TR and TR_PARAMS
+                         else max(MIN_RR, uni_min_rr))
             failed = [r for r in ranked if r.error is not None]
 
             _ev_raw, _ev_when = storage.load_value("evidence")
@@ -1448,7 +1578,7 @@ with tab_scan:
                     "Entry vs live": _gap(r),
                     "Stop": format_price(r.stop),
                     "Target": format_price(r.target),
-                    "R:R": format_rr(r.reward_risk, RR_STYLE),
+                    "R:R": format_rr(r.reward_risk),
                     ("Status" if USE_TR else "Regime"):
                         (r.entry_status or "—") if USE_TR else r.regime.title(),
                 } for r in ok])
@@ -1490,6 +1620,11 @@ with tab_scan:
                                 _sz = _size_plan(r.direction, r.entry, r.stop, r.target,
                                                   r.ticker)
                                 _render_size(_sz)
+                                _lv = st.session_state.get("uni_levels", {}).get(r.ticker)
+                                if _lv:
+                                    _render_grid(f"u_{r.ticker}", r.direction, r.price,
+                                                 _lv.get("levels", []), _lv.get("atr"),
+                                                 r.reward_risk)
                                 _take_trade_widget(
                                     f"u_{r.ticker}_{r.direction}", r.ticker, r.direction,
                                     r.entry, r.stop, r.target, features=r.features,
@@ -1547,6 +1682,9 @@ with tab_scan:
                         df, _e = exchanges.fetch_binance_klines(tr_ticker, tf, limit=lim)
                     if df is None:
                         df, _e = exchanges.fetch_kraken_ohlc(tr_ticker, tf)
+                    if df is None:
+                        df, _e = hyperliquid_data.fetch_candles(
+                            f"HL:{tr_ticker.upper().replace('-USD', '')}", tf, lim)
                     frames[tf] = trend_retrace.drop_forming(
                         df if df is not None else pd.DataFrame(), tf)
                 live, _src, _err = _cached_exchange_spot(tr_ticker)
@@ -1554,6 +1692,13 @@ with tab_scan:
                     tr_ticker, frames["4h"], frames["1h"], frames["5m"], live_price=live,
                     params=TR_PARAMS,
                     direction_override=None if tr_dir == "Auto" else tr_dir)
+                _p = st.session_state.tr_plan
+                st.session_state.tr_levels = {
+                    "levels": (trend_retrace.five_minute_levels(
+                        frames["5m"], _p.direction, _p.current_price or 0, TR_PARAMS)
+                        if _p.direction and _p.current_price else []),
+                    "atr": trend_retrace.atr(frames["5m"]),
+                }
 
         plan = st.session_state.get("tr_plan")
         if plan is None:
@@ -1582,13 +1727,17 @@ with tab_scan:
                 e1.metric("Entry (limit)", format_price(plan.entry))
                 e2.metric("Stop", format_price(plan.stop))
                 e3.metric("Target", format_price(plan.target))
-                e4.metric("R:R", format_rr(plan.reward_risk, RR_STYLE))
+                e4.metric("R:R", format_rr(plan.reward_risk))
                 if plan.current_price:
                     gap = (plan.entry - plan.current_price) / plan.current_price * 100
                     st.caption(f"Entry is {gap:+.2f}% from the live price — a limit order "
                                f"waiting for the retrace, not a market buy.")
             for p_ in plan.problems:
                 st.warning(p_)
+            if plan.quality_fails:
+                st.warning("**Weak setup — your three rules pass, but:**")
+                for q_ in plan.quality_fails:
+                    st.caption(f"• {q_}")
 
             if plan.entry is not None:
                 _sm, _tm = _methods(True, TR_PARAMS, plan.direction)
@@ -1603,6 +1752,10 @@ with tab_scan:
                     _sz = _size_plan(plan.direction, plan.entry, plan.stop, plan.target,
                                       plan.ticker)
                     _render_size(_sz)
+                    _tr_levels = st.session_state.get("tr_levels") or {}
+                    _render_grid(f"s_{plan.ticker}", plan.direction, plan.current_price,
+                                 _tr_levels.get("levels", []), _tr_levels.get("atr"),
+                                 plan.reward_risk)
                     _take_trade_widget(
                         f"s_{plan.ticker}_{plan.direction}", plan.ticker, plan.direction,
                         plan.entry, plan.stop, plan.target, features=plan.features,
@@ -2169,6 +2322,24 @@ with tab_risk:
         else:
             st.caption(f"Break-even at {_crr:g}:1 is {_be:.0%}. Chance of still being down "
                        f"after {_cn} trades, purely from luck: **{_ce.chance_of_loss_pct:.0f}%**.")
+        st.markdown("**Want to win more often?**")
+        _target_wins = st.slider("Wins out of 10 you want", 1, 9, 3, key="calc_wins")
+        _p = _target_wins / 10
+        _need_be = expectancy.required_rr(_p)
+        _need_edge = expectancy.required_rr(_p, edge_per_trade=0.20)
+        if _need_be:
+            st.caption(
+                f"To win **{_target_wins} in 10** you need a reward:risk of about "
+                f"**{_need_be:.2f}:1** just to break even, and **{_need_edge:.2f}:1** to make "
+                f"+0.20R per trade. Winning more often always means winning less each time — "
+                f"that trade-off can't be avoided, only chosen.")
+            _hi = expectancy.simulate_expectations(_p, max(_need_edge, 0.05),
+                                                    risk_pct=_crisk, n_trades=_cn)
+            st.caption(f"That style: {_hi.expected_total_pct:+.0f}% over {_cn} trades, worst "
+                       f"losing streak about {_hi.streak_bad}, worst drop "
+                       f"{_hi.drawdown_bad_pct:.0f}%. Smoother than a big-target style — but "
+                       f"each loss undoes several wins, so discipline on the stop matters "
+                       f"more, not less.")
         if _crisk > 2:
             st.warning(f"At {_crisk:g}% per trade, a bad losing run could take "
                        f"{_ce.drawdown_bad_pct:.0f}% off your account. Most traders keep risk "
@@ -2255,7 +2426,7 @@ with tab_risk:
             if res.net_profit_at_target is not None:
                 f.metric("Profit at target", f"${res.net_profit_at_target:,.2f}")
             if res.net_reward_risk is not None:
-                g.metric("Net R:R", format_rr(res.net_reward_risk, RR_STYLE))
+                g.metric("Net R:R", format_rr(res.net_reward_risk))
 
             st.caption(f"Stop is {res.stop_distance_pct * 100:.2f}% from entry "
                        f"({format_price(res.stop_distance_price)} per coin). Position "
@@ -2564,6 +2735,53 @@ with tab_track:
                            "entry", "stop", "target", "status", "r_result"]],
                      use_container_width=True, hide_index=True)
 
+    st.markdown("##### 🔁 Re-check saved setups")
+    st.caption("A plan made yesterday describes a chart that no longer exists. This "
+               "re-checks each waiting setup against the current 4H trend and price.")
+    _pending = sig_df[sig_df["status"] == "PENDING"] if not sig_df.empty else sig_df
+    if _pending.empty:
+        st.caption("No setups waiting to fill.")
+    elif st.button(f"Re-check {len(_pending)} waiting setup(s)", use_container_width=True):
+        _out = []
+        bar = st.progress(0.0, text="Checking…")
+        for i_, (_, sg) in enumerate(_pending.iterrows()):
+            bar.progress(i_ / max(len(_pending), 1), text=sg["ticker"])
+            _created = pd.Timestamp(sg["created_utc"])
+            _created = _created.tz_localize("UTC") if _created.tzinfo is None else _created
+            try:
+                _fr, _since, _px, _now = _review_inputs(sg["ticker"], _created)
+                if _px is None:
+                    _out.append((sg, None, "No current price available."))
+                    continue
+                _v = trade_review.setup_still_viable(
+                    sg["direction"], float(sg["entry"]), float(sg["stop"]), _created,
+                    float(_px), _now, _fr["4h"],
+                    trend_candles=(TR_PARAMS.trend_candles if TR_PARAMS else 2))
+                _out.append((sg, _v, None))
+            except Exception as e:
+                _out.append((sg, None, f"{type(e).__name__}: {e}"))
+        bar.empty()
+        st.session_state.viability = _out
+
+    for sg, _v, _err in st.session_state.get("viability", []):
+        with st.container(border=True):
+            st.markdown(f"**{sg['direction']} {sg['label'] or sg['ticker']}** — entry "
+                        f"{format_price(sg['entry'])}, stop {format_price(sg['stop'])}")
+            if _err or _v is None:
+                st.caption(f"Couldn't check: {_err}")
+                continue
+            box = {trade_review.STILL_VALID: st.success}.get(_v.verdict, st.warning)
+            box(f"**{_v.verdict}** · now {format_price(_v.price)}")
+            for why in _v.reasons:
+                st.caption(f"• {why}")
+            if _v.verdict != trade_review.STILL_VALID:
+                if st.button("Cancel this setup", key=f"vcancel_{int(sg['id'])}"):
+                    storage.update_signal(int(sg["id"]), status="EXPIRED",
+                                          exit_utc=datetime.now(timezone.utc).isoformat())
+                    st.session_state.viability = [
+                        x for x in st.session_state.viability if x[0]["id"] != sg["id"]]
+                    st.rerun()
+
     st.markdown("##### 🧠 Learn from the app's own trades")
     _tt = tracking.tracked_trades()
     _usable = [t for t in _tt if t.status in ("WIN", "LOSS") and t.features]
@@ -2613,7 +2831,8 @@ with tab_backtest:
         "pessimistically, so results lean worse rather than better."
     )
     bc1, bc2, bc3 = st.columns(3)
-    trb_size = bc1.selectbox("Coins", [5, 10, 20], index=1, key="trb_size")
+    trb_size = bc1.selectbox("Coins", [5, 10, 20, 30, 50], index=1, key="trb_size",
+                             format_func=lambda n: f"Top {n}")
     trb_days = bc2.selectbox("History", ["14 days", "30 days", "60 days"], index=1,
                              key="trb_days",
                              help="Longer history = more trades = more trustworthy, but slower.")
@@ -2631,19 +2850,19 @@ with tab_backtest:
     if st.button("▶ Run backtest", use_container_width=True, key="trb_run"):
         labels = list(CRYPTO_TICKERS)[:trb_size]
         results_on, results_off, results_rev, failures = [], [], [], []
+        sources = set()
         bar = st.progress(0.0, text="Starting…")
         for i_, lbl in enumerate(labels):
             tk = CRYPTO_TICKERS[lbl]
             bar.progress(i_ / len(labels), text=f"{i_ + 1}/{len(labels)} · {lbl}")
-            m5, err = exchanges.fetch_binance_history(tk, "5m", days * 288)
-            if m5 is None or m5.empty:
-                failures.append(f"{lbl}: {err or 'no 5m history'}")
+            m5, h1, h4, _src, _note = _backtest_frames(tk, days)
+            if m5 is None:
+                failures.append(f"{lbl}: {_note}")
                 continue
-            h1, _ = exchanges.fetch_binance_history(tk, "1h", days * 24 + 48)
-            h4, _ = exchanges.fetch_binance_history(tk, "4h", days * 6 + 30)
-            if h1 is None or h4 is None:
-                failures.append(f"{lbl}: missing 1H or 4H history")
-                continue
+            if _note:
+                sources.add(_note)
+            else:
+                sources.add(_src)
             results_on += trend_retrace.run_backtest(m5, h1, h4, tk, params=TR_PARAMS,
                                                       fee_r=trb_fee, enable_reentry=True)
             results_off += trend_retrace.run_backtest(m5, h1, h4, tk, params=TR_PARAMS,
@@ -2654,6 +2873,7 @@ with tab_backtest:
                                                        exit_stale_hours=trb_stale)
         bar.empty()
         st.session_state.trb = (results_on, results_off, failures)
+        st.session_state.trb_sources = sorted(sources)
         st.session_state.trb_review = results_rev
         if results_on:
             _ev = expectancy.EvidenceBook.from_trades(
@@ -2673,6 +2893,10 @@ with tab_backtest:
     trb = st.session_state.get("trb")
     if trb is not None:
         res_on, res_off, fails = trb
+        if st.session_state.get("trb_sources"):
+            st.caption("Candles from: " + ", ".join(st.session_state.trb_sources)
+                       + ". Prices on majors are near-identical across venues, so a "
+                         "backtest on one is a fair guide for trading another.")
         if not res_on:
             st.info("No trades were produced over this history.")
         else:
@@ -2794,12 +3018,12 @@ with tab_backtest:
                 } for t in res_on]), use_container_width=True, hide_index=True)
         for f_ in fails:
             st.caption(f"⚠️ Could not load {f_}")
-        if fails and not res_on and any("451" in f_ or "geo" in f_ for f_ in fails):
+        if fails and not res_on:
             st.error(
-                "Binance is geo-blocked from this server, and it's the only free source "
-                "with weeks of 5-minute history — Kraken serves only about 2.5 days, too "
-                "short to backtest. Running the app locally, from a region Binance serves, "
-                "would work.")
+                "No source could supply history for these coins. Bybit and Binance block "
+                "US-hosted servers, and Hyperliquid only lists a few hundred perps — so a "
+                "coin it doesn't list can't be backtested here. Running the app on your own "
+                "machine in Australia would reach Bybit and Binance directly.")
 
   else:
       st.subheader("Strategy backtest")

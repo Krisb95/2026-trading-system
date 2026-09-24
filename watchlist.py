@@ -17,8 +17,9 @@ import difflib
 import re
 
 # The trader's list, as given.
-DEFAULT_WATCHLIST = ("RSR, BTC, ETH, SOL, ZEC, HYPE, LIGHTER, TAO, NEAR, PUMP, DRV, "
-                     "SUI, UNI, RNDR, COMP, STACKS, IMMUTABLE, LINK, XRP, AVAX, INJ, ONDO")
+DEFAULT_WATCHLIST = ("RSR, BTC, ETH, SOL, ZEC, HYPE, LIGHTER, TAO, NEAR, PUMP, PONS, "
+                     "FETCH.AI, CASHCAT, SUI, UNI, RNDR, COMP, STACKS, IMMUTABLE, LINK, "
+                     "XRP, AVAX, INJ, ONDO")
 
 # Common names and old tickers mapped to the symbol venues use.
 ALIASES: Dict[str, str] = {
@@ -32,7 +33,7 @@ ALIASES: Dict[str, str] = {
     # Confirmed by the trader. Tickers get reused across projects, so these are
     # their call, not a guess: LIT is the market they mean by "Lighter", and DRV
     # by "Derive"/"Derivative".
-    "LIGHTER": "LIT", "DERIVE": "DRV", "DERIVATIVE": "DRV",
+    "LIGHTER": "LIT", "FETCHAI": "FET", "FETCH": "FET",
 }
 
 

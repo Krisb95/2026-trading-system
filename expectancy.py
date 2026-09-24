@@ -226,3 +226,24 @@ def simulate_expectations(win_rate: float, reward_risk: float, risk_pct: float =
         drawdown_typical_pct=float(np.median(drawdown)),
         drawdown_bad_pct=float(np.percentile(drawdown, 95)),
         chance_of_loss_pct=float((equity[:, -1] < 0).mean() * 100))
+
+
+def required_rr(win_rate: float, edge_per_trade: float = 0.0) -> Optional[float]:
+    """The reward:risk needed for a given win rate to produce a given edge.
+
+    Rearranged from expectancy = p*R - (1-p):   R = (edge + 1 - p) / p
+
+    This is the trade-off nobody escapes: a high win rate REQUIRES a small
+    reward relative to risk, and a large reward REQUIRES accepting a low win
+    rate. You can choose which side to sit on, not have both.
+    """
+    if not (0 < win_rate <= 1):
+        return None
+    return (edge_per_trade + 1.0 - win_rate) / win_rate
+
+
+def win_rate_needed(reward_risk: float, edge_per_trade: float = 0.0) -> Optional[float]:
+    """The win rate needed at this reward:risk to produce a given edge."""
+    if reward_risk <= 0:
+        return None
+    return (1.0 + edge_per_trade) / (1.0 + reward_risk)

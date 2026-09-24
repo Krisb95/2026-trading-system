@@ -49,6 +49,7 @@ WAIT_1H = "Waiting for 1H confirmation"
 NO_SUPPORT = "No 5m support found"
 WAIT_RETRACE = "Waiting for retrace"
 AT_ENTRY = "At entry now"
+LOW_QUALITY = "Rejected by quality filters"
 
 
 @dataclass
@@ -65,6 +66,14 @@ class StrategyParams:
     at_entry_atr: float = 0.3       # within this many 5m ATR = "at entry"
     swing_left: int = 3
     swing_right: int = 3
+    # --- optional quality filters -------------------------------------
+    # These go BEYOND the trader's three rules. They exist because two 4H
+    # candles and one 1H candle are weak filters on their own: in choppy
+    # markets both happen constantly by chance. Each can be switched off, and
+    # the backtest measures whether they help. Set to 0 to disable.
+    min_h1_body_ratio: float = 0.0   # 1H candle body as a share of its range
+    min_trend_move_atr: float = 0.0  # 4H trend move, in 4H ATR
+    max_extension_atr: float = 0.0   # distance from the 4H 20-period average
 
 
 @dataclass
@@ -88,6 +97,7 @@ class TrendRetracePlan:
     rules: Dict[str, RuleResult] = field(default_factory=dict)
     problems: List[str] = field(default_factory=list)
     features: Dict[str, object] = field(default_factory=dict)
+    quality_fails: List[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------
@@ -224,6 +234,47 @@ def compute_features(direction: str, price: float, entry: float, stop: float,
     return {k: v for k, v in feats.items() if v is not None}
 
 
+def quality_check(direction: str, price: float, df_4h: pd.DataFrame,
+                   df_1h: pd.DataFrame, params: StrategyParams) -> List[str]:
+    """Reasons this setup is weak, beyond the three core rules. Empty = fine."""
+    fails: List[str] = []
+
+    if params.min_h1_body_ratio > 0 and df_1h is not None and not df_1h.empty:
+        c = df_1h.iloc[-1]
+        rng = float(c["High"] - c["Low"])
+        body = abs(float(c["Close"] - c["Open"])) / rng if rng > 0 else 0.0
+        if body < params.min_h1_body_ratio:
+            fails.append(f"The 1H confirmation candle is weak — its body is only "
+                         f"{body * 100:.0f}% of its range (need "
+                         f"{params.min_h1_body_ratio * 100:.0f}%). A small body means "
+                         f"buyers and sellers finished roughly level.")
+
+    if params.min_trend_move_atr > 0 and df_4h is not None and len(df_4h) >= 15:
+        a4 = atr(df_4h)
+        n = params.trend_candles
+        if a4 and len(df_4h) >= n + 1:
+            first = float(df_4h["High"].iloc[-(n + 1)] if direction == "Long"
+                          else df_4h["Low"].iloc[-(n + 1)])
+            last = float(df_4h["High"].iloc[-1] if direction == "Long"
+                         else df_4h["Low"].iloc[-1])
+            move = abs(last - first) / a4
+            if move < params.min_trend_move_atr:
+                fails.append(f"The 4H trend is barely a trend — it has moved {move:.2f} ATR "
+                             f"over {n} candles (need {params.min_trend_move_atr:.2f}). "
+                             f"Marginally higher highs happen by chance in a range.")
+
+    if params.max_extension_atr > 0 and df_4h is not None and len(df_4h) >= 20:
+        a4 = atr(df_4h)
+        sma = float(df_4h["Close"].tail(20).mean())
+        if a4 and sma:
+            ext = abs(price - sma) / a4
+            if ext > params.max_extension_atr:
+                fails.append(f"Price is {ext:.1f} ATR from its 4H 20-period average (limit "
+                             f"{params.max_extension_atr:.1f}) — the move is extended, and "
+                             f"entering here is chasing.")
+    return fails
+
+
 def _grade(score: float) -> str:
     return "A+" if score >= 8 else "B" if score >= 6 else "C"
 
@@ -267,6 +318,8 @@ def analyze(ticker: str, df_4h: pd.DataFrame, df_1h: pd.DataFrame,
     plan = TrendRetracePlan(ticker, direction, NO_TREND, float(score), _grade(score),
                              price, rules=rules)
 
+    plan.quality_fails = quality_check(direction, price, df_4h, df_1h, params)
+
     if not rules["4h"].passed:
         plan.stage = NO_TREND
     elif not rules["1h"].passed:
@@ -276,6 +329,13 @@ def analyze(ticker: str, df_4h: pd.DataFrame, df_1h: pd.DataFrame,
     else:
         a = atr(df_5m) or 0.0
         plan.stage = AT_ENTRY if abs(price - level) <= a * params.at_entry_atr else WAIT_RETRACE
+
+    if plan.quality_fails and plan.stage in (WAIT_RETRACE, AT_ENTRY):
+        # The core rules pass, but the setup is weak. Say so rather than
+        # presenting it as a full-quality signal.
+        plan.stage = LOW_QUALITY
+        plan.score = min(plan.score, 7.0)
+        plan.grade = _grade(plan.score)
 
     if level is not None:
         stop, target, how = stop_and_target(direction, level, df_5m, df_4h, params)
@@ -442,7 +502,13 @@ def run_backtest(df_5m: pd.DataFrame, df_1h: pd.DataFrame, df_4h: pd.DataFrame,
         trend = trend_cache[i4]
 
         if state == "FLAT":
-            if trend and _h1_ok(i1, trend):
+            _quality_ok = True
+            if trend and (params.min_h1_body_ratio or params.min_trend_move_atr
+                          or params.max_extension_atr):
+                _quality_ok = not quality_check(
+                    trend, float(c5[k]), df_4h.iloc[:i4 + 1],
+                    df_1h.iloc[:i1 + 1] if i1 >= 0 else pd.DataFrame(), params)
+            if trend and _quality_ok and _h1_ok(i1, trend):
                 order = _new_order(k, trend, KIND_INITIAL, 1.0, i4)
                 if order:
                     state = "PENDING"
@@ -681,3 +747,22 @@ def scan_universe_tr(instruments, frame_loader, spot_loader=None,
 
     out.sort(key=key)
     return out
+
+
+def five_minute_levels(df_5m: pd.DataFrame, direction: str, price: float,
+                        params: Optional[StrategyParams] = None,
+                        limit: int = 6) -> List[float]:
+    """Every confirmed 5m support below price (resistance above, for a short),
+    nearest first. Used to build a laddered entry; the single-entry rule uses
+    only the first of these."""
+    params = params or StrategyParams()
+    if df_5m is None or len(df_5m) < params.swing_left + params.swing_right + 1:
+        return []
+    window = df_5m.iloc[-params.support_lookback:]
+    swings = [s for s in find_swing_points(window, params.swing_left, params.swing_right)
+              if s.confirmed]
+    kind = "low" if direction == "Long" else "high"
+    levels = [s.price for s in swings if s.kind == kind
+              and (s.price < price if direction == "Long" else s.price > price)]
+    levels.sort(reverse=(direction == "Long"))
+    return levels[:limit]

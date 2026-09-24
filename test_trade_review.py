@@ -138,3 +138,47 @@ class TestCostComparison(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSetupViability(unittest.TestCase):
+    """Re-checking a plan saved earlier: does it still describe this chart?"""
+
+    def _check(self, **kw):
+        from trade_review import setup_still_viable
+        args = dict(direction="Long", entry=100.0, stop=97.0, created=T0, price=100.5,
+                    now=T0 + pd.Timedelta(hours=2), df_4h=UP_4H)
+        args.update(kw)
+        return setup_still_viable(**args)
+
+    def test_recent_setup_in_a_live_trend_is_still_valid(self):
+        from trade_review import STILL_VALID
+        self.assertEqual(self._check().verdict, STILL_VALID)
+
+    def test_price_past_the_stop_is_invalidated(self):
+        from trade_review import INVALIDATED
+        self.assertEqual(self._check(price=96.0).verdict, INVALIDATED)
+
+    def test_reversed_trend_kills_it(self):
+        from trade_review import TREND_GONE
+        self.assertEqual(self._check(df_4h=DOWN_4H).verdict, TREND_GONE)
+
+    def test_old_setup_is_stale(self):
+        from trade_review import LEVELS_STALE
+        self.assertEqual(self._check(now=T0 + pd.Timedelta(hours=72)).verdict, LEVELS_STALE)
+
+    def test_price_running_away_means_the_entry_was_missed(self):
+        from trade_review import ENTRY_PASSED
+        self.assertEqual(self._check(price=110.0).verdict, ENTRY_PASSED)
+
+    def test_short_mirrors_the_checks(self):
+        from trade_review import INVALIDATED, ENTRY_PASSED
+        self.assertEqual(self._check(direction="Short", entry=100.0, stop=103.0,
+                                     price=104.0, df_4h=DOWN_4H).verdict, INVALIDATED)
+        self.assertEqual(self._check(direction="Short", entry=100.0, stop=103.0,
+                                     price=90.0, df_4h=DOWN_4H).verdict, ENTRY_PASSED)
+
+    def test_always_explains_itself(self):
+        for kw in ({}, {"price": 96.0}, {"df_4h": DOWN_4H}, {"price": 110.0}):
+            r = self._check(**kw)
+            self.assertTrue(r.reasons)
+            self.assertGreaterEqual(r.hours_old, 0)

@@ -61,19 +61,14 @@ def format_signed(value: Optional[float], significant: int = SIGNIFICANT_DIGITS)
     return f"{'-' if value < 0 else '+'}{body}"
 
 
-RR_REWARD_FIRST = "3.00 (reward:risk)"
-RR_RISK_FIRST = "1:3 (risk:reward)"
-RR_STYLES = [RR_REWARD_FIRST, RR_RISK_FIRST]
+def format_rr(value: Optional[float]) -> str:
+    """Reward:risk written as "3:1" — reward first, risk as 1.
 
-
-def format_rr(value: Optional[float], style: str = RR_REWARD_FIRST) -> str:
-    """Reward:risk in whichever direction the trader prefers to read it.
-
-    Both describe the same trade: risking 1 to make 3 is "3.00" as reward:risk
-    and "1:3" as risk:reward. Only the order changes, never the maths.
+    Whole numbers lose the decimals ("3:1", not "3.00:1"); anything else keeps
+    two ("2.47:1").
     """
     if value is None or not math.isfinite(value) or value <= 0:
         return "—"
-    if style == RR_RISK_FIRST:
-        return f"1:{value:.2f}".rstrip("0").rstrip(".") if value % 1 else f"1:{value:.0f}"
-    return f"{value:.2f}"
+    if abs(value - round(value)) < 0.005:
+        return f"{round(value):g}:1"
+    return f"{value:.2f}:1"

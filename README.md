@@ -327,3 +327,22 @@ cap. Descriptions are written from general knowledge and do not update
 themselves, so verify anything before acting on it. Any other ticker can be
 looked up live from CoinGecko, which returns the project's own description —
 useful for what a coin does, not for whether it is any good.
+
+## Laddered (scale-in) entries
+
+Optional, and offered only when the 5m chart shows more than one confirmed
+support below price — spaced at least 0.6 ATR apart and within 8 ATR. A single
+support means a single entry; extra levels are never invented.
+
+**The whole ladder risks one trade's risk.** Sizes are solved so that if every
+level fills and the stop is then hit, the loss equals your chosen risk — not
+that amount times the number of levels. Filling part of the ladder risks less.
+
+The stop sits beyond the furthest level, so it is further from price than a
+single entry would need: that is the cost of laddering. The gain is a better
+average entry and a better chance of being filled at all; the loss is being
+under-sized when price tags only the first level and runs.
+
+Sizing can be equal across levels or weighted towards the better prices. The
+backtest models single entries only, so there is no evidence yet that laddering
+helps this strategy — it is never the default.

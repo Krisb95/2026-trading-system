@@ -209,3 +209,75 @@ def review(direction: str, entry: float, stop: float, target: float,
                         mae_r=mae, hours_open=hours, thesis=thesis, stale=stale,
                         suggested_stop=new_stop if verdict in (TIGHTEN, HOLD) else None,
                         close_now_r=cur, stop_r=stop_r, target_r=target_r, actions=actions)
+
+
+# ---------------------------------------------------------------------
+# Re-checking a setup you saved earlier
+# ---------------------------------------------------------------------
+
+STILL_VALID = "Still valid"
+ENTRY_PASSED = "Entry already passed"
+TREND_GONE = "Trend no longer supports it"
+LEVELS_STALE = "Too old to trust"
+INVALIDATED = "Invalidated — price is past the stop"
+
+
+@dataclass
+class ViabilityResult:
+    verdict: str
+    reasons: List[str]
+    hours_old: float
+    distance_to_entry_pct: Optional[float]
+    price: float
+
+
+def setup_still_viable(direction: str, entry: float, stop: float, created: pd.Timestamp,
+                       price: float, now: pd.Timestamp, df_4h: pd.DataFrame,
+                       trend_candles: int = 2,
+                       max_age_hours: float = 48.0) -> ViabilityResult:
+    """Is a setup saved earlier still worth waiting for?
+
+    A plan made yesterday describes a chart that no longer exists. This
+    re-checks the parts that can go stale: the 4H trend it was built on, and
+    whether price has since blown past the entry or the stop.
+    """
+    from trend_retrace import four_hour_trend
+
+    reasons: List[str] = []
+    hours = max(0.0, (now - created).total_seconds() / 3600)
+    gap = ((entry - price) / price * 100) if price else None
+
+    beyond_stop = price <= stop if direction == "Long" else price >= stop
+    trend, trend_reason = four_hour_trend(df_4h, trend_candles)
+
+    if beyond_stop:
+        reasons.append(f"Price ({price:g}) is already past the planned stop ({stop:g}). "
+                       f"The level this setup was built on has broken.")
+        verdict = INVALIDATED
+    elif trend is not None and trend != direction:
+        reasons.append(f"The 4H candles now trend {trend.lower()}, against this "
+                       f"{direction.lower()} setup.")
+        verdict = TREND_GONE
+    elif hours > max_age_hours:
+        reasons.append(f"Saved {hours:.0f}h ago. The 5m support it was built on is long "
+                       f"gone — re-scan rather than trusting these levels.")
+        verdict = LEVELS_STALE
+    elif trend is None:
+        reasons.append(f"The 4H trend has paused: {trend_reason}")
+        verdict = TREND_GONE
+    else:
+        moved_away = (gap is not None
+                      and ((direction == "Long" and price > entry and gap < -5)
+                           or (direction == "Short" and price < entry and gap > 5)))
+        if moved_away:
+            reasons.append(f"Price has run {abs(gap):.1f}% away from the entry without "
+                           f"filling it. Chasing it now is the extended entry your rules "
+                           f"warn against.")
+            verdict = ENTRY_PASSED
+        else:
+            reasons.append(f"The 4H trend still runs {direction.lower()}, and price is "
+                           f"{abs(gap):.2f}% from the entry." if gap is not None
+                           else "The 4H trend still supports this setup.")
+            verdict = STILL_VALID
+    reasons.append(f"Saved {hours:.1f}h ago.")
+    return ViabilityResult(verdict, reasons, hours, gap, price)
