@@ -63,11 +63,12 @@ import grid as grid_mod
 import charting
 import patterns
 import uihelpers
+import swing
 from formatting import format_price, format_rr
 
 _REQUIRED = {
     coingecko: ['build_frames_v2', 'fetch_description', 'fetch_ohlc', 'fetch_period_changes', 'fetch_spot_price', 'has_api_key', 'search_coins', 'set_api_key'],
-    hyperliquid_data: ['MarketContext', 'fetch_candles', 'fetch_market_contexts', 'is_hl_ticker', 'rank_by_volume'],
+    hyperliquid_data: ['MarketContext', 'fetch_candles', 'fetch_candles_many', 'fetch_market_contexts', 'is_hl_ticker', 'rank_by_volume'],
     watchlist_mod: ['DEFAULT_WATCHLIST', '_normalise', 'parse_aliases', 'parse_list', 'resolve', 'search_markets', 'suggest'],
     sentiment: ['bucket', 'fetch_fear_greed', 'set_cmc_api_key'],
     market_tools: ['OVERBOUGHT', 'OVERSOLD', 'altcoin_season_index', 'flow_rows', 'most_crowded', 'rsi_row', 'rsi_state', 'turnover_ratio'],
@@ -80,12 +81,13 @@ _REQUIRED = {
     explain: ['AT_ENTRY', 'NO_TREND', 'WAIT_RETRACE', 'full_plan', 'short_plan'],
     trend_retrace: ['AT_ENTRY', 'KIND_INITIAL', 'STOP_BELOW_4H_CANDLE', 'STOP_BELOW_SUPPORT', 'StrategyParams', 'WAIT_RETRACE', 'analyze', 'atr', 'backtest_stats', 'drop_forming', 'five_minute_levels', 'frames_from_5m', 'reentry_plan_text', 'run_backtest', 'scan_universe_tr'],
     tracking: ['record_from_ranked', 'tracked_stats', 'tracked_trades', 'update_all'],
-    exchanges: ['build_frames', 'fetch_binance_history', 'fetch_binance_klines', 'fetch_bybit_klines', 'fetch_bybit_tickers', 'fetch_kraken_ohlc', 'fetch_spot'],
+    exchanges: ['blocked_hosts', 'build_frames', 'fetch_binance_history', 'fetch_binance_klines', 'fetch_bybit_klines', 'fetch_bybit_tickers', 'fetch_kraken_ohlc', 'fetch_spot'],
     coin_info: ['CATEGORIES', 'COINS', 'coverage', 'describe'],
     grid_mod: ['MIN_LEVELS', 'WEIGHTINGS', 'build_grid', 'usable_levels'],
     charting: ['INTERVALS', 'to_tradingview_symbol', 'widget_html'],
     patterns: ['bias_of', 'contradicts', 'detect', 'summarise'],
     uihelpers: ['scan_count'],
+    swing: ['SwingParams', 'analyze'],
 }
 
 _stale = sorted({f"{m.__name__.split('.')[-1]}.py" for m, attrs in _REQUIRED.items()
@@ -398,7 +400,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-24-b52 (parallel scanning within the rate budget)"
+APP_BUILD = "2026-09-24-b54 (Swing Levels strategy)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -506,12 +508,33 @@ st.sidebar.header("⚙️ Settings")
 st.sidebar.subheader("Strategy")
 strategy_choice = st.sidebar.radio(
     "Scanner strategy",
-    ["Trend Retrace (your strategy)", "Confluence (original)"],
+    ["Trend Retrace (your strategy)", "Swing Levels (daily, fewer decisions)",
+     "Confluence (original)"],
     key="strategy_choice",
     help="Trend Retrace: two 4H candles of HH/HL, a bullish 1H candle, then a 5m "
          "retrace to support (reverse for shorts). Confluence is the earlier 10-point "
          "checklist, kept for comparison.")
 USE_TR = strategy_choice.startswith("Trend")
+USE_SWING = strategy_choice.startswith("Swing")
+if USE_SWING:
+    with st.sidebar.expander("Swing settings", expanded=False):
+        st.caption("Daily candles: check once a day, hold for days or weeks. Built from "
+                   "standard swing-trading principles — major levels, trend agreement and "
+                   "a confirming candle — not anyone's proprietary system.")
+        _sw_touches = st.slider("Minimum touches for a level", 2, 5, 2, key="sw_touches",
+                                help="How many times price must have respected a level "
+                                     "before it counts. Higher means far fewer setups.")
+        _sw_rr = st.number_input("Minimum reward:risk", 1.0, 10.0, 3.0, 0.5, key="sw_rr")
+        _sw_stop = st.slider("Stop beyond the level (daily ATR)", 0.25, 3.0, 0.75, 0.25,
+                             key="sw_stop")
+        _sw_confirm = st.checkbox("Require a confirming daily candle", value=True,
+                                  key="sw_confirm",
+                                  help="A hammer or engulfing candle at the level. Without "
+                                       "it the level alone is the trigger.")
+    SWING_PARAMS = swing.SwingParams(min_touches=int(_sw_touches), min_rr=_sw_rr,
+                                      stop_atr=_sw_stop, require_pattern=_sw_confirm)
+else:
+    SWING_PARAMS = None
 
 if USE_TR:
     with st.sidebar.expander("Stop & take profit — please confirm", expanded=False):
@@ -1174,7 +1197,8 @@ with tab_scan:
         "overridable — ❔ means it could not be evaluated and scores zero rather than guessing."
     )
 
-    _modes = (["Rank the universe", "Auto-scan one instrument"] if USE_TR
+    _modes = (["Rank the universe", "Auto-scan one instrument"]
+              if (USE_TR or USE_SWING)
               else ["Rank the universe", "Auto-scan one instrument", "Manual checklist"])
     mode = st.radio("Mode", _modes, key="scan_mode",
                     help="Rank the universe checks many coins and shortlists the best; "
@@ -1594,20 +1618,27 @@ with tab_scan:
                     # limits total weight per minute, not the gap between
                     # calls, so 20 coins fit comfortably inside one window and
                     # finish in seconds instead of one request at a time.
-                    _bulk = {}
-                    _hl_names = [t for _l, t, _k in instruments
-                                 if hyperliquid_data.is_hl_ticker(t)]
-                    if _hl_names:
-                        bar.progress(0.0, text=f"Fetching {len(_hl_names)} coins…")
-                        _bulk = hyperliquid_data.fetch_candles_many(
-                            _hl_names, "5m", 1000,
+                    # Bulk-fetch EVERY crypto ticker, not just HL:-prefixed ones.
+                    # In market-cap mode the tickers look like BTC-USD, so the
+                    # old check never matched and every coin fell through to
+                    # the slow per-timeframe path.
+                    _bulk, _bulk_key = {}, {}
+                    if not NON_CRYPTO:
+                        for _l, _t, _k in instruments:
+                            _bulk_key[_t] = (_t if hyperliquid_data.is_hl_ticker(_t)
+                                             else f"HL:{_t.upper().replace('-USD', '')}")
+                        bar.progress(0.0, text=f"Fetching {len(_bulk_key)} coins…")
+                        _fetched = hyperliquid_data.fetch_candles_many(
+                            list(_bulk_key.values()), "5m", 1000,
                             progress=lambda i, n, nm: bar.progress(
                                 min(i / max(n, 1), 1.0), text=f"{i}/{n} · {nm}"))
+                        _bulk = {tk: _fetched.get(key) for tk, key in _bulk_key.items()}
 
                     def _tr_loader_capture(payload):
                         _tk = payload[0]
-                        if _tk in _bulk and _bulk[_tk] is not None and len(_bulk[_tk]) >= 720:
-                            frames = trend_retrace.frames_from_5m(_bulk[_tk])
+                        _pre = _bulk.get(_tk)
+                        if _pre is not None and len(_pre) >= 720:
+                            frames = trend_retrace.frames_from_5m(_pre)
                         else:
                             frames = _tr_loader(payload)
                         # Keep the 5m structure so a ladder can be offered later
@@ -1636,6 +1667,11 @@ with tab_scan:
                         direction_override=None if uni_direction == "Auto" else uni_direction,
                         progress_callback=_progress, spot_loader=_spot)
             bar.empty()
+            _blocked = exchanges.blocked_hosts()
+            if _blocked:
+                st.caption("Unreachable from this server, so skipped: "
+                           + ", ".join(sorted(_blocked)) + ". Candles came from "
+                           "Hyperliquid instead.")
             st.session_state.ranked = ranked
             if st.session_state.get("track_signals", True):
                 added = tracking.record_from_ranked(ranked, VENUE_TAGS, min_rr=MIN_RR)
@@ -1845,6 +1881,74 @@ with tab_scan:
                 with st.expander(f"⚠️ {len(failed)} instrument(s) could not be scored"):
                     for r in failed:
                         st.caption(f"**{r.label}** — {r.error}")
+
+        score_evidence, seq_evidence = {}, {}
+
+    elif mode == "Auto-scan one instrument" and USE_SWING:
+        sw1, sw2 = st.columns([3, 1])
+        _sw_market = sw1.selectbox("Market", ["Crypto", "Stocks", "Commodities", "FX"],
+                                   key="sw_market")
+        _sw_lists = {"Crypto": CRYPTO_TICKERS, "Stocks": STOCK_TICKERS,
+                     "Commodities": COMMODITY_TICKERS, "FX": FX_TICKERS}
+        _sw_name = sw2.selectbox("Instrument", list(_sw_lists[_sw_market]), key="sw_name")
+        _sw_ticker = _sw_lists[_sw_market][_sw_name]
+
+        st.caption("Checks daily candles: is there a clear daily trend, is price at a level "
+                   "the market has respected before, and has a confirming candle printed. "
+                   "One look a day is enough.")
+
+        if st.button("🔍 Check the daily chart", use_container_width=True):
+            with st.spinner("Loading daily candles…"):
+                _d = None
+                if _sw_market == "Crypto":
+                    _d, _e = hyperliquid_data.fetch_candles(
+                        f"HL:{_sw_ticker.upper().replace('-USD', '')}", "1d", 1000)
+                    if _d is None:
+                        _d, _e = exchanges.fetch_bybit_klines(_sw_ticker, "1d", limit=1000)
+                    if _d is None:
+                        _d, _e = exchanges.fetch_binance_klines(_sw_ticker, "1d", limit=1000)
+                else:
+                    _frames, _p = _yahoo_frames(_sw_ticker)
+                    _d = _frames.get("1d", pd.DataFrame())
+                    if _d is None or _d.empty:
+                        _hist = yf.Ticker(_sw_ticker).history(period="3y", interval="1d")
+                        _d = _hist.rename(columns=str.title) if _hist is not None else None
+                if _d is None or _d.empty:
+                    st.error("Couldn't load daily candles for this instrument.")
+                else:
+                    st.session_state.sw_plan = swing.analyze(_sw_ticker, _d,
+                                                             params=SWING_PARAMS)
+                    st.session_state.sw_bars = len(_d)
+
+        _swp = st.session_state.get("sw_plan")
+        if _swp is None:
+            st.info("Pick an instrument and press **Check the daily chart**.")
+        else:
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("Instrument", _swp.ticker)
+            h2.metric("Direction", _swp.direction or "—")
+            h3.metric("Score", f"{_swp.score:.0f}/10", _swp.grade)
+            h4.metric("Price", format_price(_swp.price))
+            st.markdown(f"##### Status: **{_swp.stage}**")
+            for r_ in _swp.reasons:
+                st.caption(f"• {r_}")
+            if _swp.entry and _swp.stop and _swp.target:
+                e1, e2, e3, e4 = st.columns(4)
+                e1.metric("Entry (limit)", format_price(_swp.entry))
+                e2.metric("Stop", format_price(_swp.stop))
+                e3.metric("Target", format_price(_swp.target))
+                e4.metric("R:R", format_rr(_swp.reward_risk))
+                _szs = _size_plan(_swp.direction, _swp.entry, _swp.stop, _swp.target,
+                                   _swp.ticker)
+                _render_size(_szs)
+                _take_trade_widget(f"sw_{_swp.ticker}", _swp.ticker, _swp.direction,
+                                   _swp.entry, _swp.stop, _swp.target,
+                                   features=_swp.features, score=_swp.score,
+                                   grade=_swp.grade,
+                                   reason=f"Swing Levels: {_swp.stage}",
+                                   suggested_qty=_szs.quantity if _szs else 0.0)
+            st.caption(f"Read from {st.session_state.get('sw_bars', 0)} daily candles. "
+                       f"Trades typically last days to weeks — check once a day.")
 
         score_evidence, seq_evidence = {}, {}
 
@@ -2190,7 +2294,7 @@ with tab_scan:
     # The confluence score/readiness panel only applies to the original
     # strategy's single-coin and manual modes. Under Trend Retrace, or after a
     # universe scan, it would show a meaningless score built from no evidence.
-    if not USE_TR and mode != "Rank the universe":
+    if not USE_TR and not USE_SWING and mode != "Rank the universe":
         st.markdown("---")
         result = score_setup(score_evidence)
         r1, r2 = st.columns([1, 2])
