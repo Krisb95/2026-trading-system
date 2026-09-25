@@ -38,9 +38,6 @@ def kraken_rows(n=50):
 
 
 class TestSymbolMapping(unittest.TestCase):
-    def setUp(self):
-        exchanges.reset_blocked_hosts()
-
     def test_binance_uses_usdt_pairs(self):
         self.assertEqual(to_binance_symbol("BTC-USD"), "BTCUSDT")
         self.assertEqual(to_binance_symbol("SOL-USD"), "SOLUSDT")
@@ -60,7 +57,6 @@ class TestSymbolMapping(unittest.TestCase):
 
 class TestBinance(unittest.TestCase):
     def setUp(self):
-        exchanges.reset_blocked_hosts()
         self.original = exchanges.requests.get
 
     def tearDown(self):
@@ -105,7 +101,6 @@ class TestBinance(unittest.TestCase):
 
 class TestKraken(unittest.TestCase):
     def setUp(self):
-        exchanges.reset_blocked_hosts()
         self.original = exchanges.requests.get
 
     def tearDown(self):
@@ -135,7 +130,6 @@ class TestKraken(unittest.TestCase):
 
 class TestFallbackBehaviour(unittest.TestCase):
     def setUp(self):
-        exchanges.reset_blocked_hosts()
         self.original = exchanges.requests.get
 
     def tearDown(self):
@@ -205,7 +199,6 @@ class TestBinanceHistoryPaging(unittest.TestCase):
     """Binance caps a request at 1,000 candles; history beyond that is paged."""
 
     def setUp(self):
-        exchanges.reset_blocked_hosts()
         self.original = exchanges.requests.get
 
     def tearDown(self):
@@ -274,7 +267,6 @@ def bybit_ok(payload):
 
 class TestBybit(unittest.TestCase):
     def setUp(self):
-        exchanges.reset_blocked_hosts()
         self.orig = exchanges.requests.get
 
     def tearDown(self):
@@ -343,74 +335,3 @@ class TestBybit(unittest.TestCase):
             {"list": [{"symbol": "BTCUSDT", "lastPrice": "82000"}]})
         price, err = exchanges.fetch_bybit_price("BTC-USD")
         self.assertAlmostEqual(price, 82000.0)
-
-
-class TestBlockedHostsAreRememberedNotRetried(unittest.TestCase):
-    """A geo-block is permanent. Retrying it for every coin and timeframe is
-    what turned a 20-coin scan into a 15-minute wait."""
-
-    def setUp(self):
-        exchanges.reset_blocked_hosts()
-        self.orig = exchanges.requests.get
-        exchanges.reset_blocked_hosts()
-
-    def tearDown(self):
-        exchanges.requests.get = self.orig
-        exchanges.reset_blocked_hosts()
-
-    def test_geo_block_is_not_retried(self):
-        calls = {"n": 0}
-
-        def _get(url, params=None, **k):
-            calls["n"] += 1
-            return FakeResp({}, status_code=451)
-
-        exchanges.requests.get = _get
-        exchanges.fetch_binance_klines("BTC-USD", "4h")
-        self.assertEqual(calls["n"], 1, "a 451 must not be retried")
-
-    def test_later_calls_skip_the_host_entirely(self):
-        calls = {"n": 0}
-
-        def _get(url, params=None, **k):
-            calls["n"] += 1
-            return FakeResp({}, status_code=451)
-
-        exchanges.requests.get = _get
-        for _ in range(10):
-            exchanges.fetch_binance_klines("BTC-USD", "4h")
-        self.assertEqual(calls["n"], 1, "the host should be tried once, then remembered")
-
-    def test_403_is_treated_the_same_way(self):
-        calls = {"n": 0}
-
-        def _get(url, params=None, **k):
-            calls["n"] += 1
-            return FakeResp({}, status_code=403)
-
-        exchanges.requests.get = _get
-        exchanges.fetch_bybit_tickers()
-        self.assertLessEqual(calls["n"], 2, "one attempt per Bybit host, no retries")
-
-    def test_blocked_hosts_are_reported(self):
-        exchanges.requests.get = lambda *a, **k: FakeResp({}, status_code=451)
-        exchanges.fetch_binance_klines("BTC-USD", "4h")
-        self.assertTrue(any("binance" in h for h in exchanges.blocked_hosts()))
-
-    def test_an_ordinary_failure_is_still_retried(self):
-        calls = {"n": 0}
-
-        def _get(url, params=None, **k):
-            calls["n"] += 1
-            raise ConnectionError("blip")
-
-        exchanges.requests.get = _get
-        exchanges.configure(max_retries=2, backoff=0.0, spacing=0.0)
-        exchanges.fetch_binance_klines("BTC-USD", "4h")
-        exchanges.configure()
-        self.assertEqual(calls["n"], 3, "transient errors should still retry")
-
-    def test_a_working_host_is_never_blocked(self):
-        exchanges.requests.get = lambda *a, **k: FakeResp(binance_rows())
-        exchanges.fetch_binance_klines("BTC-USD", "4h")
-        self.assertEqual(exchanges.blocked_hosts(), {})

@@ -44,27 +44,6 @@ _MIN_SPACING = 0.15          # exchanges tolerate far more traffic than CoinGeck
 _last_call = {"t": 0.0}
 _SETTINGS = {"max_retries": 2, "backoff": 1.0, "spacing": _MIN_SPACING}
 
-# A geo-block is permanent for the life of the process: the server's location
-# will not change between requests. Retrying one — three attempts with backoff,
-# for every coin and every timeframe — turned a 20-coin scan into a 15-minute
-# wait. Once a host answers 403 or 451 it is skipped instantly thereafter.
-PERMANENT_STATUSES = (401, 403, 451)
-_blocked_hosts: Dict[str, str] = {}
-
-
-def _host_of(url: str) -> str:
-    from urllib.parse import urlsplit
-    return urlsplit(url).netloc
-
-
-def blocked_hosts() -> Dict[str, str]:
-    """Hosts found unreachable this session, and why."""
-    return dict(_blocked_hosts)
-
-
-def reset_blocked_hosts() -> None:
-    _blocked_hosts.clear()
-
 
 def configure(max_retries: int = 2, backoff: float = 1.0, spacing: float = 0.15) -> None:
     """Tune retry behaviour. Tests set these to zero so no real sleeping occurs."""
@@ -74,15 +53,7 @@ def configure(max_retries: int = 2, backoff: float = 1.0, spacing: float = 0.15)
 
 
 def _get(url, params, timeout=10):
-    """GET with light spacing and retry. Returns (response, error).
-
-    Hosts that have already refused on location grounds are skipped without a
-    request or a pause.
-    """
-    host = _host_of(url)
-    if host in _blocked_hosts:
-        return None, _blocked_hosts[host]
-
+    """GET with light spacing and retry. Returns (response, error)."""
     last_error = None
     for attempt in range(_SETTINGS["max_retries"] + 1):
         wait = _SETTINGS["spacing"] - (time.time() - _last_call["t"])
@@ -91,11 +62,8 @@ def _get(url, params, timeout=10):
         try:
             resp = requests.get(url, params=params, timeout=timeout)
             _last_call["t"] = time.time()
-            if resp.status_code in PERMANENT_STATUSES:
-                msg = (f"{resp.status_code} — this exchange is geo-blocked from this "
-                       f"server.")
-                _blocked_hosts[host] = msg      # never try this host again
-                return None, msg
+            if resp.status_code == 451:
+                return None, "451 — this exchange is geo-blocked from this server."
             if resp.status_code == 429:
                 last_error = "429 rate limited"
                 if attempt < _SETTINGS["max_retries"]:

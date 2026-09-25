@@ -766,23 +766,3 @@ def five_minute_levels(df_5m: pd.DataFrame, direction: str, price: float,
               and (s.price < price if direction == "Long" else s.price > price)]
     levels.sort(reverse=(direction == "Long"))
     return levels[:limit]
-
-
-def frames_from_5m(df_5m: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """Build the 1H and 4H frames by aggregating 5m candles.
-
-    One request instead of three. The result is identical data — a 4H candle is
-    by definition the open, high, low and close of its 48 five-minute candles —
-    so nothing is approximated. It simply removes two round trips per coin,
-    which is most of the scan time when a venue rate-limits requests.
-
-    Needs enough history: 15 complete 4H candles (for ATR) is 720 5m candles.
-    """
-    if df_5m is None or df_5m.empty:
-        return {"5m": pd.DataFrame(), "1h": pd.DataFrame(), "4h": pd.DataFrame()}
-    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
-    if "Volume" in df_5m.columns:
-        agg["Volume"] = "sum"
-    one_h = df_5m.resample("1h", label="left", closed="left").agg(agg).dropna(subset=["Close"])
-    four_h = df_5m.resample("4h", label="left", closed="left").agg(agg).dropna(subset=["Close"])
-    return {"5m": df_5m, "1h": one_h, "4h": four_h}
