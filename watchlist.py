@@ -17,9 +17,17 @@ import difflib
 import re
 
 # The trader's list, as given.
-DEFAULT_WATCHLIST = ("RSR, BTC, ETH, SOL, ZEC, HYPE, LIGHTER, TAO, NEAR, PUMP, PONS, "
-                     "FETCH.AI, CASHCAT, SUI, UNI, RNDR, COMP, STACKS, IMMUTABLE, LINK, "
-                     "XRP, AVAX, INJ, ONDO")
+DEFAULT_WATCHLIST = ("RSR, BTC, ETH, SOL, ZEC, HYPE, LIGHTER, TAO, NEAR, PONS, "
+                     "FETCH.AI, SUI, UNI, RNDR, COMP, STACKS, IMMUTABLE, LINK, "
+                     "XRP, AVAX, INJ, ONDO, WLD, GRT, AAVE, LDO, PYTH, TIA, ARB, ATOM")
+
+# Memecoins are kept apart deliberately. They move on attention rather than
+# anything measurable, so mixing them into the main list makes a scan's results
+# harder to read — and worth judging separately once forward tracking has
+# enough trades to compare the two.
+MEME_WATCHLIST = ("FARTCOIN, PUMP, WIF, PEPE, BONK, DOGE, SHIB, POPCAT, MEW, SPX")
+
+WATCHLISTS = {"Main": DEFAULT_WATCHLIST, "Memes": MEME_WATCHLIST}
 
 # Common names and old tickers mapped to the symbol venues use.
 ALIASES: Dict[str, str] = {

@@ -72,7 +72,8 @@ class TestResolving(unittest.TestCase):
 
     def test_default_watchlist_resolves_fully_on_a_venue_listing_everything(self):
         found, missing = resolve(DEFAULT_WATCHLIST,
-                                 MARKETS + ["LIT", "FET", "PONS", "CASHCAT"])
+                                 MARKETS + ["LIT", "FET", "PONS", "WLD", "GRT", "AAVE",
+                                            "LDO", "PYTH", "TIA", "ARB", "ATOM"])
         self.assertEqual(missing, [])
 
     def test_empty_input(self):
@@ -149,8 +150,11 @@ class TestTraderConfirmedAliases(unittest.TestCase):
         self.assertNotIn("WBT", DEFAULT_WATCHLIST)
 
     def test_new_coins_are_in_the_default_list(self):
-        for name in ("PONS", "FETCH.AI", "CASHCAT"):
+        for name in ("PONS", "FETCH.AI", "WLD", "PYTH", "GRT"):
             self.assertIn(name, DEFAULT_WATCHLIST)
+
+    def test_cashcat_removed(self):
+        self.assertNotIn("CASHCAT", DEFAULT_WATCHLIST)
 
     def test_alias_does_not_help_if_the_market_is_not_listed(self):
         found, missing = resolve("LIGHTER, Derivative", MARKETS)   # no LIT, no DRV
@@ -162,3 +166,32 @@ class TestTraderConfirmedAliases(unittest.TestCase):
         found, missing = resolve("CARDS", MARKETS + ["CARDS"])
         self.assertEqual(found[0].market, "CARDS")
         self.assertEqual(missing, [])
+
+
+class TestSeparateWatchlists(unittest.TestCase):
+    def test_memes_are_kept_out_of_the_main_list(self):
+        from watchlist import DEFAULT_WATCHLIST, MEME_WATCHLIST
+        for meme in ("FARTCOIN", "WIF", "PEPE", "BONK", "DOGE"):
+            self.assertNotIn(meme, DEFAULT_WATCHLIST)
+            self.assertIn(meme, MEME_WATCHLIST)
+
+    def test_pump_moved_to_the_meme_list(self):
+        from watchlist import DEFAULT_WATCHLIST, MEME_WATCHLIST
+        self.assertNotIn("PUMP", DEFAULT_WATCHLIST)
+        self.assertIn("PUMP", MEME_WATCHLIST)
+
+    def test_fartcoin_is_present(self):
+        from watchlist import MEME_WATCHLIST
+        self.assertIn("FARTCOIN", MEME_WATCHLIST)
+
+    def test_both_lists_are_registered(self):
+        from watchlist import WATCHLISTS
+        self.assertEqual(set(WATCHLISTS), {"Main", "Memes"})
+
+    def test_meme_list_resolves_against_a_venue(self):
+        from watchlist import MEME_WATCHLIST
+        found, missing = resolve(MEME_WATCHLIST,
+                                 ["FARTCOIN", "PUMP", "WIF", "kPEPE", "kBONK", "DOGE"])
+        got = {r.market for r in found}
+        self.assertIn("FARTCOIN", got)
+        self.assertIn("kPEPE", got)      # bundled coins match their underlying symbol
