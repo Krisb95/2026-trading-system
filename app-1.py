@@ -87,7 +87,7 @@ _REQUIRED = {
     charting: ['INTERVALS', 'to_tradingview_symbol', 'widget_html'],
     patterns: ['bias_of', 'contradicts', 'detect', 'summarise'],
     uihelpers: ['scan_count'],
-    swing: ['SwingParams', 'analyze'],
+    swing: ['SwingParams', 'analyze', 'run_backtest', 'scan_universe'],
 }
 
 _stale = sorted({f"{m.__name__.split('.')[-1]}.py" for m, attrs in _REQUIRED.items()
@@ -400,7 +400,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-25-b57 (save and re-check past setups)"
+APP_BUILD = "2026-09-26-b58 (Swing Levels: default, universe scan, backtest)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -498,7 +498,7 @@ st.sidebar.header("⚙️ Settings")
 st.sidebar.subheader("Strategy")
 strategy_choice = st.sidebar.radio(
     "Scanner strategy",
-    ["Trend Retrace (your strategy)", "Swing Levels (daily, fewer decisions)",
+    ["Swing Levels (daily — fewer decisions)", "Trend Retrace (5-minute)",
      "Confluence (original)"],
     key="strategy_choice",
     help="Trend Retrace: two 4H candles of HH/HL, a bullish 1H candle, then a 5m "
@@ -1394,7 +1394,18 @@ with tab_scan:
                 "⚠️ High volume outside the top coins often means a sharp move, news or a "
                 "pump. These markets are usually more volatile, and your strategy hasn't "
                 "been backtested on them — treat results with extra caution.")
-        if USE_TR:
+        if USE_SWING:
+            st.caption(
+                "Applies the swing rules to each instrument's **daily** chart: a clear "
+                "daily trend, price at a level the market has respected before, and a "
+                "confirming daily candle. Most instruments will show nothing on most "
+                "days — that is the point of a higher-timeframe strategy."
+            )
+            universe_size = st.selectbox(
+                "Scan the top…", [10, 20, 30, 50, 100], index=1, key="uni_size",
+                format_func=lambda n: f"Top {n} by market cap")
+            uni_direction, uni_min_rr = "Auto", SWING_PARAMS.min_rr if SWING_PARAMS else 3.0
+        elif USE_TR:
             st.caption(
                 "Applies your three rules to each coin: **two 4H candles of higher highs and "
                 "higher lows**, a **bullish 1H candle**, and a **5m retrace to previous "
@@ -1614,7 +1625,47 @@ with tab_scan:
                                 else pd.DataFrame()) for k in ("4h", "1h", "5m")}
                 return out
 
-            if USE_TR:
+            if USE_SWING:
+                _daily_cache = {}
+
+                def _daily_loader(payload):
+                    tk = payload[0] if isinstance(payload, tuple) else payload
+                    if tk in _daily_cache:
+                        return _daily_cache[tk]
+                    df = None
+                    if NON_CRYPTO:
+                        _fr, _p = _yahoo_frames(tk)
+                        df = _fr.get("1d")
+                        if df is None or df.empty:
+                            _h = yf.Ticker(tk).history(period="3y", interval="1d")
+                            df = _h.rename(columns=str.title) if _h is not None else None
+                    else:
+                        base = tk.upper().replace("HL:", "").replace("-USD", "")
+                        df = _bulk_daily.get(base)
+                        if df is None:
+                            df, _e = exchanges.fetch_bybit_klines(tk, "1d", limit=1000)
+                        if df is None:
+                            df, _e = exchanges.fetch_binance_klines(tk, "1d", limit=1000)
+                    _daily_cache[tk] = df
+                    return df
+
+                # One daily request per coin, in parallel within the budget.
+                _bulk_daily = {}
+                if not NON_CRYPTO:
+                    _names = [f"HL:{t.upper().replace('HL:', '').replace('-USD', '')}"
+                              for _l, t, _k in instruments]
+                    bar.progress(0.0, text=f"Fetching {len(_names)} daily charts…")
+                    _got = hyperliquid_data.fetch_candles_many(
+                        _names, "1d", 1000,
+                        progress=lambda i, n, nm: bar.progress(
+                            min(i / max(n, 1), 1.0), text=f"{i}/{n} · {nm}"))
+                    _bulk_daily = {k.replace("HL:", ""): v for k, v in _got.items()}
+
+                with st.spinner("Applying the swing rules…"):
+                    ranked = swing.scan_universe(
+                        instruments, _daily_loader, spot_loader=_spot,
+                        params=SWING_PARAMS, progress=_progress)
+            elif USE_TR:
                 with st.spinner("Scanning…"):
                     _extra = {"sentiment": sentiment.bucket(_fg["value"])} if _fg else None
                     _level_cache = {}
@@ -3248,7 +3299,106 @@ with tab_track:
             st.error(str(e))
 
 with tab_backtest:
-  if USE_TR:
+  if USE_SWING:
+    st.subheader("Backtest — Swing Levels")
+    st.caption(
+        "Replays the swing rules over daily history. Daily candles go back years, so "
+        "unlike the 5-minute strategy this can be tested over real market conditions "
+        "rather than a fortnight. At each step only candles that had already closed are "
+        "visible."
+    )
+    st.warning(
+        "No strategy guarantees profit. This shows how the rules would have performed on "
+        "past data. Ambiguous candles resolve pessimistically, so results lean worse "
+        "rather than better."
+    )
+    sb1, sb2 = st.columns(2)
+    swb_size = sb1.selectbox("Coins", [5, 10, 20, 30], index=1, key="swb_size",
+                             format_func=lambda n: f"Top {n}")
+    swb_fee = sb2.number_input("Costs per trade (R)", min_value=0.0, value=0.05, step=0.01,
+                               format="%.2f", key="swb_fee")
+    swb_confirm = st.checkbox("Require a confirming daily candle", value=True,
+                              key="swb_confirm",
+                              help="Off takes many more trades — worth testing both ways.")
+
+    if st.button("▶ Run swing backtest", use_container_width=True, key="swb_run"):
+        labels = list(CRYPTO_TICKERS)[:swb_size]
+        trades, fails, srcs = [], [], set()
+        bar = st.progress(0.0, text="Starting…")
+        for i_, lbl in enumerate(labels):
+            tk = CRYPTO_TICKERS[lbl]
+            bar.progress(i_ / max(len(labels), 1), text=f"{i_ + 1}/{len(labels)} · {lbl}")
+            base = tk.upper().replace("-USD", "")
+            df, err = hyperliquid_data.fetch_candles(f"HL:{base}", "1d", 1000)
+            src = "Hyperliquid"
+            if df is None or len(df) < 200:
+                df, err = exchanges.fetch_bybit_klines(tk, "1d", limit=1000)
+                src = "Bybit"
+            if df is None or len(df) < 200:
+                df, err = exchanges.fetch_binance_klines(tk, "1d", limit=1000)
+                src = "Binance"
+            if df is None or len(df) < 200:
+                fails.append(f"{lbl}: {err or 'not enough daily history'}")
+                continue
+            srcs.add(f"{src} ({len(df)} days)")
+            trades += swing.run_backtest(df, tk, params=SWING_PARAMS, fee_r=swb_fee,
+                                          require_confirmation=swb_confirm)
+        bar.empty()
+        st.session_state.swb = (trades, fails, sorted(srcs))
+
+    _swb = st.session_state.get("swb")
+    if _swb:
+        trades, fails, srcs = _swb
+        if srcs:
+            st.caption("Daily candles from: " + ", ".join(srcs) + ".")
+        if not trades:
+            st.info("No setups met the rules over this history. With a confirming candle "
+                    "required and a 3:1 minimum, that can happen — try switching the "
+                    "confirmation off, or scanning more coins.")
+        else:
+            stats = stats_by_grade(trades)
+            st.dataframe(pd.DataFrame([{
+                "Grade": s_.grade, "Signals": s_.signals, "Filled": s_.filled,
+                "Wins": s_.wins, "Losses": s_.losses, "Expired": s_.expired,
+                "Win rate": f"{s_.win_rate:.0%}" if s_.win_rate is not None else "—",
+                "Avg R / trade": f"{s_.avg_r:+.2f}" if s_.avg_r is not None else "—",
+                "Total R": f"{s_.total_r:+.1f}",
+                "Enough data?": "yes" if s_.enough_data else "no (<30)",
+            } for s_ in stats]), use_container_width=True, hide_index=True)
+            v = verdict(stats)
+            (st.success if "separated better" in v else st.warning)(v)
+
+            _all = next(x for x in stats if x.grade == "All")
+            _resolved = _all.wins + _all.losses
+            if _resolved >= 10 and _all.win_rate is not None:
+                _rr = SWING_PARAMS.min_rr if SWING_PARAMS else 3.0
+                ex = expectancy.simulate_expectations(_all.win_rate, _rr,
+                                                       risk_pct=RISK_PCT, n_trades=100)
+                st.caption(
+                    f"At this win rate ({_all.win_rate:.0%}) and {_rr:g}:1, expect "
+                    f"{ex.expected_total_pct:+.0f}% over 100 trades, a losing streak of "
+                    f"about {ex.streak_typical} (up to {ex.streak_bad}), and a worst "
+                    f"drop of around {ex.drawdown_typical_pct:.0f}%.")
+
+            _m = learning.learn([t for t in trades], source=f"swing backtest, {len(trades)}")
+            st.markdown("##### 🧠 What the system learned")
+            _render_learned(_m)
+            _md = _m.to_dict()
+            _md["config"] = _config_signature(False, None) + "|SWING"
+            storage.save_value("learned_model", _md)
+
+            with st.expander(f"All {len(trades)} simulated trades"):
+                st.dataframe(pd.DataFrame([{
+                    "Coin": t.ticker, "Signal": t.signal_time, "Dir": t.direction,
+                    "Grade": t.grade, "Entry": format_price(t.entry),
+                    "Stop": format_price(t.stop), "Target": format_price(t.target),
+                    "Outcome": t.status,
+                    "R": f"{t.r_result:+.2f}" if t.r_result is not None else "—",
+                } for t in trades]), use_container_width=True, hide_index=True)
+        for f_ in fails:
+            st.caption(f"⚠️ {f_}")
+
+  elif USE_TR:
     st.subheader("Backtest — Trend Retrace (your strategy)")
     st.caption(
         "Replays your rules candle by candle on 5-minute data: two 4H HH/HL candles, a "

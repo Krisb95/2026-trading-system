@@ -366,3 +366,58 @@ def run_backtest(df_daily: pd.DataFrame, ticker: str,
         else:
             busy_until = len(df_daily)
     return trades
+
+
+def scan_universe(instruments, frame_loader, spot_loader=None,
+                  params: Optional[SwingParams] = None, progress=None):
+    """Rank many instruments on the swing rules.
+
+    instruments:  list of (label, ticker, fetch_key)
+    frame_loader: fetch_key -> daily OHLC DataFrame (closed candles only)
+    Returns scanner.RankedCandidate rows so the existing results table,
+    filters, saving and tracking all work unchanged.
+    """
+    from scanner import RankedCandidate
+
+    params = params or SwingParams()
+    out = []
+    total = len(instruments)
+    for i, (label, ticker, key) in enumerate(instruments):
+        if progress:
+            progress(i, total, label)
+        try:
+            daily = frame_loader(key)
+            if daily is None or daily.empty:
+                out.append(RankedCandidate(ticker, label, None, 0.0, "—", "unknown",
+                                            None, None, None, None,
+                                            error="No daily candles returned."))
+                continue
+            live = None
+            if spot_loader is not None:
+                try:
+                    live = spot_loader(key)
+                except Exception:
+                    live = None
+            plan = analyze(ticker, daily, price=live, params=params)
+            out.append(RankedCandidate(
+                ticker=ticker, label=label, direction=plan.direction, score=plan.score,
+                grade=plan.grade, regime=plan.stage, price=plan.price, stop=plan.stop,
+                target=plan.target, reward_risk=plan.reward_risk,
+                note="; ".join(plan.reasons[:3]), entry_status=plan.stage,
+                entry=plan.entry, price_is_live=live is not None,
+                features=plan.features or None))
+        except Exception as e:
+            out.append(RankedCandidate(ticker, label, None, 0.0, "—", "unknown",
+                                        None, None, None, None,
+                                        error=f"{type(e).__name__}: {e}"))
+    if progress:
+        progress(total, total, "done")
+
+    stage_rank = {CONFIRMED: 0, AT_LEVEL: 1, APPROACHING: 2, NO_LEVEL: 3, NO_TREND: 4}
+
+    def key_fn(r):
+        dist = abs(r.entry - r.price) / r.price if (r.entry and r.price) else 9e9
+        return (r.error is not None, -r.score, stage_rank.get(r.entry_status, 9), dist)
+
+    out.sort(key=key_fn)
+    return out

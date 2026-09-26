@@ -33,13 +33,18 @@ def record_from_ranked(ranked, tags: Optional[Dict[str, List[str]]] = None,
                         expiry_hours: float = DEFAULT_EXPIRY_HOURS,
                         grades=TRACKED_GRADES, db_path: str = storage.DEFAULT_DB_PATH,
                         min_rr: float = 0.0) -> int:
+    """grades=None records every setup with a complete plan, whatever its grade.
+
+    Recording the weaker ones too is what lets you compare grades later — and
+    it means a setup you looked at last week is still there to re-check, rather
+    than only the ones that happened to be A+ at the time."""
     """Store every qualifying setup from a universe scan. Returns count added.
 
     min_rr: setups below this reward:risk are not recorded — tracking only
     what you would actually trade keeps the track record meaningful."""
     added = 0
     for r in ranked:
-        if r.error or r.grade not in grades:
+        if r.error or (grades is not None and r.grade not in grades):
             continue
         if r.reward_risk is None or r.reward_risk < min_rr - 1e-9:
             continue
@@ -163,3 +168,20 @@ def tracked_trades(db_path: str = storage.DEFAULT_DB_PATH) -> List[TrackedTrade]
             r_result=None if pd.isna(r["r_result"]) else float(r["r_result"]),
             status=r["status"], ticker=r["ticker"], direction=r["direction"]))
     return out
+
+
+def record_one(plan_like, source: str = "manual", expiry_hours: float = DEFAULT_EXPIRY_HOURS,
+               db_path: str = storage.DEFAULT_DB_PATH) -> Optional[int]:
+    """Save a single setup from a one-off check, so it can be re-checked later."""
+    if None in (getattr(plan_like, "entry", None), getattr(plan_like, "stop", None),
+                getattr(plan_like, "target", None), getattr(plan_like, "direction", None)):
+        return None
+    return storage.record_signal({
+        "ticker": plan_like.ticker, "label": getattr(plan_like, "label", plan_like.ticker),
+        "direction": plan_like.direction, "score": getattr(plan_like, "score", None),
+        "grade": getattr(plan_like, "grade", None), "entry": plan_like.entry,
+        "stop": plan_like.stop, "target": plan_like.target,
+        "planned_rr": getattr(plan_like, "reward_risk", None),
+        "expiry_hours": expiry_hours, "source": source,
+        "features": json.dumps(getattr(plan_like, "features", None) or {}) or None,
+    }, db_path=db_path)
