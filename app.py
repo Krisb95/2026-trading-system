@@ -7,6 +7,7 @@ platform. Setup scores measure checklist confluence only; they are not
 win-probability estimates, edge claims, or profitability guarantees.
 """
 
+import importlib
 import streamlit as st
 import streamlit.components.v1 as components
 import yfinance as yf
@@ -61,12 +62,30 @@ import theme
 import coin_info
 import grid as grid_mod
 import charting
-import strategy_chart
-import stop_manager
 import patterns
 import uihelpers
-import swing
 from formatting import format_price, format_rr
+
+
+def _optional(name):
+    """Import a module that adds a feature, or return None if it isn't there.
+
+    These arrived in later builds, and a part-finished upload shouldn't take
+    the whole app down — the feature that needs the file says what's missing,
+    and everything else carries on working.
+    """
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        return None
+
+
+strategy_chart = _optional("strategy_chart")
+stop_manager = _optional("stop_manager")
+swing = _optional("swing")
+_MISSING_MODULES = [n for n, m in (("strategy_chart.py", strategy_chart),
+                                    ("stop_manager.py", stop_manager),
+                                    ("swing.py", swing)) if m is None]
 
 _REQUIRED = {
     coingecko: ['build_frames_v2', 'fetch_description', 'fetch_ohlc', 'fetch_period_changes', 'fetch_spot_price', 'has_api_key', 'search_coins', 'set_api_key'],
@@ -97,6 +116,7 @@ _REQUIRED = {
 # Features the app can run without. A missing one degrades that feature only,
 # rather than blocking the entire app over a single lagging file.
 _OPTIONAL = {(stop_manager, "trailing_plan")}
+_REQUIRED = {m: attrs for m, attrs in _REQUIRED.items() if m is not None}
 
 _stale = sorted({f"{m.__name__.split('.')[-1]}.py" for m, attrs in _REQUIRED.items()
                  for a in attrs if not hasattr(m, a) and (m, a) not in _OPTIONAL})
@@ -460,7 +480,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-26-b66 (resilient to one lagging file)"
+APP_BUILD = "2026-09-26-b67 (starts even with files missing)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -475,6 +495,14 @@ except Exception as _db_exc:  # pragma: no cover - environment dependent
 
 st.title("📈 Bull Run Strategy V2")
 st.caption(f"Build `{APP_BUILD}` · data persisted to SQLite")
+if _MISSING_MODULES:
+    st.warning(
+        "**Some files are missing, so parts of the app are switched off:** "
+        + ", ".join(f"`{n}`" for n in _MISSING_MODULES)
+        + ". Everything else works. Upload those files to turn the features back on — "
+          "`swing.py` is the Swing Levels strategy, `strategy_chart.py` the auto-drawn "
+          "chart, `stop_manager.py` the trailing-stop numbers."
+    )
 if not DB_READY:
     st.error(
         f"Database could not be initialised, so the Journal and Positions tabs will "
@@ -558,14 +586,14 @@ st.sidebar.header("⚙️ Settings")
 st.sidebar.subheader("Strategy")
 strategy_choice = st.sidebar.radio(
     "Scanner strategy",
-    ["Swing Levels (daily — fewer decisions)", "Trend Retrace (5-minute)",
-     "Confluence (original)"],
+    (["Swing Levels (daily — fewer decisions)"] if swing else [])
+    + ["Trend Retrace (5-minute)", "Confluence (original)"],
     key="strategy_choice",
     help="Trend Retrace: two 4H candles of HH/HL, a bullish 1H candle, then a 5m "
          "retrace to support (reverse for shorts). Confluence is the earlier 10-point "
          "checklist, kept for comparison.")
 USE_TR = strategy_choice.startswith("Trend")
-USE_SWING = strategy_choice.startswith("Swing")
+USE_SWING = strategy_choice.startswith("Swing") and swing is not None
 if USE_SWING:
     with st.sidebar.expander("Swing settings", expanded=False):
         st.caption("Daily candles: check once a day, hold for days or weeks. Built from "
@@ -1019,7 +1047,10 @@ with tab_chart:
              "TradingView is there when you want to draw trend lines and Fibs by hand — "
              "its embedded widget can't be drawn on by code, and drawings aren't saved.")
 
-    if _chart_mode.startswith("Strategy"):
+    if _chart_mode.startswith("Strategy") and strategy_chart is None:
+        st.warning("The auto-drawn chart needs `strategy_chart.py`, which isn't in your "
+                   "repo yet. Upload it, or use the TradingView option above.")
+    elif _chart_mode.startswith("Strategy"):
         st.caption(
             "Candles with the strategy's own entry, stop, target and levels drawn on "
             "automatically — no TradingView, nothing to draw by hand. It re-reads the "
@@ -2613,6 +2644,9 @@ with tab_review:
                                              "Where's my stop?"])
 
     with _rv_tab3:
+      if stop_manager is None:
+        st.warning("This needs `stop_manager.py`, which isn't in your repo yet.")
+      else:
         st.caption(
             "Tell it where you actually got filled and it works out the stop from the "
             "chart's structure — then updates it as the trade moves. It only ever moves "
