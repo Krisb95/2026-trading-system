@@ -89,6 +89,30 @@ def moving_average(df: pd.DataFrame, period: int) -> List[Dict]:
             for ts, v in ma.items() if pd.notna(v)]
 
 
+def infer_direction(df: pd.DataFrame, left: int = 3, right: int = 3) -> Optional[str]:
+    """Which way the chart is trending, read from its own swing points.
+
+    The trend line used to need a complete trading setup to know which way to
+    draw. Most of the time there is no setup, so no line appeared — but the
+    chart still has a direction, and that is what a trend line describes.
+    """
+    from technical import find_swing_points
+    if df is None or len(df) < left + right + 4:
+        return None
+    swings = [s for s in find_swing_points(df, left, right) if s.confirmed]
+    lows = [s.price for s in swings if s.kind == "low"][-2:]
+    highs = [s.price for s in swings if s.kind == "high"][-2:]
+    if len(lows) == 2 and lows[1] > lows[0]:
+        return "Long"
+    if len(highs) == 2 and highs[1] < highs[0]:
+        return "Short"
+    if len(lows) == 2 and lows[1] < lows[0]:
+        return "Short"
+    if len(highs) == 2 and highs[1] > highs[0]:
+        return "Long"
+    return None
+
+
 def trend_line(df: pd.DataFrame, direction: Optional[str], left: int = 3,
                right: int = 3) -> List[Dict]:
     """A line through the last two confirmed swings, extended to the right edge.
@@ -196,7 +220,7 @@ def chart_spec(df: pd.DataFrame, levels: Optional[List[ChartLevel]] = None,
             })
 
     if show_trend_line and view is not None and not view.empty:
-        tl = trend_line(view, direction)
+        tl = trend_line(view, direction or infer_direction(view))
         if tl:
             layers.append({
                 "data": {"values": tl},
@@ -243,7 +267,7 @@ def chart_spec(df: pd.DataFrame, levels: Optional[List[ChartLevel]] = None,
         "data": {"values": candles},
         "layer": layers,
         "height": height,
-        "width": "container",
+        "autosize": {"type": "fit", "contains": "padding"},
         "config": {"background": "transparent",
                     "view": {"stroke": "transparent"},
                     "axis": {"labelColor": "#9FB0D0", "gridColor": "rgba(255,255,255,.06)",

@@ -480,7 +480,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-26-b67 (starts even with files missing)"
+APP_BUILD = "2026-09-27-b68 (chart renders reliably; trend line without a setup)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -1104,7 +1104,12 @@ with tab_chart:
                 _bits.insert(1, f"{plan.direction} · {plan.stage}")
             st.caption(" · ".join(_bits))
             if plan is None or not getattr(plan, "entry", None):
-                st.caption("No complete setup right now, so only the candles are drawn.")
+                st.info(
+                    "**No setup on this instrument right now**, so there's no entry, stop "
+                    "or target to draw — the trend line, swing points and moving average "
+                    "are still there. Most instruments have no setup most of the time; "
+                    "that's the strategy being selective rather than a fault."
+                )
 
         if _seconds and hasattr(st, "fragment"):
             st.fragment(run_every=_seconds)(_draw_strategy_chart)()
