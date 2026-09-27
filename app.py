@@ -64,6 +64,7 @@ import grid as grid_mod
 import charting
 import patterns
 import uihelpers
+import frames as frame_check
 from formatting import format_price, format_rr
 
 
@@ -480,7 +481,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-27-b69 (pan-zoom chart, price-mismatch guard, data check)"
+APP_BUILD = "2026-09-27-b70 (fixed duplicate loader; one venue per coin)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -1761,20 +1762,41 @@ with tab_scan:
                 return {}, [err or "no data"]
 
             def _spot(payload):
-                """Live spot price for the Price column and entry maths. Without
-                this, 'Price' was the last 4H close — up to four hours stale."""
+                """Live price for the coin — from the SAME venue as its candles.
+
+                Mixing sources is what produced plans priced nowhere near the
+                market: the levels were read from one venue's candles while the
+                "live price" came from another's. If the candles came from
+                Hyperliquid, the price must be Hyperliquid's too.
+                """
                 ticker, coin_id = payload
                 if NON_CRYPTO:
                     q = fetch_quote(ticker, "commodity",
                                      yf, live_threshold_seconds=live_threshold,
                                      stale_threshold_seconds=stale_threshold, max_retries=1)
                     return q.price if q and q.price else None
-                if hyperliquid_data.is_hl_ticker(ticker):
-                    return hl_marks.get(ticker)        # already fetched with the volumes
-                if CRYPTO_SOURCE == "bybit":
-                    _b = BYBIT_TICKERS.get(ticker.upper().replace("-USD", ""))
+
+                base = ticker.upper().replace("HL:", "").replace("-USD", "")
+                _from = (_loader_notes.get(ticker) or (None, ""))[0] or ""
+
+                if hyperliquid_data.is_hl_ticker(ticker) or _from.startswith("Hyperliquid"):
+                    px = hl_marks.get(ticker) or _HL_MARKS.get(base)
+                    if px:
+                        return px
+                if _from.startswith("Bybit"):
+                    _b = BYBIT_TICKERS.get(base)
                     if _b:
-                        return _b["last"]              # already fetched with the tickers
+                        return _b["last"]
+                if _from:
+                    # Candles came from a venue with no quick quote — use their
+                    # own last close rather than another venue's price.
+                    _c = _last_closes.get(ticker)
+                    if _c:
+                        return _c
+                if CRYPTO_SOURCE == "bybit":
+                    _b = BYBIT_TICKERS.get(base)
+                    if _b:
+                        return _b["last"]
                 px, _src, _err = exchanges.fetch_spot(ticker)
                 if px is None and coin_id:
                     px, _upd, _e = coingecko.fetch_spot_price(coin_id)
@@ -1783,6 +1805,14 @@ with tab_scan:
             def _progress(i, total, label):
                 bar.progress(min(i / max(total, 1), 1.0), text=f"{i}/{total} · {label}")
 
+            _loader_notes = {}
+            _last_closes = {}
+            _HL_MARKS = {}
+            if not NON_CRYPTO:
+                _ctx, _cerr = _cached_hl_contexts()
+                _HL_MARKS = {c["name"].upper(): c["mark"] for c in (_ctx or [])
+                             if c.get("mark")}
+
             def _tr_loader(payload):
                 """4H, 1H and 5m candles for the Trend Retrace rules."""
                 ticker, _coin_id = payload
@@ -1790,41 +1820,32 @@ with tab_scan:
                     frames, _p = _yahoo_frames(ticker)
                     return frames
                 out = {}
-                if hyperliquid_data.is_hl_ticker(ticker):
-                    # One request for 5m candles, then build 1H and 4H from
-                    # them. Identical data, a third of the requests, and the
-                    # venue's rate limit is what makes scans slow.
-                    df, _e = hyperliquid_data.fetch_candles(ticker, "5m", 1000)
-                    if df is not None and len(df) >= 720:
-                        return trend_retrace.frames_from_5m(df)
-                    for tf, lim in (("4h", 30), ("1h", 48), ("5m", 400)):
-                        df2, _e = hyperliquid_data.fetch_candles(ticker, tf, lim)
-                        out[tf] = df2 if df2 is not None else pd.DataFrame()
-                    return out
-                if CRYPTO_SOURCE == "bybit":
-                    df, _e = exchanges.fetch_bybit_klines(ticker, "5m", limit=1000)
-                    if df is not None and len(df) >= 720:
-                        return trend_retrace.frames_from_5m(df)
-                for tf, lim in (("4h", 30), ("1h", 48), ("5m", 400)):
-                    df = None
+                base = ticker.upper().replace("HL:", "").replace("-USD", "")
+
+                # Ask every source that might have this coin, then use the
+                # first frame that really is 5m data and really is current.
+                # Trusting a source's label is what produced plans priced
+                # nowhere near the market.
+                def _five_minute():
+                    tried = []
+                    hl, _e = hyperliquid_data.fetch_candles(f"HL:{base}", "5m", 1000)
+                    tried.append(("Hyperliquid", hl))
                     if CRYPTO_SOURCE == "bybit":
-                        df, _e = exchanges.fetch_bybit_klines(ticker, tf, limit=lim)
-                    if df is None:
-                        df, _e = exchanges.fetch_binance_klines(ticker, tf, limit=lim)
-                    if df is None:
-                        df, _e = exchanges.fetch_kraken_ohlc(ticker, tf)
-                    if df is None:
-                        # Bybit and Binance block US-hosted servers; Hyperliquid
-                        # doesn't, so it's the last exchange-quality fallback.
-                        df, _e = hyperliquid_data.fetch_candles(
-                            f"HL:{ticker.upper().replace('-USD', '')}", tf, lim)
-                    out[tf] = df if df is not None else pd.DataFrame()
-                if all(f.empty for f in out.values()) and _coin_id:
-                    # Not on any exchange here — CoinGecko is the last resort.
-                    cg_frames, _p = _cached_cg_frames(_coin_id)
-                    return {k: (cg_frames.get(k) if cg_frames.get(k) is not None
-                                else pd.DataFrame()) for k in ("4h", "1h", "5m")}
-                return out
+                        bb, _e = exchanges.fetch_bybit_klines(ticker, "5m", limit=1000)
+                        tried.append(("Bybit", bb))
+                    bi, _e = exchanges.fetch_binance_klines(ticker, "5m", limit=1000)
+                    tried.append(("Binance", bi))
+                    kr, _e = exchanges.fetch_kraken_ohlc(ticker, "5m")
+                    tried.append(("Kraken", kr))
+                    return frame_check.first_valid(tried, "5m", min_bars=300)
+
+                df, src, why = _five_minute()
+                if df is not None:
+                    _loader_notes[ticker] = (src, why)
+                    _last_closes[ticker] = float(df["Close"].iloc[-1])
+                    return trend_retrace.frames_from_5m(df)
+                _loader_notes[ticker] = (None, why)
+                return {"4h": pd.DataFrame(), "1h": pd.DataFrame(), "5m": pd.DataFrame()}
 
             if USE_SWING:
                 _daily_cache = {}
@@ -1896,9 +1917,16 @@ with tab_scan:
                     def _tr_loader_capture(payload):
                         _tk = payload[0]
                         _pre = _bulk.get(_tk)
+                        if _pre is not None:
+                            _chk = frame_check.check(_pre, "5m", min_bars=300)
+                            if not _chk.ok:
+                                _loader_notes[_tk] = ("Hyperliquid (rejected)", _chk.reason)
+                                _pre = None      # fall through to the other sources
                         if _pre is not None and len(_pre) >= 720:
                             frames = trend_retrace.frames_from_5m(_pre)
                             _src = "Hyperliquid 5m (bulk)"
+                            _loader_notes[_tk] = ("Hyperliquid", "")
+                            _last_closes[_tk] = float(_pre["Close"].iloc[-1])
                         else:
                             frames = _tr_loader(payload)
                             _src = "per-timeframe fallback"
