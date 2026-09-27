@@ -229,6 +229,19 @@ def analyze(ticker: str, df_daily: pd.DataFrame, price: Optional[float] = None,
         return SwingPlan(ticker, None, NO_TREND, 0.0, "C", price,
                          reasons=["No usable price or candles."])
 
+    if price and df_daily is not None and not df_daily.empty:
+        last_close = float(df_daily["Close"].iloc[-1])
+        gap = abs(price - last_close) / last_close * 100 if last_close > 0 else 0
+        if gap > 15.0:
+            # Daily candles move more than 5m ones, so the tolerance is wider —
+            # but a live price this far from the last daily close still means
+            # the candles and the quote are different markets.
+            return SwingPlan(ticker, None, NO_TREND, 0.0, "C", price,
+                             reasons=[f"The daily candles end at {_fp(last_close)} but the "
+                                      f"live price is {_fp(price)} — {gap:.0f}% apart. "
+                                      f"They aren't the same market, so no level here can "
+                                      f"be trusted."])
+
     reasons: List[str] = []
     trend, trend_reason = trend_of(df_daily, params)
     direction = direction_override or trend

@@ -47,6 +47,7 @@ STOP_BELOW_4H_CANDLE = "4h_candle"
 NO_TREND = "No 4H trend"
 WAIT_1H = "Waiting for 1H confirmation"
 NO_SUPPORT = "No 5m support found"
+DATA_MISMATCH = "Candles don't match the live price"
 WAIT_RETRACE = "Waiting for retrace"
 AT_ENTRY = "At entry now"
 LOW_QUALITY = "Rejected by quality filters"
@@ -64,6 +65,12 @@ class StrategyParams:
     target_r: float = 3.0           # take profit as a multiple of risk (minimum 3)
     support_lookback: int = 288     # 5m bars searched for support (288 = 24h)
     at_entry_atr: float = 0.3       # within this many 5m ATR = "at entry"
+    # A live price this far from the last candle means the two are not the same
+    # market — stale candles, a wrong symbol, or a bundled "k" coin mixed with a
+    # per-coin price. A ZEC plan once showed an entry 71% below the live price
+    # for exactly this reason, and a plan built on the wrong prices is worse
+    # than no plan.
+    max_price_gap_pct: float = 10.0
     swing_left: int = 3
     swing_right: int = 3
     # --- optional quality filters -------------------------------------
@@ -300,6 +307,21 @@ def analyze(ticker: str, df_4h: pd.DataFrame, df_1h: pd.DataFrame,
     if price is None or price <= 0:
         return TrendRetracePlan(ticker, None, NO_TREND, 0.0, "C", None,
                                  problems=["No usable price."])
+
+    # Before anything else: do the candles describe the same market as the
+    # live price?
+    if live_price and df_5m is not None and not df_5m.empty:
+        last_close = float(df_5m["Close"].iloc[-1])
+        if last_close > 0:
+            gap = abs(live_price - last_close) / last_close * 100
+            if gap > params.max_price_gap_pct:
+                return TrendRetracePlan(
+                    ticker, None, DATA_MISMATCH, 0.0, "C", price,
+                    problems=[f"The candles end at {_fp(last_close)} but the live price is "
+                              f"{_fp(live_price)} — {gap:.0f}% apart. They are not the same "
+                              f"market, so no levels can be trusted. Usually stale candles, "
+                              f"a symbol that resolved to the wrong coin, or a bundled "
+                              f"'k' market priced per 1,000."])
 
     trend, trend_reason = four_hour_trend(df_4h, params.trend_candles)
     direction = direction_override or trend
@@ -725,6 +747,13 @@ def scan_universe_tr(instruments, frame_loader, spot_loader=None,
                     live = None
             plan = analyze(ticker, f4, f1, f5, live_price=live, params=params,
                             extra_features=extra_features)
+            if plan.stage == DATA_MISMATCH:
+                # A data problem is not a weak setup — report it as a failure
+                # so it can't be mistaken for a tradable plan.
+                out.append(RankedCandidate(ticker, label, None, 0.0, "—", plan.stage,
+                                            plan.current_price, None, None, None,
+                                            error="; ".join(plan.problems)))
+                continue
             out.append(RankedCandidate(
                 ticker=ticker, label=label, direction=plan.direction, score=plan.score,
                 grade=plan.grade, regime=plan.stage, price=plan.current_price,
