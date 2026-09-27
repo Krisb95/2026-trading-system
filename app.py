@@ -94,16 +94,26 @@ _REQUIRED = {
     stop_manager: ['suggest', 'trailing_plan'],
 }
 
+# Features the app can run without. A missing one degrades that feature only,
+# rather than blocking the entire app over a single lagging file.
+_OPTIONAL = {(stop_manager, "trailing_plan")}
+
 _stale = sorted({f"{m.__name__.split('.')[-1]}.py" for m, attrs in _REQUIRED.items()
-                 for a in attrs if not hasattr(m, a)})
+                 for a in attrs if not hasattr(m, a) and (m, a) not in _OPTIONAL})
 if _stale:
     # A module is present but older than app.py expects. This is always a
     # part-finished upload, and it surfaces as a confusing AttributeError deep
     # in the page, so it is caught here instead.
+    _detail = "; ".join(
+        f"`{m.__name__.split('.')[-1]}.py` is missing " +
+        ", ".join(f"`{a}`" for a in attrs if not hasattr(m, a))
+        for m, attrs in _REQUIRED.items()
+        if any(not hasattr(m, a) and (m, a) not in _OPTIONAL for a in attrs))
     st.error(
         "**These files are out of date:** " + ", ".join(f"`{f}`" for f in _stale) +
-        "\n\nUpload **every `.py` file** from the latest download together — they're "
-        "released as a set and expect each other's newest versions."
+        f"\n\n{_detail}.\n\nUpload those files again from the latest download. Check the "
+        f"name has no space in it and that it sits beside `app.py` in the repo root — a "
+        f"file saved as `stop manager.py` can't be imported and leaves the old one in use."
     )
     st.stop()
 
@@ -362,11 +372,16 @@ def _take_trade_widget(key, ticker, direction, entry, stop, target, features=Non
 
 
 def _render_trailing(direction, entry, stop, atr, key=""):
-    """The two numbers an exchange trailing stop needs, on the setup itself."""
-    if not TRAIL_ON or None in (direction, entry, stop) or not atr:
+    """The two numbers an exchange trailing stop needs, on the setup itself.
+
+    Skipped quietly if the installed stop_manager.py predates it — one lagging
+    file shouldn't stop the whole app from running, when everything else works.
+    """
+    _plan_fn = getattr(stop_manager, "trailing_plan", None)
+    if _plan_fn is None or not TRAIL_ON or None in (direction, entry, stop) or not atr:
         return
-    tp = stop_manager.trailing_plan(direction, float(entry), float(stop), float(atr),
-                                     activate_at_r=TRAIL_AT_R, trail_atr_mult=TRAIL_MULT)
+    tp = _plan_fn(direction, float(entry), float(stop), float(atr),
+                  activate_at_r=TRAIL_AT_R, trail_atr_mult=TRAIL_MULT)
     if tp is None:
         return
     st.markdown("**Trailing stop**")
@@ -445,7 +460,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-26-b65 (trend line, swings and MA on the strategy chart)"
+APP_BUILD = "2026-09-26-b66 (resilient to one lagging file)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
