@@ -481,7 +481,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-27-b73 (swing scan validated too)"
+APP_BUILD = "2026-09-27-b74 (original defaults restored)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -606,8 +606,9 @@ st.sidebar.header("⚙️ Settings")
 st.sidebar.subheader("Strategy")
 strategy_choice = st.sidebar.radio(
     "Scanner strategy",
-    (["Swing Levels (daily — fewer decisions)"] if swing else [])
-    + ["Trend Retrace (5-minute)", "Confluence (original)"],
+    ["Trend Retrace (your strategy)"]
+    + (["Swing Levels (daily — fewer decisions)"] if swing else [])
+    + ["Confluence (original)"],
     key="strategy_choice",
     help="Trend Retrace: two 4H candles of HH/HL, a bullish 1H candle, then a 5m "
          "retrace to support (reverse for shorts). Confluence is the earlier 10-point "
@@ -658,16 +659,16 @@ if USE_TR:
         _trend_n = st.number_input("4H candles required", min_value=1, max_value=5,
                                     value=2, step=1, key="tr_trend_n")
     with st.sidebar.expander("Setup quality filters", expanded=False):
-        st.caption("Extra gates beyond your three rules, because two 4H candles and one 1H "
-                   "candle fire often by chance. Each halves the signal count roughly; the "
-                   "backtest measures whether they help. Slide to 0 to switch one off.")
-        _q_body = st.slider("1H candle body, minimum share of its range", 0.0, 0.8, 0.40,
+        st.caption("**Off by default** — these are extra gates beyond your three rules, not "
+                   "part of them. Each roughly halves the number of setups, so turn one on "
+                   "only after the backtest shows it helps.")
+        _q_body = st.slider("1H candle body, minimum share of its range", 0.0, 0.8, 0.0,
                             0.05, key="q_body",
                             help="A doji closes level — it confirms nothing.")
-        _q_trend = st.slider("4H trend move, minimum ATR", 0.0, 3.0, 0.80, 0.1,
+        _q_trend = st.slider("4H trend move, minimum ATR", 0.0, 3.0, 0.0, 0.1,
                              key="q_trend",
                              help="Marginally higher highs happen constantly in a range.")
-        _q_ext = st.slider("Max distance from the 4H average (ATR)", 0.0, 8.0, 3.0, 0.5,
+        _q_ext = st.slider("Max distance from the 4H average (ATR)", 0.0, 8.0, 0.0, 0.5,
                            key="q_ext",
                            help="Stops you entering after price has already run. 0 = off.")
     TR_PARAMS = trend_retrace.StrategyParams(
@@ -2220,6 +2221,29 @@ with tab_scan:
             st.markdown(f"##### Results · {len(ok)} shown"
                         + (f", {hidden} hidden by filter" if hidden else "")
                         + (f", {len(failed)} failed" if failed else ""))
+            if hidden:
+                _why_hidden = []
+                for r in scored_all:
+                    if r in ok:
+                        continue
+                    if r.reward_risk is None:
+                        _why_hidden.append(f"{r.label}: no target far enough away to give "
+                                           f"{_rr_floor:g}:1, so no reward:risk")
+                    elif r.reward_risk < _rr_floor - 1e-9:
+                        _why_hidden.append(f"{r.label}: {format_rr(r.reward_risk)} is below "
+                                           f"your {_rr_floor:g}:1 minimum")
+                    elif r.score < min_score:
+                        _why_hidden.append(f"{r.label}: scored {r.score:.0f}, below your "
+                                           f"{min_score:g} minimum")
+                    elif a_plus_only and r.grade != "A+":
+                        _why_hidden.append(f"{r.label}: grade {r.grade}, and A+ only is on")
+                    elif proven_only:
+                        _why_hidden.append(f"{r.label}: no proven positive expectancy yet")
+                    elif apply_lessons:
+                        _why_hidden.append(f"{r.label}: matches a lesson you're filtering out")
+                with st.expander(f"Why {hidden} setup(s) are hidden"):
+                    for line in _why_hidden:
+                        st.caption(f"• {line}")
             st.caption(f"Setups with reward:risk below {_rr_floor:g}:1 are never shown.")
             if EVIDENCE is not None and ok:
                 with st.expander("Why each setup has the evidence label it does"):
