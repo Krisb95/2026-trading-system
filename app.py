@@ -61,6 +61,8 @@ import theme
 import coin_info
 import grid as grid_mod
 import charting
+import strategy_chart
+import stop_manager
 import patterns
 import uihelpers
 import swing
@@ -87,7 +89,9 @@ _REQUIRED = {
     charting: ['INTERVALS', 'to_tradingview_symbol', 'widget_html'],
     patterns: ['bias_of', 'contradicts', 'detect', 'summarise'],
     uihelpers: ['scan_count'],
-    swing: ['SwingParams', 'analyze'],
+    swing: ['SwingParams', 'analyze', 'run_variants', 'scan_universe'],
+    strategy_chart: ['chart_spec', 'entry_zone_of', 'levels_for'],
+    stop_manager: ['suggest', 'trailing_plan'],
 }
 
 _stale = sorted({f"{m.__name__.split('.')[-1]}.py" for m, attrs in _REQUIRED.items()
@@ -322,39 +326,80 @@ def _render_grid(key, direction, price, levels, atr_value, target_r):
 
 def _take_trade_widget(key, ticker, direction, entry, stop, target, features=None,
                        score=None, grade=None, reason="", suggested_qty=0.0):
-    """'I took this trade' — records a recommended setup in the journal, with the
-    setup snapshot the learner needs. Same control on every recommendation."""
+    """'I took this trade' — one tap logs it to the journal.
+
+    It used to be a toggle that merely revealed a Save button further down, and
+    that button was easy to miss on a phone: people ticked the box and nothing
+    appeared in the journal. Now the button saves immediately using the planned
+    levels and your sidebar sizing, and anything that needs correcting — the
+    actual fill, the quantity — is editable on the Journal tab afterwards.
+    """
     if None in (direction, entry, stop, target):
         return
-    if not st.toggle("I took this trade", key=f"tk_on_{key}"):
+    saved_id = st.session_state.get(f"tk_saved_{key}")
+    if saved_id:
+        st.success(f"Logged as journal entry #{saved_id}. Correct the fill price or size "
+                   f"on the 📓 Journal tab, and complete it there when it closes.")
         return
-    c1, c2 = st.columns(2)
-    fill = c1.number_input("Your actual entry price", value=float(entry), format="%.8f",
-                           key=f"tk_fill_{key}",
-                           help="What you were really filled at. Leave as-is if it matched.")
-    qty = c2.number_input("Quantity", min_value=0.0, value=float(suggested_qty or 0.0),
-                          format="%.8f", key=f"tk_qty_{key}",
-                          help="Pre-filled from your sidebar risk settings. Change it if you "
-                               "sized differently.")
-    c3, c4 = st.columns(2)
-    lev = c3.number_input("Leverage", min_value=1.0, value=float(LEVERAGE), step=0.5,
-                          key=f"tk_lev_{key}")
-    followed = c4.checkbox("I followed the rules", value=True, key=f"tk_rules_{key}",
-                           help="Untick if you entered early, skipped a rule or changed the "
-                                "stop. Only rule-following trades teach the strategy.")
-    note = st.text_input("Note (optional)", key=f"tk_note_{key}")
-    if st.button("💾 Save to journal", key=f"tk_save_{key}", use_container_width=True):
+
+    if st.button(f"✅ I took this trade — log it", key=f"tk_go_{key}",
+                 use_container_width=True):
         try:
             jid = trade_log.take_trade(
                 ticker=ticker, direction=direction, planned_entry=float(entry),
-                stop=float(stop), target=float(target), actual_entry=fill, quantity=qty,
-                leverage=lev, features=features, followed_rules=followed,
+                stop=float(stop), target=float(target),
+                actual_entry=float(entry), quantity=float(suggested_qty or 0.0),
+                leverage=float(LEVERAGE), features=features, followed_rules=True,
                 strategy_config=_config_signature(USE_TR, TR_PARAMS),
-                reason=note or reason, score=score, grade=grade)
-            st.success(f"Saved as journal entry #{jid}. Complete it on the 📓 Journal tab "
-                       f"when the trade closes.")
+                reason=reason, score=score, grade=grade)
+            st.session_state[f"tk_saved_{key}"] = jid
+            st.rerun()
         except ValueError as e:
             st.error(str(e))
+    st.caption(f"Logs it at {format_price(entry)} with "
+               f"{(suggested_qty or 0):,.6g}".rstrip("0").rstrip(".")
+               + " units from your sidebar risk settings — all editable afterwards.")
+
+
+def _render_trailing(direction, entry, stop, atr, key=""):
+    """The two numbers an exchange trailing stop needs, on the setup itself."""
+    if not TRAIL_ON or None in (direction, entry, stop) or not atr:
+        return
+    tp = stop_manager.trailing_plan(direction, float(entry), float(stop), float(atr),
+                                     activate_at_r=TRAIL_AT_R, trail_atr_mult=TRAIL_MULT)
+    if tp is None:
+        return
+    st.markdown("**Trailing stop**")
+    t1, t2, t3 = st.columns(3)
+    t1.metric("Switch on at", format_price(tp.activate_at), f"{tp.activate_at_r:g}R")
+    t2.metric("Trail distance", format_price(tp.distance), f"{tp.distance_pct:.2f}%")
+    t3.metric("Locks in", f"{tp.locked_in_at_activation:+.2f}R")
+    st.caption(tp.description)
+    st.caption("Place the hard stop first — the trail is a change to it later, not a "
+               "replacement. On Bybit these go in the trailing-stop fields as an "
+               "activation price and a trail distance.")
+
+
+def _candles_for(ticker, timeframe, bars=400):
+    """Candles for any instrument, from whichever source carries it.
+
+    Shared by the chart, the stop manager and the reviews so they can't drift
+    apart and show different prices for the same thing.
+    """
+    if "=" in ticker:                     # commodity or FX: Yahoo
+        frames, _p = _yahoo_frames(ticker)
+        df = frames.get(timeframe)
+        if (df is None or df.empty) and timeframe == "1d":
+            hist = yf.Ticker(ticker).history(period="2y", interval="1d")
+            df = hist.rename(columns=str.title) if hist is not None else None
+        return df
+    base = ticker.upper().replace("HL:", "").replace("-USD", "")
+    df, _e = hyperliquid_data.fetch_candles(f"HL:{base}", timeframe, bars)
+    if df is None:
+        df, _e = exchanges.fetch_bybit_klines(ticker, timeframe, limit=bars)
+    if df is None:
+        df, _e = exchanges.fetch_binance_klines(ticker, timeframe, limit=bars)
+    return df
 
 
 def _review_inputs(ticker, entry_time):
@@ -400,7 +445,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-25-b57 (save and re-check past setups)"
+APP_BUILD = "2026-09-26-b65 (trend line, swings and MA on the strategy chart)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -498,7 +543,7 @@ st.sidebar.header("⚙️ Settings")
 st.sidebar.subheader("Strategy")
 strategy_choice = st.sidebar.radio(
     "Scanner strategy",
-    ["Trend Retrace (your strategy)", "Swing Levels (daily, fewer decisions)",
+    ["Swing Levels (daily — fewer decisions)", "Trend Retrace (5-minute)",
      "Confluence (original)"],
     key="strategy_choice",
     help="Trend Retrace: two 4H candles of HH/HL, a bullish 1H candle, then a 5m "
@@ -588,6 +633,19 @@ with st.sidebar.expander("Costs"):
 st.sidebar.caption(f"Risking **${ACCOUNT_EQUITY * RISK_PCT / 100:,.2f}** per trade.")
 
 st.sidebar.markdown("---")
+with st.sidebar.expander("Trailing stop"):
+    st.caption("Shown on every setup as two numbers you can type into Bybit. Whether "
+               "trailing helps at all is measured in the 🔁 Backtest — leave it off if it "
+               "doesn't.")
+    TRAIL_ON = st.checkbox("Include a trailing stop in setups", value=True,
+                           key="trail_on")
+    TRAIL_AT_R = st.number_input("Switch it on at (R in profit)", min_value=0.25,
+                                 max_value=5.0, value=1.0, step=0.25, key="trail_at_r",
+                                 disabled=not TRAIL_ON)
+    TRAIL_MULT = st.number_input("Trail distance (x ATR)", min_value=0.5, max_value=6.0,
+                                 value=2.0, step=0.5, key="trail_mult",
+                                 disabled=not TRAIL_ON)
+
 with st.sidebar.expander("Advanced settings"):
     st.caption("Data-freshness rules and display timezone. The defaults rarely need "
                "changing — crypto prices come live from the exchange regardless.")
@@ -763,10 +821,10 @@ st.sidebar.warning(
     "import them back afterwards."
 )
 
-(tab_market, tab_chart, tab_tools, tab_learn, tab_scan, tab_positions, tab_risk,
- tab_journal, tab_track, tab_backtest) = st.tabs(
+(tab_market, tab_chart, tab_tools, tab_learn, tab_scan, tab_review, tab_positions,
+ tab_risk, tab_journal, tab_track, tab_backtest) = st.tabs(
     ["🌍 Market", "📉 Charts", "🌡️ Market tools", "📚 What coins do", "🎯 Scanner",
-     "📋 Positions", "🧮 Risk", "📓 Journal", "📈 Tracking", "🔁 Backtest"]
+     "🔍 Review", "📋 Positions", "🧮 Risk", "📓 Journal", "📈 Tracking", "🔁 Backtest"]
 )
 
 # ---------------------------------------------------------------------
@@ -934,8 +992,92 @@ with tab_market:
 
 with tab_chart:
     st.subheader("Charts")
+    _chart_h = st.select_slider(
+        "Chart size", options=[420, 560, 700, 850, 1000], value=700, key="chart_height",
+        format_func=lambda v: {420: "Small", 560: "Medium", 700: "Large",
+                               850: "Extra large", 1000: "Full screen"}[v],
+        help="Taller charts show more price history at a readable size on a phone.")
+    _chart_mode = st.radio(
+        "Chart", ["Strategy chart (auto-updating)", "TradingView (draw your own)"],
+        horizontal=True, key="chart_mode",
+        help="The strategy chart draws your levels itself and refreshes on a timer. "
+             "TradingView is there when you want to draw trend lines and Fibs by hand — "
+             "its embedded widget can't be drawn on by code, and drawings aren't saved.")
 
-    c1, c2, c3 = st.columns([2, 1, 1])
+    if _chart_mode.startswith("Strategy"):
+        st.caption(
+            "Candles with the strategy's own entry, stop, target and levels drawn on "
+            "automatically — no TradingView, nothing to draw by hand. It re-reads the "
+            "market and redraws itself on a timer."
+        )
+        sc1, sc2, sc3 = st.columns([2, 1, 1])
+        _sc_lists = {"Crypto": CRYPTO_TICKERS, "Commodities": COMMODITY_TICKERS,
+                     "FX": FX_TICKERS}
+        _sc_market = sc1.selectbox("Market", list(_sc_lists), key="sc_market")
+        _sc_name = sc1.selectbox("Instrument", list(_sc_lists[_sc_market]), key="sc_name")
+        _sc_ticker = _sc_lists[_sc_market][_sc_name]
+        _tf = sc2.selectbox("Timeframe", ["1d", "4h", "1h", "5m"],
+                            index=0 if USE_SWING else 1, key="sc_tf")
+        _every = sc3.selectbox("Update every", ["Off", "15s", "30s", "1 min", "5 min"],
+                               index=2, key="sc_every")
+        _seconds = {"15s": 15, "30s": 30, "1 min": 60, "5 min": 300}.get(_every)
+
+        def _draw_strategy_chart():
+            df = _candles_for(_sc_ticker, _tf)
+            if df is None or df.empty:
+                st.warning(f"Couldn't load {_tf} candles for {_sc_name}.")
+                return
+            # Work the plan out here so the levels update with the candles.
+            plan = None
+            try:
+                if USE_SWING:
+                    daily = df if _tf == "1d" else _candles_for(_sc_ticker, "1d", 400)
+                    if daily is not None and not daily.empty:
+                        plan = swing.analyze(_sc_ticker, daily, params=SWING_PARAMS)
+                else:
+                    f5 = df if _tf == "5m" else _candles_for(_sc_ticker, "5m", 1000)
+                    if f5 is not None and len(f5) >= 720:
+                        fr = trend_retrace.frames_from_5m(f5)
+                        plan = trend_retrace.analyze(_sc_ticker, fr["4h"], fr["1h"],
+                                                      fr["5m"], params=TR_PARAMS)
+            except Exception:
+                plan = None
+
+            _dir = getattr(plan, "direction", None) if plan else None
+            _sma = (SWING_PARAMS.trend_sma if (USE_SWING and SWING_PARAMS and _tf == "1d")
+                    else 20)
+            st.vega_lite_chart(
+                strategy_chart.chart_spec(
+                    df, strategy_chart.levels_for(plan),
+                    zone=strategy_chart.entry_zone_of(plan), height=_chart_h - 40,
+                    direction=_dir, sma_period=_sma),
+                use_container_width=True)
+            _bits = [f"{_sc_name} · {_tf} · {len(df)} candles",
+                     f"updated {datetime.now().strftime('%H:%M:%S')}"]
+            if plan is not None and getattr(plan, "direction", None):
+                _bits.insert(1, f"{plan.direction} · {plan.stage}")
+            st.caption(" · ".join(_bits))
+            if plan is None or not getattr(plan, "entry", None):
+                st.caption("No complete setup right now, so only the candles are drawn.")
+
+        if _seconds and hasattr(st, "fragment"):
+            st.fragment(run_every=_seconds)(_draw_strategy_chart)()
+            st.caption(f"Redrawing every {_every.lower()} while this tab is open.")
+        else:
+            _draw_strategy_chart()
+            if _seconds:
+                st.caption("Automatic updating needs a newer Streamlit — press R to refresh.")
+
+        st.caption(
+            "**What's drawn:** green target · red stop · amber entry · dashed blue at the "
+            "current price · grey for the level · shaded amber for the entry zone · "
+            "dashed purple trend line through the swing points the strategy read · blue "
+            "moving average · green and red dots marking confirmed swing lows and highs. "
+            "Every price line is labelled."
+        )
+
+    c1, c2, c3 = st.columns([2, 1, 1]) if not _chart_mode.startswith("Strategy") \
+        else (st.container(), st.container(), st.container())
     _all_lists = {"Crypto": CRYPTO_TICKERS_ALL, "Commodities": COMMODITY_TICKERS,
                   "FX": FX_TICKERS}
     _ch_market = c1.selectbox("Market", list(_all_lists), key="ch_market")
@@ -944,13 +1086,22 @@ with tab_chart:
     _ch_interval = c3.selectbox("Timeframe", list(charting.INTERVALS), index=3,
                                 key="ch_interval")
 
+    _tv_on = not _chart_mode.startswith("Strategy")
     _default_symbol = charting.to_tradingview_symbol(
         _all_lists[_ch_market][_ch_pick], _ch_market,
         exchange=("BYBIT" if CRYPTO_SOURCE == "bybit" else "BYBIT"))
     _symbol = st.text_input("TradingView symbol", value=_default_symbol, key="ch_symbol",
                             help="Edit this for anything not in the lists, or use the "
                                  "search inside the chart itself.")
-    components.html(charting.widget_html(_symbol, _ch_interval, height=640), height=660)
+    if _tv_on:
+        components.html(charting.widget_html(_symbol, _ch_interval, height=_chart_h),
+                        height=_chart_h + 20)
+        st.caption("Rotating your phone to landscape gives the chart much more room, and "
+                   "collapsing the sidebar (the » arrow, top left) widens it further.")
+        st.info("This is TradingView's own chart, so **it can't show your strategy's "
+                "levels** — its embedded widget has no way for code to draw on it. Switch "
+                "to **Strategy chart** above for entry, stop, target, trend line and swing "
+                "points drawn automatically. Use this one for drawing by hand.")
 
     st.caption(
         "Full TradingView drawing tools are in the toolbar on the left of the chart — "
@@ -1187,10 +1338,9 @@ with tab_scan:
         "overridable — ❔ means it could not be evaluated and scores zero rather than guessing."
     )
 
-    _modes = (["Rank the universe", "Auto-scan one instrument", "Review a setup"]
+    _modes = (["Rank the universe", "Auto-scan one instrument"]
               if (USE_TR or USE_SWING)
-              else ["Rank the universe", "Auto-scan one instrument", "Review a setup",
-                    "Manual checklist"])
+              else ["Rank the universe", "Auto-scan one instrument", "Manual checklist"])
     mode = st.radio("Mode", _modes, key="scan_mode",
                     help="Rank the universe checks many coins and shortlists the best; "
                          "single-instrument mode shows every rule for one coin in detail.")
@@ -1394,7 +1544,18 @@ with tab_scan:
                 "⚠️ High volume outside the top coins often means a sharp move, news or a "
                 "pump. These markets are usually more volatile, and your strategy hasn't "
                 "been backtested on them — treat results with extra caution.")
-        if USE_TR:
+        if USE_SWING:
+            st.caption(
+                "Applies the swing rules to each instrument's **daily** chart: a clear "
+                "daily trend, price at a level the market has respected before, and a "
+                "confirming daily candle. Most instruments will show nothing on most "
+                "days — that is the point of a higher-timeframe strategy."
+            )
+            universe_size = st.selectbox(
+                "Scan the top…", [10, 20, 30, 50, 100], index=1, key="uni_size",
+                format_func=lambda n: f"Top {n} by market cap")
+            uni_direction, uni_min_rr = "Auto", SWING_PARAMS.min_rr if SWING_PARAMS else 3.0
+        elif USE_TR:
             st.caption(
                 "Applies your three rules to each coin: **two 4H candles of higher highs and "
                 "higher lows**, a **bullish 1H candle**, and a **5m retrace to previous "
@@ -1614,7 +1775,47 @@ with tab_scan:
                                 else pd.DataFrame()) for k in ("4h", "1h", "5m")}
                 return out
 
-            if USE_TR:
+            if USE_SWING:
+                _daily_cache = {}
+
+                def _daily_loader(payload):
+                    tk = payload[0] if isinstance(payload, tuple) else payload
+                    if tk in _daily_cache:
+                        return _daily_cache[tk]
+                    df = None
+                    if NON_CRYPTO:
+                        _fr, _p = _yahoo_frames(tk)
+                        df = _fr.get("1d")
+                        if df is None or df.empty:
+                            _h = yf.Ticker(tk).history(period="3y", interval="1d")
+                            df = _h.rename(columns=str.title) if _h is not None else None
+                    else:
+                        base = tk.upper().replace("HL:", "").replace("-USD", "")
+                        df = _bulk_daily.get(base)
+                        if df is None:
+                            df, _e = exchanges.fetch_bybit_klines(tk, "1d", limit=1000)
+                        if df is None:
+                            df, _e = exchanges.fetch_binance_klines(tk, "1d", limit=1000)
+                    _daily_cache[tk] = df
+                    return df
+
+                # One daily request per coin, in parallel within the budget.
+                _bulk_daily = {}
+                if not NON_CRYPTO:
+                    _names = [f"HL:{t.upper().replace('HL:', '').replace('-USD', '')}"
+                              for _l, t, _k in instruments]
+                    bar.progress(0.0, text=f"Fetching {len(_names)} daily charts…")
+                    _got = hyperliquid_data.fetch_candles_many(
+                        _names, "1d", 1000,
+                        progress=lambda i, n, nm: bar.progress(
+                            min(i / max(n, 1), 1.0), text=f"{i}/{n} · {nm}"))
+                    _bulk_daily = {k.replace("HL:", ""): v for k, v in _got.items()}
+
+                with st.spinner("Applying the swing rules…"):
+                    ranked = swing.scan_universe(
+                        instruments, _daily_loader, spot_loader=_spot,
+                        params=SWING_PARAMS, progress=_progress)
+            elif USE_TR:
                 with st.spinner("Scanning…"):
                     _extra = {"sentiment": sentiment.bucket(_fg["value"])} if _fg else None
                     _level_cache = {}
@@ -1848,6 +2049,13 @@ with tab_scan:
                                 _sz = _size_plan(r.direction, r.entry, r.stop, r.target,
                                                   r.ticker)
                                 _render_size(_sz)
+                                _render_trailing(
+                                    r.direction, r.entry, r.stop,
+                                    (r.features or {}).get("atr")
+                                    or (abs(r.entry - r.stop) / (TR_PARAMS.stop_atr_mult
+                                        if (USE_TR and TR_PARAMS) else 0.75)
+                                        if r.entry and r.stop else None),
+                                    key=f"u_{r.ticker}")
                                 if r.ticker in COMMODITY_PERPS:
                                     st.caption(f"Place this on **{COMMODITY_PERPS[r.ticker]}**.")
                                 _lv = st.session_state.get("uni_levels", {}).get(r.ticker)
@@ -1889,101 +2097,6 @@ with tab_scan:
                 with st.expander(f"⚠️ {len(failed)} instrument(s) could not be scored"):
                     for r in failed:
                         st.caption(f"**{r.label}** — {r.error}")
-
-        score_evidence, seq_evidence = {}, {}
-
-    elif mode == "Review a setup":
-        st.caption(
-            "A second opinion on any setup — one you're already in, or one you're thinking "
-            "about. Enter the levels and it re-checks them against the current chart: is "
-            "the trend still there, has price passed the entry, and what would closing now "
-            "cost against letting the stop do its job."
-        )
-
-        rv1, rv2 = st.columns([3, 1])
-        _rv_market = rv1.selectbox("Market", ["Crypto", "Commodities", "FX"], key="rv_market")
-        _rv_lists = {"Crypto": CRYPTO_TICKERS, "Commodities": COMMODITY_TICKERS,
-                     "FX": FX_TICKERS}
-        _rv_name = rv1.selectbox("Instrument", list(_rv_lists[_rv_market]), key="rv_name")
-        _rv_ticker = _rv_lists[_rv_market][_rv_name]
-        _rv_dir = rv2.selectbox("Direction", ["Long", "Short"], key="rv_dir")
-
-        # Prefill from the last single-coin check, if it was this instrument.
-        _last = st.session_state.get("tr_plan") or st.session_state.get("sw_plan")
-        _pre = {}
-        if _last is not None and getattr(_last, "ticker", None) == _rv_ticker:
-            _pre = {"entry": _last.entry, "stop": _last.stop, "target": _last.target}
-            st.caption("Levels pre-filled from your last check of this instrument.")
-
-        q1, q2, q3 = st.columns(3)
-        _rv_entry = q1.number_input("Entry", min_value=0.0, format="%.8f",
-                                    value=float(_pre.get("entry") or 0.0), key="rv_entry")
-        _rv_stop = q2.number_input("Stop", min_value=0.0, format="%.8f",
-                                   value=float(_pre.get("stop") or 0.0), key="rv_stop")
-        _rv_target = q3.number_input("Target", min_value=0.0, format="%.8f",
-                                     value=float(_pre.get("target") or 0.0), key="rv_target")
-        _rv_in = st.checkbox("I'm already in this trade", key="rv_in")
-        _rv_hours = st.number_input("Hours since I entered", min_value=0.0, value=6.0,
-                                    step=1.0, key="rv_hours",
-                                    disabled=not _rv_in) if _rv_in else 0.0
-
-        if st.button("🔍 Review it", use_container_width=True, key="rv_run"):
-            if not (_rv_entry and _rv_stop):
-                st.error("Enter at least an entry and a stop.")
-            else:
-                with st.spinner("Loading the current chart…"):
-                    _since_when = (pd.Timestamp.now(tz="UTC")
-                                   - pd.Timedelta(hours=float(_rv_hours or 1)))
-                    _fr, _bars_since, _px, _now = _review_inputs(_rv_ticker, _since_when)
-                if _px is None:
-                    st.error("Couldn't fetch a current price for this instrument.")
-                elif _rv_in:
-                    st.session_state.rv_result = ("open", trade_review.review(
-                        direction=_rv_dir, entry=_rv_entry, stop=_rv_stop,
-                        target=_rv_target or _rv_entry, entry_time=_since_when,
-                        price=float(_px), now=_now, df_4h=_fr["4h"], df_1h=_fr["1h"],
-                        candles_since_entry=_bars_since,
-                        structure_candles=_fr["5m"].tail(200),
-                        atr_value=trend_retrace.atr(_fr["5m"]),
-                        trend_candles=(TR_PARAMS.trend_candles if TR_PARAMS else 2),
-                        stale_hours=st.session_state.get("trb_stale", 12.0)), float(_px))
-                else:
-                    st.session_state.rv_result = ("planned", trade_review.setup_still_viable(
-                        direction=_rv_dir, entry=_rv_entry, stop=_rv_stop,
-                        created=_since_when, price=float(_px), now=_now, df_4h=_fr["4h"],
-                        trend_candles=(TR_PARAMS.trend_candles if TR_PARAMS else 2)),
-                        float(_px))
-
-        _res = st.session_state.get("rv_result")
-        if _res:
-            _kind, _r, _price_now = _res
-            with st.container(border=True):
-                if _kind == "open":
-                    box = {trade_review.HOLD: st.success, trade_review.TIGHTEN: st.info,
-                           trade_review.CLOSE: st.warning,
-                           trade_review.CLOSE_THESIS: st.error}[_r.verdict]
-                    box(f"**{_r.verdict}** · price now {format_price(_price_now)}")
-                    for why in _r.reasons:
-                        st.caption(f"• {why}")
-                    for act in _r.actions:
-                        st.markdown(act)
-                    if _r.current_r is not None:
-                        m1, m2, m3 = st.columns(3)
-                        m1.metric("Close now", f"{_r.close_now_r:+.2f}R")
-                        m2.metric("If stop hits", f"{_r.stop_r:+.2f}R")
-                        m3.metric("If target hits", f"{_r.target_r:+.2f}R"
-                                  if _r.target_r else "—")
-                    if _r.suggested_stop is not None:
-                        st.caption(f"Suggested tighter stop: "
-                                   f"**{format_price(_r.suggested_stop)}** — never wider.")
-                else:
-                    ok = _r.verdict == trade_review.STILL_VALID
-                    (st.success if ok else st.warning)(
-                        f"**{_r.verdict}** · price now {format_price(_price_now)}")
-                    for why in _r.reasons:
-                        st.caption(f"• {why}")
-                st.caption("A second opinion based on your rules, not an instruction. "
-                           "Nothing is changed on the exchange.")
 
         score_evidence, seq_evidence = {}, {}
 
@@ -2044,6 +2157,11 @@ with tab_scan:
                 _szs = _size_plan(_swp.direction, _swp.entry, _swp.stop, _swp.target,
                                    _swp.ticker)
                 _render_size(_szs)
+                _render_trailing(_swp.direction, _swp.entry, _swp.stop,
+                                  (abs(_swp.entry - _swp.stop)
+                                   / (SWING_PARAMS.stop_atr if SWING_PARAMS else 0.75))
+                                  if _swp.entry and _swp.stop else None,
+                                  key=f"sw_{_swp.ticker}")
                 if st.button("💾 Save this setup to re-check later",
                              key=f"savesw_{_swp.ticker}", use_container_width=True):
                     _sid = tracking.record_one(_swp, source="swing-check")
@@ -2169,6 +2287,9 @@ with tab_scan:
                     _sz = _size_plan(plan.direction, plan.entry, plan.stop, plan.target,
                                       plan.ticker)
                     _render_size(_sz)
+                    _render_trailing(plan.direction, plan.entry, plan.stop,
+                                      (st.session_state.get("tr_levels") or {}).get("atr"),
+                                      key=f"s_{plan.ticker}")
                     _tr_levels = st.session_state.get("tr_levels") or {}
                     _render_grid(f"s_{plan.ticker}", plan.direction, plan.current_price,
                                  _tr_levels.get("levels", []), _tr_levels.get("atr"),
@@ -2466,6 +2587,241 @@ with tab_scan:
             gaps = missing_entry_sequence_stages(seq_evidence)
             if gaps:
                 st.warning("What would confirm this:\n" + "\n".join(f"- {g}" for g in gaps))
+
+with tab_review:
+    st.subheader("Review")
+    st.caption(
+        "Two things live here: setups the scanner saved earlier, so you can decide whether "
+        "they're still worth leaving pending, and a one-off review of any setup you type in."
+    )
+    _rv_tab1, _rv_tab2, _rv_tab3 = st.tabs(["Saved setups", "Review any setup",
+                                             "Where's my stop?"])
+
+    with _rv_tab3:
+        st.caption(
+            "Tell it where you actually got filled and it works out the stop from the "
+            "chart's structure — then updates it as the trade moves. It only ever moves "
+            "the stop closer to price, never further away."
+        )
+        sm1, sm2 = st.columns([3, 1])
+        _sm_lists = {"Crypto": CRYPTO_TICKERS, "Commodities": COMMODITY_TICKERS,
+                     "FX": FX_TICKERS}
+        _sm_market = sm1.selectbox("Market", list(_sm_lists), key="sm_market")
+        _sm_name = sm1.selectbox("Instrument", list(_sm_lists[_sm_market]), key="sm_name")
+        _sm_ticker = _sm_lists[_sm_market][_sm_name]
+        _sm_dir = sm2.selectbox("Direction", ["Long", "Short"], key="sm_dir")
+
+        n1, n2 = st.columns(2)
+        _sm_entry = n1.number_input("I entered at", min_value=0.0, format="%.8f",
+                                    key="sm_entry")
+        _sm_stop = n2.number_input("My stop now (0 if none yet)", min_value=0.0,
+                                   format="%.8f", key="sm_stop")
+        _sm_tf = st.selectbox("Read structure from", ["5m", "1h", "4h", "1d"],
+                              index=3 if USE_SWING else 0, key="sm_tf",
+                              help="Use the timeframe you're trading: 5m for intraday, "
+                                   "daily for swing trades.")
+
+        if st.button("📏 Work out my stop", use_container_width=True, key="sm_go"):
+            if not _sm_entry:
+                st.error("Enter the price you got filled at.")
+            else:
+                with st.spinner("Reading the chart…"):
+                    _df = _candles_for(_sm_ticker, _sm_tf, 400)
+                if _df is None or _df.empty:
+                    st.error("Couldn't load candles for that instrument and timeframe.")
+                else:
+                    _live = float(_df["Close"].iloc[-1])
+                    _atr = trend_retrace.atr(_df)
+                    try:
+                        st.session_state.sm_result = (stop_manager.suggest(
+                            _sm_dir, entry=_sm_entry, price=_live, candles=_df, atr=_atr,
+                            current_stop=_sm_stop or None), _live)
+                    except ValueError as e:
+                        st.error(str(e))
+
+        _smr = st.session_state.get("sm_result")
+        if _smr:
+            _s, _live = _smr
+            with st.container(border=True):
+                if _s.price is None:
+                    st.warning(_s.reason)
+                else:
+                    (st.success if _s.is_tighter else st.info)(
+                        f"**{_s.basis}** → {format_price(_s.price)}")
+                    st.write(_s.reason)
+                    k1, k2, k3 = st.columns(3)
+                    k1.metric("Suggested stop", format_price(_s.price))
+                    k2.metric("Price now", format_price(_live))
+                    if _s.current_r is not None:
+                        k3.metric("Trade is at", f"{_s.current_r:+.2f}R")
+                    if _s.locked_in is not None:
+                        _word = ("locks in" if _s.locked_in > 0 else "risks")
+                        st.caption(f"If it triggers, that {_word} "
+                                   f"{format_price(abs(_s.locked_in))} per unit "
+                                   f"(risk from entry: {format_price(_s.risk_per_unit)}).")
+                    if _s.alternatives:
+                        st.caption("Also possible: " + " · ".join(_s.alternatives))
+                    if not _s.is_tighter:
+                        st.caption("This isn't tighter than your current stop, so there's "
+                                   "nothing to change.")
+                st.caption("Advice only — move the stop on the exchange yourself. Never "
+                           "widen it: if the reason for the trade has gone, close it "
+                           "instead.")
+
+
+
+    with _rv_tab1:
+        st.caption("Every setup the scanner produced, with its levels frozen at the time. A "
+                   "plan made yesterday describes a chart that no longer exists, so this "
+                   "re-checks each one against the current trend and price, and lets you "
+                   "cancel the ones that have gone stale.")
+        _sig_df = storage.get_signals_df()
+        _pending = (_sig_df[_sig_df["status"] == "PENDING"] if not _sig_df.empty else _sig_df)
+        if _pending.empty:
+            st.caption("No setups waiting to fill.")
+        elif st.button(f"Re-check {len(_pending)} waiting setup(s)", use_container_width=True):
+            _out = []
+            bar = st.progress(0.0, text="Checking…")
+            for i_, (_, sg) in enumerate(_pending.iterrows()):
+                bar.progress(i_ / max(len(_pending), 1), text=sg["ticker"])
+                _created = pd.Timestamp(sg["created_utc"])
+                _created = _created.tz_localize("UTC") if _created.tzinfo is None else _created
+                try:
+                    _fr, _since, _px, _now = _review_inputs(sg["ticker"], _created)
+                    if _px is None:
+                        _out.append((sg, None, "No current price available."))
+                        continue
+                    _v = trade_review.setup_still_viable(
+                        sg["direction"], float(sg["entry"]), float(sg["stop"]), _created,
+                        float(_px), _now, _fr["4h"],
+                        trend_candles=(TR_PARAMS.trend_candles if TR_PARAMS else 2))
+                    _out.append((sg, _v, None))
+                except Exception as e:
+                    _out.append((sg, None, f"{type(e).__name__}: {e}"))
+            bar.empty()
+            st.session_state.viability = _out
+
+        for sg, _v, _err in st.session_state.get("viability", []):
+            with st.container(border=True):
+                _age = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(sg["created_utc"]).tz_localize(
+                    "UTC") if pd.Timestamp(sg["created_utc"]).tzinfo is None
+                    else pd.Timestamp.now(tz="UTC") - pd.Timestamp(sg["created_utc"]))
+                st.markdown(f"**{sg['direction']} {sg['label'] or sg['ticker']}** "
+                            f"· {sg.get('grade') or '—'} · saved "
+                            f"{_age.total_seconds() / 3600:.0f}h ago")
+                st.caption(f"Entry {format_price(sg['entry'])} · stop {format_price(sg['stop'])} "
+                           f"· target {format_price(sg['target'])}")
+                if _err or _v is None:
+                    st.caption(f"Couldn't check: {_err}")
+                    continue
+                box = {trade_review.STILL_VALID: st.success}.get(_v.verdict, st.warning)
+                box(f"**{_v.verdict}** · now {format_price(_v.price)}")
+                for why in _v.reasons:
+                    st.caption(f"• {why}")
+                if _v.verdict != trade_review.STILL_VALID:
+                    if st.button("Cancel this setup", key=f"vcancel_{int(sg['id'])}"):
+                        storage.update_signal(int(sg["id"]), status="EXPIRED",
+                                              exit_utc=datetime.now(timezone.utc).isoformat())
+                        st.session_state.viability = [
+                            x for x in st.session_state.viability if x[0]["id"] != sg["id"]]
+                        st.rerun()
+
+
+    with _rv_tab2:
+        st.caption(
+            "A second opinion on any setup — one you're already in, or one you're thinking "
+            "about. Enter the levels and it re-checks them against the current chart: is "
+            "the trend still there, has price passed the entry, and what would closing now "
+            "cost against letting the stop do its job."
+        )
+
+        rv1, rv2 = st.columns([3, 1])
+        _rv_market = rv1.selectbox("Market", ["Crypto", "Commodities", "FX"], key="rv_market")
+        _rv_lists = {"Crypto": CRYPTO_TICKERS, "Commodities": COMMODITY_TICKERS,
+                     "FX": FX_TICKERS}
+        _rv_name = rv1.selectbox("Instrument", list(_rv_lists[_rv_market]), key="rv_name")
+        _rv_ticker = _rv_lists[_rv_market][_rv_name]
+        _rv_dir = rv2.selectbox("Direction", ["Long", "Short"], key="rv_dir")
+
+        # Prefill from the last single-coin check, if it was this instrument.
+        _last = st.session_state.get("tr_plan") or st.session_state.get("sw_plan")
+        _pre = {}
+        if _last is not None and getattr(_last, "ticker", None) == _rv_ticker:
+            _pre = {"entry": _last.entry, "stop": _last.stop, "target": _last.target}
+            st.caption("Levels pre-filled from your last check of this instrument.")
+
+        q1, q2, q3 = st.columns(3)
+        _rv_entry = q1.number_input("Entry", min_value=0.0, format="%.8f",
+                                    value=float(_pre.get("entry") or 0.0), key="rv_entry")
+        _rv_stop = q2.number_input("Stop", min_value=0.0, format="%.8f",
+                                   value=float(_pre.get("stop") or 0.0), key="rv_stop")
+        _rv_target = q3.number_input("Target", min_value=0.0, format="%.8f",
+                                     value=float(_pre.get("target") or 0.0), key="rv_target")
+        _rv_in = st.checkbox("I'm already in this trade", key="rv_in")
+        _rv_hours = st.number_input("Hours since I entered", min_value=0.0, value=6.0,
+                                    step=1.0, key="rv_hours",
+                                    disabled=not _rv_in) if _rv_in else 0.0
+
+        if st.button("🔍 Review it", use_container_width=True, key="rv_run"):
+            if not (_rv_entry and _rv_stop):
+                st.error("Enter at least an entry and a stop.")
+            else:
+                with st.spinner("Loading the current chart…"):
+                    _since_when = (pd.Timestamp.now(tz="UTC")
+                                   - pd.Timedelta(hours=float(_rv_hours or 1)))
+                    _fr, _bars_since, _px, _now = _review_inputs(_rv_ticker, _since_when)
+                if _px is None:
+                    st.error("Couldn't fetch a current price for this instrument.")
+                elif _rv_in:
+                    st.session_state.rv_result = ("open", trade_review.review(
+                        direction=_rv_dir, entry=_rv_entry, stop=_rv_stop,
+                        target=_rv_target or _rv_entry, entry_time=_since_when,
+                        price=float(_px), now=_now, df_4h=_fr["4h"], df_1h=_fr["1h"],
+                        candles_since_entry=_bars_since,
+                        structure_candles=_fr["5m"].tail(200),
+                        atr_value=trend_retrace.atr(_fr["5m"]),
+                        trend_candles=(TR_PARAMS.trend_candles if TR_PARAMS else 2),
+                        stale_hours=st.session_state.get("trb_stale", 12.0)), float(_px))
+                else:
+                    st.session_state.rv_result = ("planned", trade_review.setup_still_viable(
+                        direction=_rv_dir, entry=_rv_entry, stop=_rv_stop,
+                        created=_since_when, price=float(_px), now=_now, df_4h=_fr["4h"],
+                        trend_candles=(TR_PARAMS.trend_candles if TR_PARAMS else 2)),
+                        float(_px))
+
+        _res = st.session_state.get("rv_result")
+        if _res:
+            _kind, _r, _price_now = _res
+            with st.container(border=True):
+                if _kind == "open":
+                    box = {trade_review.HOLD: st.success, trade_review.TIGHTEN: st.info,
+                           trade_review.CLOSE: st.warning,
+                           trade_review.CLOSE_THESIS: st.error}[_r.verdict]
+                    box(f"**{_r.verdict}** · price now {format_price(_price_now)}")
+                    for why in _r.reasons:
+                        st.caption(f"• {why}")
+                    for act in _r.actions:
+                        st.markdown(act)
+                    if _r.current_r is not None:
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("Close now", f"{_r.close_now_r:+.2f}R")
+                        m2.metric("If stop hits", f"{_r.stop_r:+.2f}R")
+                        m3.metric("If target hits", f"{_r.target_r:+.2f}R"
+                                  if _r.target_r else "—")
+                    if _r.suggested_stop is not None:
+                        st.caption(f"Suggested tighter stop: "
+                                   f"**{format_price(_r.suggested_stop)}** — never wider.")
+                else:
+                    ok = _r.verdict == trade_review.STILL_VALID
+                    (st.success if ok else st.warning)(
+                        f"**{_r.verdict}** · price now {format_price(_price_now)}")
+                    for why in _r.reasons:
+                        st.caption(f"• {why}")
+                st.caption("A second opinion based on your rules, not an instruction. "
+                           "Nothing is changed on the exchange.")
+
+
+
 
 # ---------------------------------------------------------------------
 # TAB: Positions
@@ -3158,61 +3514,6 @@ with tab_track:
                            "entry", "stop", "target", "status", "r_result"]],
                      use_container_width=True, hide_index=True)
 
-    st.markdown("##### 🔁 Saved setups — still worth leaving pending?")
-    st.caption("Every setup the scanner produced, with its levels frozen at the time. A "
-               "plan made yesterday describes a chart that no longer exists, so this "
-               "re-checks each one against the current trend and price, and lets you "
-               "cancel the ones that have gone stale.")
-    _pending = sig_df[sig_df["status"] == "PENDING"] if not sig_df.empty else sig_df
-    if _pending.empty:
-        st.caption("No setups waiting to fill.")
-    elif st.button(f"Re-check {len(_pending)} waiting setup(s)", use_container_width=True):
-        _out = []
-        bar = st.progress(0.0, text="Checking…")
-        for i_, (_, sg) in enumerate(_pending.iterrows()):
-            bar.progress(i_ / max(len(_pending), 1), text=sg["ticker"])
-            _created = pd.Timestamp(sg["created_utc"])
-            _created = _created.tz_localize("UTC") if _created.tzinfo is None else _created
-            try:
-                _fr, _since, _px, _now = _review_inputs(sg["ticker"], _created)
-                if _px is None:
-                    _out.append((sg, None, "No current price available."))
-                    continue
-                _v = trade_review.setup_still_viable(
-                    sg["direction"], float(sg["entry"]), float(sg["stop"]), _created,
-                    float(_px), _now, _fr["4h"],
-                    trend_candles=(TR_PARAMS.trend_candles if TR_PARAMS else 2))
-                _out.append((sg, _v, None))
-            except Exception as e:
-                _out.append((sg, None, f"{type(e).__name__}: {e}"))
-        bar.empty()
-        st.session_state.viability = _out
-
-    for sg, _v, _err in st.session_state.get("viability", []):
-        with st.container(border=True):
-            _age = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(sg["created_utc"]).tz_localize(
-                "UTC") if pd.Timestamp(sg["created_utc"]).tzinfo is None
-                else pd.Timestamp.now(tz="UTC") - pd.Timestamp(sg["created_utc"]))
-            st.markdown(f"**{sg['direction']} {sg['label'] or sg['ticker']}** "
-                        f"· {sg.get('grade') or '—'} · saved "
-                        f"{_age.total_seconds() / 3600:.0f}h ago")
-            st.caption(f"Entry {format_price(sg['entry'])} · stop {format_price(sg['stop'])} "
-                       f"· target {format_price(sg['target'])}")
-            if _err or _v is None:
-                st.caption(f"Couldn't check: {_err}")
-                continue
-            box = {trade_review.STILL_VALID: st.success}.get(_v.verdict, st.warning)
-            box(f"**{_v.verdict}** · now {format_price(_v.price)}")
-            for why in _v.reasons:
-                st.caption(f"• {why}")
-            if _v.verdict != trade_review.STILL_VALID:
-                if st.button("Cancel this setup", key=f"vcancel_{int(sg['id'])}"):
-                    storage.update_signal(int(sg["id"]), status="EXPIRED",
-                                          exit_utc=datetime.now(timezone.utc).isoformat())
-                    st.session_state.viability = [
-                        x for x in st.session_state.viability if x[0]["id"] != sg["id"]]
-                    st.rerun()
-
     st.markdown("##### 🧠 Learn from the app's own trades")
     _tt = tracking.tracked_trades()
     _usable = [t for t in _tt if t.status in ("WIN", "LOSS") and t.features]
@@ -3248,7 +3549,158 @@ with tab_track:
             st.error(str(e))
 
 with tab_backtest:
-  if USE_TR:
+  if USE_SWING:
+    st.subheader("Backtest — Swing Levels")
+    st.caption(
+        "Replays the swing rules over daily history. Daily candles go back years, so "
+        "unlike the 5-minute strategy this can be tested over real market conditions "
+        "rather than a fortnight. At each step only candles that had already closed are "
+        "visible."
+    )
+    st.warning(
+        "No strategy guarantees profit. This shows how the rules would have performed on "
+        "past data. Ambiguous candles resolve pessimistically, so results lean worse "
+        "rather than better."
+    )
+    sb1, sb2 = st.columns(2)
+    swb_size = sb1.selectbox("Coins", [5, 10, 20, 30], index=1, key="swb_size",
+                             format_func=lambda n: f"Top {n}")
+    swb_fee = sb2.number_input("Costs per trade (R)", min_value=0.0, value=0.05, step=0.01,
+                               format="%.2f", key="swb_fee")
+    swb_confirm = st.checkbox("Require a confirming daily candle", value=True,
+                              key="swb_confirm",
+                              help="Off takes many more trades — worth testing both ways.")
+
+    if st.button("▶ Run swing backtest", use_container_width=True, key="swb_run"):
+        labels = list(CRYPTO_TICKERS)[:swb_size]
+        trades, fails, srcs, variants = [], [], set(), {}
+        bar = st.progress(0.0, text="Starting…")
+        for i_, lbl in enumerate(labels):
+            tk = CRYPTO_TICKERS[lbl]
+            bar.progress(i_ / max(len(labels), 1), text=f"{i_ + 1}/{len(labels)} · {lbl}")
+            base = tk.upper().replace("-USD", "")
+            df, err = hyperliquid_data.fetch_candles(f"HL:{base}", "1d", 1000)
+            src = "Hyperliquid"
+            if df is None or len(df) < 200:
+                df, err = exchanges.fetch_bybit_klines(tk, "1d", limit=1000)
+                src = "Bybit"
+            if df is None or len(df) < 200:
+                df, err = exchanges.fetch_binance_klines(tk, "1d", limit=1000)
+                src = "Binance"
+            if df is None or len(df) < 200:
+                fails.append(f"{lbl}: {err or 'not enough daily history'}")
+                continue
+            srcs.add(f"{src} ({len(df)} days)")
+            _vars = swing.run_variants(df, tk, params=SWING_PARAMS, fee_r=swb_fee,
+                                        require_confirmation=swb_confirm)
+            for _vname, _vtrades in _vars.items():
+                variants.setdefault(_vname, []).extend(_vtrades)
+            trades += _vars["Hard stop, fixed target"]
+        bar.empty()
+        st.session_state.swb = (trades, fails, sorted(srcs))
+        st.session_state.swb_variants = variants
+
+    _swb = st.session_state.get("swb")
+    if _swb:
+        trades, fails, srcs = _swb
+        if srcs:
+            st.caption("Daily candles from: " + ", ".join(srcs) + ".")
+        if not trades:
+            st.info("No setups met the rules over this history. With a confirming candle "
+                    "required and a 3:1 minimum, that can happen — try switching the "
+                    "confirmation off, or scanning more coins.")
+        else:
+            stats = stats_by_grade(trades)
+            st.dataframe(pd.DataFrame([{
+                "Grade": s_.grade, "Signals": s_.signals, "Filled": s_.filled,
+                "Wins": s_.wins, "Losses": s_.losses, "Expired": s_.expired,
+                "Win rate": f"{s_.win_rate:.0%}" if s_.win_rate is not None else "—",
+                "Avg R / trade": f"{s_.avg_r:+.2f}" if s_.avg_r is not None else "—",
+                "Total R": f"{s_.total_r:+.1f}",
+                "Enough data?": "yes" if s_.enough_data else "no (<30)",
+            } for s_ in stats]), use_container_width=True, hide_index=True)
+            v = verdict(stats)
+            (st.success if "separated better" in v else st.warning)(v)
+
+            _all = next(x for x in stats if x.grade == "All")
+            _resolved = _all.wins + _all.losses
+            if _resolved >= 10 and _all.win_rate is not None:
+                _rr = SWING_PARAMS.min_rr if SWING_PARAMS else 3.0
+                ex = expectancy.simulate_expectations(_all.win_rate, _rr,
+                                                       risk_pct=RISK_PCT, n_trades=100)
+                st.caption(
+                    f"At this win rate ({_all.win_rate:.0%}) and {_rr:g}:1, expect "
+                    f"{ex.expected_total_pct:+.0f}% over 100 trades, a losing streak of "
+                    f"about {ex.streak_typical} (up to {ex.streak_bad}), and a worst "
+                    f"drop of around {ex.drawdown_typical_pct:.0f}%.")
+
+            _vars = st.session_state.get("swb_variants") or {}
+            if _vars:
+                st.markdown("##### Does a trailing stop help?")
+                st.caption(
+                    "The same strategy with the stop managed different ways. A trailing "
+                    "stop protects profit but takes you out before the target — at 3:1 the "
+                    "few full winners are what pay for the losses, so cutting them short "
+                    "can cost more than it saves. Trade counts differ slightly because an "
+                    "earlier exit frees you to take the next setup sooner."
+                )
+                _rows = []
+                for _vn, _vt in _vars.items():
+                    _res = [t for t in _vt if t.r_result is not None]
+                    if not _res:
+                        continue
+                    _tot = sum(t.r_result for t in _res)
+                    _wins = sum(1 for t in _res if t.r_result > 0)
+                    _sd = (pd.Series([t.r_result for t in _res]).std(ddof=1)
+                           if len(_res) > 1 else 0.0)
+                    _luck = 2 * float(_sd) * (len(_res) ** 0.5)
+                    _rows.append({"Stop management": _vn, "Trades": len(_res),
+                                   "Win rate": f"{_wins / len(_res):.0%}",
+                                   "Avg R": f"{_tot / len(_res):+.2f}",
+                                   "Total R": f"{_tot:+.1f}",
+                                   "Luck range": f"±{_luck:.0f}",
+                                   "_t": _tot, "_l": _luck})
+                if _rows:
+                    st.dataframe(pd.DataFrame(_rows).drop(columns=["_t", "_l"]),
+                                 use_container_width=True, hide_index=True)
+                    _base = next((r for r in _rows
+                                  if r["Stop management"].startswith("Hard stop")), None)
+                    _best = max(_rows, key=lambda r: r["_t"])
+                    if _base and _best["Stop management"] != _base["Stop management"]:
+                        _diff = _best["_t"] - _base["_t"]
+                        if abs(_diff) < max(_best["_l"], _base["_l"]):
+                            st.info(
+                                f"**{_best['Stop management']}** came out ahead by "
+                                f"{_diff:+.1f}R, but that's inside the luck range — no "
+                                f"real evidence either way yet. A plain hard stop is the "
+                                f"simpler default.")
+                        else:
+                            st.success(
+                                f"**{_best['Stop management']}** beat a plain hard stop by "
+                                f"{_diff:+.1f}R, by more than luck explains.")
+                    elif _base:
+                        st.info("A plain hard stop with a fixed target came out best here — "
+                                "trailing cut winners short more than it saved on losers.")
+
+            _m = learning.learn([t for t in trades], source=f"swing backtest, {len(trades)}")
+            st.markdown("##### 🧠 What the system learned")
+            _render_learned(_m)
+            _md = _m.to_dict()
+            _md["config"] = _config_signature(False, None) + "|SWING"
+            storage.save_value("learned_model", _md)
+
+            with st.expander(f"All {len(trades)} simulated trades"):
+                st.dataframe(pd.DataFrame([{
+                    "Coin": t.ticker, "Signal": t.signal_time, "Dir": t.direction,
+                    "Grade": t.grade, "Entry": format_price(t.entry),
+                    "Stop": format_price(t.stop), "Target": format_price(t.target),
+                    "Outcome": t.status,
+                    "R": f"{t.r_result:+.2f}" if t.r_result is not None else "—",
+                } for t in trades]), use_container_width=True, hide_index=True)
+        for f_ in fails:
+            st.caption(f"⚠️ {f_}")
+
+  elif USE_TR:
     st.subheader("Backtest — Trend Retrace (your strategy)")
     st.caption(
         "Replays your rules candle by candle on 5-minute data: two 4H HH/HL candles, a "

@@ -195,3 +195,38 @@ class TestSetupSnapshots(Base):
     def test_tracked_trades_feed_the_learner(self):
         from learning import learn
         self.assertEqual(learn(tracking.tracked_trades(self.db)).n_trades, 0)
+
+
+class TestRecordingEverySetup(Base):
+    def test_grades_none_records_weak_setups_too(self):
+        rows = [ranked(grade="A+"), ranked(label="E", ticker="ETH-USD", grade="C")]
+        added = tracking.record_from_ranked(rows, grades=None, db_path=self.db)
+        self.assertEqual(added, 2)
+
+    def test_default_still_records_only_the_good_ones(self):
+        rows = [ranked(grade="A+"), ranked(label="E", ticker="ETH-USD", grade="C")]
+        self.assertEqual(tracking.record_from_ranked(rows, db_path=self.db), 1)
+
+    def test_record_one_from_a_single_check(self):
+        class Plan:
+            ticker, direction, entry, stop, target = "SOL-USD", "Long", 100.0, 97.0, 109.0
+            score, grade, reward_risk = 10.0, "A+", 3.0
+            features = {"x": 1}
+        sid = tracking.record_one(Plan(), source="single", db_path=self.db)
+        self.assertIsNotNone(sid)
+        row = storage.get_signals_df(self.db).iloc[0]
+        self.assertEqual(row["ticker"], "SOL-USD")
+        self.assertEqual(row["status"], "PENDING")
+
+    def test_incomplete_plan_is_not_saved(self):
+        class Plan:
+            ticker, direction, entry, stop, target = "SOL-USD", "Long", 100.0, 97.0, None
+            score, grade, reward_risk = 7.0, "B", None
+        self.assertIsNone(tracking.record_one(Plan(), db_path=self.db))
+
+    def test_saving_the_same_setup_twice_does_not_duplicate(self):
+        class Plan:
+            ticker, direction, entry, stop, target = "SOL-USD", "Long", 100.0, 97.0, 109.0
+            score, grade, reward_risk = 10.0, "A+", 3.0
+        tracking.record_one(Plan(), db_path=self.db)
+        self.assertIsNone(tracking.record_one(Plan(), db_path=self.db))

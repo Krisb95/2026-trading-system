@@ -73,3 +73,28 @@ class TestWidget(unittest.TestCase):
 
     def test_symbol_can_be_changed_inside_the_widget(self):
         self.assertTrue(self._config(widget_html("X"))["allow_symbol_change"])
+
+
+class TestSizing(unittest.TestCase):
+    """Autosize measured the sandboxed iframe wrongly and rendered a tiny
+    chart on mobile, so the height is passed explicitly."""
+
+    def _config(self, html):
+        import json, re
+        return json.loads(re.search(r"async>\s*(\{.*?\})\s*</script>", html, re.S).group(1))
+
+    def test_height_is_explicit_not_autosized(self):
+        cfg = self._config(widget_html("X", height=800))
+        self.assertFalse(cfg["autosize"])
+        self.assertEqual(cfg["height"], 800 - 28)
+
+    def test_container_matches_the_requested_height(self):
+        self.assertIn("height:900px", widget_html("X", height=900))
+
+    def test_width_fills_the_space(self):
+        self.assertEqual(self._config(widget_html("X"))["width"], "100%")
+
+    def test_taller_request_gives_a_taller_chart(self):
+        small = self._config(widget_html("X", height=400))["height"]
+        large = self._config(widget_html("X", height=900))["height"]
+        self.assertGreater(large, small)

@@ -320,7 +320,9 @@ class SwingTrade:
 def run_backtest(df_daily: pd.DataFrame, ticker: str,
                  params: Optional[SwingParams] = None, warmup: int = 120,
                  expiry_days: int = 10, fee_r: float = 0.0,
-                 require_confirmation: bool = True) -> List[SwingTrade]:
+                 require_confirmation: bool = True,
+                 breakeven_at_r: Optional[float] = None,
+                 trail_atr_mult: Optional[float] = None) -> List[SwingTrade]:
     """Replay the swing rules over daily history, one trade at a time."""
     from trade_sim import simulate_limit_trade, EXPIRED
 
@@ -346,7 +348,10 @@ def run_backtest(df_daily: pd.DataFrame, ticker: str,
         future = df_daily.iloc[t + 1:]
         try:
             sim = simulate_limit_trade(future, plan.direction, plan.entry, plan.stop,
-                                        plan.target, expiry_bars=expiry_days, fee_r=fee_r)
+                                        plan.target, expiry_bars=expiry_days, fee_r=fee_r,
+                                        breakeven_at_r=breakeven_at_r,
+                                        trail_atr_mult=trail_atr_mult,
+                                        atr_value=daily_atr(past))
         except ValueError:
             continue
 
@@ -421,3 +426,33 @@ def scan_universe(instruments, frame_loader, spot_loader=None,
 
     out.sort(key=key_fn)
     return out
+
+
+# Stop-management options, so the choice can be measured rather than argued.
+STOP_VARIANTS = {
+    "Hard stop, fixed target": {},
+    "Breakeven at 1R": {"breakeven_at_r": 1.0},
+    "Trail 2x ATR": {"trail_atr_mult": 2.0},
+    "Trail 3x ATR": {"trail_atr_mult": 3.0},
+    "Breakeven at 1R + trail 3x ATR": {"breakeven_at_r": 1.0, "trail_atr_mult": 3.0},
+}
+
+
+def run_variants(df_daily: pd.DataFrame, ticker: str,
+                 params: Optional[SwingParams] = None, warmup: int = 120,
+                 expiry_days: int = 10, fee_r: float = 0.0,
+                 require_confirmation: bool = True,
+                 variants: Optional[Dict[str, Dict]] = None
+                 ) -> Dict[str, List[SwingTrade]]:
+    """The same strategy, with the stop managed several different ways.
+
+    Trade counts differ slightly between variants, and that is realistic rather
+    than a flaw: a trailing stop exits earlier, which frees you to take the next
+    setup sooner (only one trade runs at a time). So the fair comparison is the
+    TOTAL result over the same history, not a trade-by-trade one.
+    """
+    variants = variants or STOP_VARIANTS
+    return {name: run_backtest(df_daily, ticker, params=params, warmup=warmup,
+                                expiry_days=expiry_days, fee_r=fee_r,
+                                require_confirmation=require_confirmation, **kw)
+            for name, kw in variants.items()}

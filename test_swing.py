@@ -266,3 +266,88 @@ class TestSwingBacktest(unittest.TestCase):
         trades = run_backtest(self._market(), "X", require_confirmation=False)
         if trades:
             self.assertIn("level_touches", trades[0].features)
+
+
+class TestSwingUniverseScan(unittest.TestCase):
+    def _loader(self, key):
+        return zigzag(rising=True) if key != "flat" else daily([100] * 200)
+
+    def test_returns_a_row_per_instrument(self):
+        from swing import scan_universe
+        out = scan_universe([("Bitcoin", "BTC-USD", "a"), ("Ether", "ETH-USD", "b")],
+                            self._loader)
+        self.assertEqual(len(out), 2)
+
+    def test_best_setups_rank_first(self):
+        from swing import scan_universe
+        out = scan_universe([("Flat", "F-USD", "flat"), ("Trend", "T-USD", "a")],
+                            self._loader)
+        self.assertEqual(out[0].label, "Trend")
+
+    def test_failures_are_reported_not_dropped(self):
+        from swing import scan_universe
+
+        def loader(key):
+            if key == "bad":
+                raise ConnectionError("down")
+            return zigzag()
+
+        out = scan_universe([("Bad", "B-USD", "bad"), ("Good", "G-USD", "a")], loader)
+        self.assertEqual(len(out), 2)
+        self.assertTrue(any(r.error for r in out))
+
+    def test_empty_candles_reported(self):
+        from swing import scan_universe
+        out = scan_universe([("X", "X-USD", "x")], lambda k: pd.DataFrame())
+        self.assertIn("No daily candles", out[0].error)
+
+    def test_live_price_is_used_when_given(self):
+        from swing import scan_universe
+        out = scan_universe([("X", "X-USD", "a")], self._loader,
+                            spot_loader=lambda k: 250.0)
+        self.assertTrue(out[0].price_is_live)
+        self.assertAlmostEqual(out[0].price, 250.0)
+
+    def test_rows_carry_features_for_learning(self):
+        from swing import scan_universe
+        out = scan_universe([("X", "X-USD", "a")], self._loader)
+        if out[0].entry:
+            self.assertIn("level_touches", out[0].features)
+
+
+class TestStopManagementVariants(unittest.TestCase):
+    def _market(self, seed=4, n=700):
+        rng = np.random.default_rng(seed)
+        return daily(list(100 * np.exp(np.cumsum(rng.normal(0.0006, 0.02, n)))))
+
+    def test_variants_take_broadly_the_same_trades(self):
+        """Counts differ a little because an earlier exit frees you to take the
+        next setup sooner — realistic, not a flaw. They should stay close."""
+        from swing import run_variants
+        out = run_variants(self._market(), "X", require_confirmation=False)
+        counts = [len(ts) for ts in out.values()]
+        self.assertLessEqual(max(counts) - min(counts), max(3, min(counts) // 4),
+                             f"variants should be broadly comparable: {counts}")
+
+    def test_variants_produce_different_results(self):
+        from swing import run_variants
+        out = run_variants(self._market(), "X", require_confirmation=False)
+        totals = {n: sum(t.r_result for t in ts if t.r_result is not None)
+                  for n, ts in out.items()}
+        self.assertGreater(len(set(round(v, 6) for v in totals.values())), 1)
+
+    def test_breakeven_reduces_full_losses(self):
+        from swing import run_variants
+        out = run_variants(self._market(), "X", require_confirmation=False)
+        def full_losses(ts):
+            return sum(1 for t in ts if t.r_result is not None and t.r_result <= -0.99)
+        self.assertLessEqual(full_losses(out["Breakeven at 1R"]),
+                             full_losses(out["Hard stop, fixed target"]))
+
+    def test_no_trade_is_worse_than_minus_one_r(self):
+        from swing import run_variants
+        for name, ts in run_variants(self._market(), "X",
+                                      require_confirmation=False).items():
+            for t in ts:
+                if t.r_result is not None:
+                    self.assertGreaterEqual(t.r_result, -1.0 - 1e-9, name)
