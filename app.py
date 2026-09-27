@@ -481,7 +481,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-27-b70 (fixed duplicate loader; one venue per coin)"
+APP_BUILD = "2026-09-27-b71 (CoinGecko price reference; Coinbase added)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -738,6 +738,11 @@ def _exchange_has(symbol: str):
     if df is not None and not df.empty:
         return ticker, "Kraken"
     return None, None
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_cg_bulk(coin_ids):
+    return coingecko.fetch_prices_bulk(list(coin_ids))
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -1777,6 +1782,9 @@ with tab_scan:
                     return q.price if q and q.price else None
 
                 base = ticker.upper().replace("HL:", "").replace("-USD", "")
+                _ref = _REF_PRICES.get(ticker)
+                if _ref:
+                    return _ref            # CoinGecko: the price you'd verify against
                 _from = (_loader_notes.get(ticker) or (None, ""))[0] or ""
 
                 if hyperliquid_data.is_hl_ticker(ticker) or _from.startswith("Hyperliquid"):
@@ -1808,10 +1816,20 @@ with tab_scan:
             _loader_notes = {}
             _last_closes = {}
             _HL_MARKS = {}
+            _REF_PRICES = {}          # ticker -> CoinGecko price, the reference
             if not NON_CRYPTO:
                 _ctx, _cerr = _cached_hl_contexts()
                 _HL_MARKS = {c["name"].upper(): c["mark"] for c in (_ctx or [])
                              if c.get("mark")}
+                # CoinGecko aggregates across exchanges and is reachable from
+                # anywhere, so it is the reference every candle source gets
+                # checked against. A source whose last close disagrees with it
+                # is describing a different market — or a different week.
+                _ids = {t: CRYPTO_CG_IDS.get(l) for l, t, _k in instruments}
+                _cg_prices, _cg_err = _cached_cg_bulk(
+                    tuple(sorted({v for v in _ids.values() if v})))
+                _REF_PRICES = {t: _cg_prices.get(cid) for t, cid in _ids.items()
+                               if cid and _cg_prices.get(cid)}
 
             def _tr_loader(payload):
                 """4H, 1H and 5m candles for the Trend Retrace rules."""
@@ -1828,16 +1846,34 @@ with tab_scan:
                 # nowhere near the market.
                 def _five_minute():
                     tried = []
-                    hl, _e = hyperliquid_data.fetch_candles(f"HL:{base}", "5m", 1000)
-                    tried.append(("Hyperliquid", hl))
                     if CRYPTO_SOURCE == "bybit":
                         bb, _e = exchanges.fetch_bybit_klines(ticker, "5m", limit=1000)
                         tried.append(("Bybit", bb))
                     bi, _e = exchanges.fetch_binance_klines(ticker, "5m", limit=1000)
                     tried.append(("Binance", bi))
+                    cb, _e = exchanges.fetch_coinbase_candles(ticker, "5m", limit=300)
+                    tried.append(("Coinbase", cb))
                     kr, _e = exchanges.fetch_kraken_ohlc(ticker, "5m")
                     tried.append(("Kraken", kr))
-                    return frame_check.first_valid(tried, "5m", min_bars=300)
+                    hl, _e = hyperliquid_data.fetch_candles(f"HL:{base}", "5m", 1000)
+                    tried.append(("Hyperliquid", hl))
+
+                    # Drop any source whose last close disagrees with the
+                    # reference price — that is the check that was missing.
+                    ref = _REF_PRICES.get(ticker)
+                    checked, rejected = [], []
+                    for name, frame in tried:
+                        if frame is not None and not frame.empty and ref:
+                            close = float(frame["Close"].iloc[-1])
+                            gap = abs(close - ref) / ref * 100
+                            if gap > 5:
+                                rejected.append(
+                                    f"{name}: last close {close:,.6g} vs {ref:,.6g} on "
+                                    f"CoinGecko ({gap:.0f}% out)")
+                                continue
+                        checked.append((name, frame))
+                    df_, src_, why_ = frame_check.first_valid(checked, "5m", min_bars=200)
+                    return df_, src_, "; ".join(rejected + ([why_] if why_ else []))
 
                 df, src, why = _five_minute()
                 if df is not None:

@@ -414,3 +414,37 @@ def fetch_description(coin_id: str, timeout: int = 15):
         return text, home, None
     except Exception as e:
         return None, None, f"{type(e).__name__}: {e}"
+
+
+SIMPLE_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
+
+
+def fetch_prices_bulk(coin_ids, timeout: int = 15):
+    """Current USD price for many coins in one request.
+
+    CoinGecko aggregates across exchanges, so this is the best available answer
+    to "what is this coin actually worth right now" — and it is reachable from
+    anywhere, unlike the exchange APIs that block US-hosted servers. Used as the
+    reference every candle source is checked against.
+
+    Returns ({coin_id: price}, error).
+    """
+    ids = [c for c in dict.fromkeys(coin_ids) if c]
+    if not ids:
+        return {}, None
+    out = {}
+    # The URL is length-limited, so ask in batches.
+    for i in range(0, len(ids), 100):
+        batch = ids[i:i + 100]
+        resp, err = _throttled_get(SIMPLE_PRICE_URL,
+                                   {"ids": ",".join(batch), "vs_currencies": "usd"}, timeout)
+        if resp is None:
+            return out, err
+        try:
+            for coin_id, payload in (resp.json() or {}).items():
+                price = (payload or {}).get("usd")
+                if price:
+                    out[coin_id] = float(price)
+        except Exception as e:
+            return out, f"{type(e).__name__}: {e}"
+    return out, (None if out else "CoinGecko returned no prices.")

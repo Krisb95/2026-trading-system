@@ -114,8 +114,17 @@ def _get(url, params, timeout=10):
 
 
 def base_asset(ticker: str) -> str:
-    """'BTC-USD' -> 'BTC'."""
-    return ticker.upper().replace("-USD", "").replace("USD", "").strip()
+    """'BTC-USD' -> 'BTC', and 'HL:SOL' -> 'SOL'.
+
+    The venue prefix has to come off too: without it, a Hyperliquid ticker
+    became 'HL:SOLUSDT' on Bybit and 'HL:SOL-USD' on Coinbase — symbols no
+    exchange recognises, so those coins silently fell through to another
+    source.
+    """
+    raw = ticker.upper().strip()
+    if ":" in raw:
+        raw = raw.split(":", 1)[1]
+    return raw.replace("-USD", "").replace("USD", "").strip()
 
 
 def to_binance_symbol(ticker: str) -> str:
@@ -443,3 +452,49 @@ def fetch_bybit_price(ticker: str) -> Tuple[Optional[float], Optional[str]]:
         return (price, None) if price > 0 else (None, "Non-positive price.")
     except (TypeError, ValueError) as e:
         return None, f"{type(e).__name__}"
+
+
+# ---------------------------------------------------------------------
+# Coinbase
+#
+# US-hosted and therefore reachable from Streamlit Cloud, unlike Bybit and
+# Binance. Coverage is smaller than Binance but good for majors, so it fills
+# the gap left when the two big venues refuse.
+# ---------------------------------------------------------------------
+
+COINBASE_CANDLES = "https://api.exchange.coinbase.com/products/{product}/candles"
+COINBASE_GRANULARITY = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 21600,
+                        "1d": 86400}
+
+
+def to_coinbase_product(ticker: str) -> str:
+    return f"{base_asset(ticker)}-USD"
+
+
+def fetch_coinbase_candles(ticker: str, interval: str, limit: int = 300
+                            ) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    """OHLCV candles from Coinbase, oldest first.
+
+    Note Coinbase has no true 4h granularity — 21600 is six hours — so 4h is
+    not offered here; build it from 5m or 1h instead.
+    """
+    if interval not in COINBASE_GRANULARITY or interval == "4h":
+        return None, f"Coinbase has no {interval} candles."
+    resp, err = _get(COINBASE_CANDLES.format(product=to_coinbase_product(ticker)),
+                     {"granularity": COINBASE_GRANULARITY[interval]})
+    if resp is None:
+        return None, err
+    try:
+        rows = resp.json()
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    if not isinstance(rows, list) or not rows:
+        return None, "Not listed on Coinbase."
+    try:
+        df = pd.DataFrame(rows, columns=["time", "Low", "High", "Open", "Close", "Volume"])
+        df["ts"] = pd.to_datetime(df["time"].astype("int64"), unit="s", utc=True)
+        df = df.set_index("ts")[["Open", "High", "Low", "Close", "Volume"]].astype(float)
+        df = df.sort_index().tail(limit)
+    except (KeyError, ValueError, TypeError) as e:
+        return None, f"Malformed Coinbase candles: {type(e).__name__}"
+    return (df, None) if not df.empty else (None, "Coinbase returned no candles.")
