@@ -481,7 +481,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-27-b72 (reference price for every scan mode)"
+APP_BUILD = "2026-09-27-b73 (swing scan validated too)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -1938,25 +1938,57 @@ with tab_scan:
 
             if USE_SWING:
                 _daily_cache = {}
+                # Hyperliquid last, not first — it is the source that was
+                # returning prices from another period entirely.
 
                 def _daily_loader(payload):
+                    """Daily candles, checked the same way as the 5m ones.
+
+                    This path previously trusted whatever Hyperliquid returned,
+                    which is how a swing scan could price NEAR at 1.57 while it
+                    traded at 5.49. Every source is now compared against the
+                    CoinGecko reference before use.
+                    """
                     tk = payload[0] if isinstance(payload, tuple) else payload
                     if tk in _daily_cache:
                         return _daily_cache[tk]
-                    df = None
                     if NON_CRYPTO:
                         _fr, _p = _yahoo_frames(tk)
                         df = _fr.get("1d")
                         if df is None or df.empty:
                             _h = yf.Ticker(tk).history(period="3y", interval="1d")
                             df = _h.rename(columns=str.title) if _h is not None else None
-                    else:
-                        base = tk.upper().replace("HL:", "").replace("-USD", "")
-                        df = _bulk_daily.get(base)
-                        if df is None:
-                            df, _e = exchanges.fetch_bybit_klines(tk, "1d", limit=1000)
-                        if df is None:
-                            df, _e = exchanges.fetch_binance_klines(tk, "1d", limit=1000)
+                        _daily_cache[tk] = df
+                        return df
+
+                    base = exchanges.base_asset(tk)
+                    tried = []
+                    if CRYPTO_SOURCE == "bybit":
+                        _d, _e = exchanges.fetch_bybit_klines(tk, "1d", limit=1000)
+                        tried.append(("Bybit", _d))
+                    _d, _e = exchanges.fetch_binance_klines(tk, "1d", limit=1000)
+                    tried.append(("Binance", _d))
+                    _d, _e = exchanges.fetch_coinbase_candles(tk, "1d", limit=300)
+                    tried.append(("Coinbase", _d))
+                    _d, _e = exchanges.fetch_kraken_ohlc(tk, "1d")
+                    tried.append(("Kraken", _d))
+                    tried.append(("Hyperliquid", _bulk_daily.get(base)))
+
+                    ref = _REF_PRICES.get(tk)
+                    checked, rejected = [], []
+                    for name, frame in tried:
+                        if frame is not None and not frame.empty and ref:
+                            close = float(frame["Close"].iloc[-1])
+                            gap = abs(close - ref) / ref * 100
+                            if gap > 8:      # daily closes move more than 5m ones
+                                rejected.append(f"{name}: last close {close:,.6g} vs "
+                                                f"{ref:,.6g} reference ({gap:.0f}% out)")
+                                continue
+                        checked.append((name, frame))
+                    df, src, why = frame_check.first_valid(checked, "1d", min_bars=120)
+                    _loader_notes[tk] = (src, "; ".join(rejected + ([why] if why else [])))
+                    if df is not None:
+                        _last_closes[tk] = float(df["Close"].iloc[-1])
                     _daily_cache[tk] = df
                     return df
 
@@ -2055,6 +2087,27 @@ with tab_scan:
                         direction_override=None if uni_direction == "Auto" else uni_direction,
                         progress_callback=_progress, spot_loader=_spot)
             bar.empty()
+            if _loader_notes:
+                _bad = {t: n for t, n in _loader_notes.items() if n[1]}
+                _used = {t: n[0] for t, n in _loader_notes.items() if n[0]}
+                with st.expander(
+                        f"🔧 Data check — sources used"
+                        + (f" · {len(_bad)} source(s) rejected" if _bad else "")):
+                    st.caption("Every source is compared against the CoinGecko price before "
+                               "its candles are used. Anything more than a few percent out "
+                               "is a different market or a different week, and is refused.")
+                    if _used:
+                        st.dataframe(pd.DataFrame(
+                            [{"Ticker": t, "Candles from": s,
+                              "Reference price": format_price(_REF_PRICES.get(t))
+                                                 if _REF_PRICES.get(t) else "—",
+                              "Last close": format_price(_last_closes.get(t))
+                                            if _last_closes.get(t) else "—"}
+                             for t, s in _used.items()]),
+                            use_container_width=True, hide_index=True)
+                    for t, (s, why) in _bad.items():
+                        st.caption(f"**{t}** — {why}")
+
             _d = st.session_state.get("scan_diag") or {}
             if _d:
                 _now = pd.Timestamp.now(tz="UTC")
