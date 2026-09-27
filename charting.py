@@ -75,7 +75,7 @@ def to_tradingview_symbol(ticker: str, market: str = "Crypto",
     return f"{exchange.upper()}:{base}USDT.P"
 
 
-def widget_html(symbol: str, interval: str = "4h", height: int = 620,
+def widget_html(symbol: str, interval: str = "4h", height: int = 700,
                 theme: str = "dark", studies: Optional[list] = None) -> str:
     """The TradingView Advanced Chart widget, with drawing tools enabled.
 
@@ -85,8 +85,14 @@ def widget_html(symbol: str, interval: str = "4h", height: int = 620,
     tv_interval = INTERVALS.get(interval, "240")
     studies = studies or []
     import json
+    # An explicit height beats autosize here: autosize measures the parent, and
+    # inside Streamlit's sandboxed iframe that measurement comes back far
+    # smaller than the space actually given, which rendered a postage-stamp
+    # chart on a phone.
     config = {
-        "autosize": True,
+        "autosize": False,
+        "width": "100%",
+        "height": height - 28,
         "symbol": symbol,
         "interval": tv_interval,
         "timezone": "Australia/Sydney",
@@ -102,9 +108,9 @@ def widget_html(symbol: str, interval: str = "4h", height: int = 620,
         "support_host": "https://www.tradingview.com",
     }
     return f"""
-<div class="tradingview-widget-container" style="height:{height}px;width:100%">
+<div class="tradingview-widget-container" style="height:{height}px;width:100%;margin:0">
   <div class="tradingview-widget-container__widget"
-       style="height:calc(100% - 32px);width:100%"></div>
+       style="height:{height - 28}px;width:100%"></div>
   <div class="tradingview-widget-copyright">
     <a href="https://www.tradingview.com/" rel="noopener nofollow" target="_blank">
       <span style="color:#9FB0D0;font:12px sans-serif">Charts by TradingView</span></a>
