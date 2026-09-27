@@ -481,7 +481,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-27-b71 (CoinGecko price reference; Coinbase added)"
+APP_BUILD = "2026-09-27-b72 (reference price for every scan mode)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -548,6 +548,25 @@ def _cached_cg_spot(coin_id: str):
 
 
 CRYPTO_TICKERS_ALL, CRYPTO_CG_IDS, CRYPTO_IS_LIVE, CRYPTO_NOTE = _load_crypto_universe()
+
+# CoinGecko ids keyed by SYMBOL as well as label. The watchlist and volume
+# scans build their own labels, so a label-only lookup found nothing for them —
+# which meant no reference price, and nothing to catch bad candles with.
+CRYPTO_CG_BY_SYMBOL = {
+    exchanges.base_asset(CRYPTO_TICKERS_ALL[lbl]): cg_id
+    for lbl, cg_id in CRYPTO_CG_IDS.items()
+    if lbl in CRYPTO_TICKERS_ALL and cg_id
+}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _cg_id_for_symbol(symbol: str):
+    """CoinGecko id for a ticker symbol, searching if it isn't in the top 100."""
+    sym = (symbol or "").upper()
+    if sym in CRYPTO_CG_BY_SYMBOL:
+        return CRYPTO_CG_BY_SYMBOL[sym]
+    matches, _err = coingecko.search_coins(sym)
+    return matches[0]["id"] if matches else None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1825,10 +1844,22 @@ with tab_scan:
                 # anywhere, so it is the reference every candle source gets
                 # checked against. A source whose last close disagrees with it
                 # is describing a different market — or a different week.
-                _ids = {t: CRYPTO_CG_IDS.get(l) for l, t, _k in instruments}
+                # Bundled markets (Hyperliquid's kPEPE, kBONK…) are quoted per
+                # 1,000 coins, so the reference price has to be scaled to match
+                # or every one of them looks 1,000x wrong.
+                _ids, _mults = {}, {}
+                for l, t, _k in instruments:
+                    sym = exchanges.base_asset(t)
+                    mult = 1.0
+                    if (len(sym) > 1 and sym.startswith("K")
+                            and sym[1:] in CRYPTO_CG_BY_SYMBOL):
+                        sym, mult = sym[1:], 1000.0
+                    _ids[t] = CRYPTO_CG_IDS.get(l) or _cg_id_for_symbol(sym)
+                    _mults[t] = mult
                 _cg_prices, _cg_err = _cached_cg_bulk(
                     tuple(sorted({v for v in _ids.values() if v})))
-                _REF_PRICES = {t: _cg_prices.get(cid) for t, cid in _ids.items()
+                _REF_PRICES = {t: _cg_prices[cid] * _mults.get(t, 1.0)
+                               for t, cid in _ids.items()
                                if cid and _cg_prices.get(cid)}
 
             def _tr_loader(payload):
@@ -1872,6 +1903,28 @@ with tab_scan:
                                     f"CoinGecko ({gap:.0f}% out)")
                                 continue
                         checked.append((name, frame))
+                    if not ref:
+                        # No reference price available. Rather than trust a lone
+                        # source, require two to agree — one wrong feed can't
+                        # then set the levels on its own.
+                        closes = [(n, float(f["Close"].iloc[-1]))
+                                  for n, f in checked if f is not None and not f.empty]
+                        agreed = None
+                        for i_, (n1, c1) in enumerate(closes):
+                            for n2, c2 in closes[i_ + 1:]:
+                                if c1 > 0 and abs(c1 - c2) / c1 * 100 <= 5:
+                                    agreed = {n1, n2}
+                                    break
+                            if agreed:
+                                break
+                        if closes and agreed is None:
+                            spread = ", ".join(f"{n}={c:,.6g}" for n, c in closes)
+                            return None, None, (
+                                f"No CoinGecko price to check against, and the sources "
+                                f"disagree ({spread}) — so none can be trusted.")
+                        if agreed:
+                            checked = [(n, f) for n, f in checked if n in agreed]
+
                     df_, src_, why_ = frame_check.first_valid(checked, "5m", min_bars=200)
                     return df_, src_, "; ".join(rejected + ([why_] if why_ else []))
 
