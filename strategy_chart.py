@@ -265,6 +265,11 @@ def chart_spec(df: pd.DataFrame, levels: Optional[List[ChartLevel]] = None,
     return {
         "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
         "data": {"values": candles},
+        # Drag to pan, pinch or scroll to zoom — bound to both scales so the
+        # price axis rescales with the time axis.
+        "params": [{"name": "grid", "select": {"type": "interval",
+                                                "encodings": ["x", "y"]},
+                     "bind": "scales"}],
         "layer": layers,
         "height": height,
         "autosize": {"type": "fit", "contains": "padding"},

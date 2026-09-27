@@ -480,7 +480,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-27-b68 (chart renders reliably; trend line without a setup)"
+APP_BUILD = "2026-09-27-b69 (pan-zoom chart, price-mismatch guard, data check)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -1891,13 +1891,26 @@ with tab_scan:
                                 min(i / max(n, 1), 1.0), text=f"{i}/{n} · {nm}"))
                         _bulk = {tk: _fetched.get(key) for tk, key in _bulk_key.items()}
 
+                    _diag = {}
+
                     def _tr_loader_capture(payload):
                         _tk = payload[0]
                         _pre = _bulk.get(_tk)
                         if _pre is not None and len(_pre) >= 720:
                             frames = trend_retrace.frames_from_5m(_pre)
+                            _src = "Hyperliquid 5m (bulk)"
                         else:
                             frames = _tr_loader(payload)
+                            _src = "per-timeframe fallback"
+                        _f5 = frames.get("5m")
+                        if _f5 is not None and not _f5.empty:
+                            _diag[_tk] = {
+                                "source": _src, "bars": len(_f5),
+                                "first": _f5.index[0], "last": _f5.index[-1],
+                                "last_close": float(_f5["Close"].iloc[-1]),
+                                "low": float(_f5["Low"].min()),
+                                "high": float(_f5["High"].max()),
+                            }
                         # Keep the 5m structure so a ladder can be offered later
                         # without re-fetching everything.
                         _level_cache[payload[0]] = {
@@ -1908,6 +1921,7 @@ with tab_scan:
                     ranked = trend_retrace.scan_universe_tr(
                         instruments, _tr_loader_capture, spot_loader=_spot,
                         params=TR_PARAMS, progress=_progress, extra_features=_extra)
+                    st.session_state.scan_diag = _diag
                     st.session_state.uni_levels = {
                         r.ticker: {
                             "levels": trend_retrace.five_minute_levels(
@@ -1924,6 +1938,30 @@ with tab_scan:
                         direction_override=None if uni_direction == "Auto" else uni_direction,
                         progress_callback=_progress, spot_loader=_spot)
             bar.empty()
+            _d = st.session_state.get("scan_diag") or {}
+            if _d:
+                _now = pd.Timestamp.now(tz="UTC")
+                _rows_d = []
+                for _tk, _info in list(_d.items())[:60]:
+                    _age = (_now - _info["last"]).total_seconds() / 3600
+                    _rows_d.append({
+                        "Ticker": _tk, "Source": _info["source"], "Bars": _info["bars"],
+                        "Newest candle": _info["last"].strftime("%d %b %H:%M"),
+                        "Age (h)": f"{_age:.1f}",
+                        "Last close": format_price(_info["last_close"]),
+                        "Range": f"{format_price(_info['low'])}–"
+                                 f"{format_price(_info['high'])}",
+                    })
+                _stale_rows = [r for r in _rows_d if float(r["Age (h)"]) > 2]
+                with st.expander(
+                        f"🔧 Data check — where each price came from"
+                        + (f" ({len(_stale_rows)} look stale)" if _stale_rows else "")):
+                    st.caption("If a plan's levels look wrong, check this first: the newest "
+                               "candle should be minutes old and the last close should match "
+                               "the live price.")
+                    st.dataframe(pd.DataFrame(_rows_d), use_container_width=True,
+                                 hide_index=True)
+
             _blocked = exchanges.blocked_hosts()
             if _blocked:
                 st.caption("Unreachable from this server, so skipped: "
