@@ -53,7 +53,9 @@ def planned_reward_r(direction: str, entry: float, stop: float, target: float) -
 
 def simulate_limit_trade(bars: pd.DataFrame, direction: str, entry: float,
                           stop: float, target: float, expiry_bars: int,
-                          fee_r: float = 0.0) -> SimResult:
+                          fee_r: float = 0.0, breakeven_at_r: Optional[float] = None,
+                          trail_atr_mult: Optional[float] = None,
+                          atr_value: Optional[float] = None) -> SimResult:
     """Replay a limit order against bars that occur STRICTLY AFTER the signal.
 
     bars:        OHLC dataframe, oldest first, containing only post-signal bars
@@ -95,17 +97,36 @@ def simulate_limit_trade(bars: pd.DataFrame, direction: str, entry: float,
                           r_result=-1.0 - fee_r, bars_to_fill=fill_i, bars_in_trade=0)
 
     # --- phase 2: manage the open position ------------------------------
+    # Optional stop management. The stop is moved using only bars that have
+    # ALREADY closed, then tested on the next one — moving it with the same
+    # bar's high and then testing that bar's low would be using the future.
+    risk0 = abs(entry - stop)
+    stop_now = stop
+    best_favourable = 0.0
+
     for j in range(fill_i + 1, n):
-        hit_stop = lows[j] <= stop if long else highs[j] >= stop
+        hit_stop = lows[j] <= stop_now if long else highs[j] >= stop_now
         hit_target = highs[j] >= target if long else lows[j] <= target
         if hit_stop:   # checked first: ambiguous bars resolve to the stop
-            return SimResult(status=LOSS, fill_time=index[fill_i], exit_time=index[j],
-                              r_result=-1.0 - fee_r, bars_to_fill=fill_i,
-                              bars_in_trade=j - fill_i)
+            # A trailed stop can sit beyond entry, so this is not always -1R.
+            moved = (stop_now - entry) if long else (entry - stop_now)
+            r = (moved / risk0) if risk0 else -1.0
+            return SimResult(status=WIN if r > 0 else LOSS, fill_time=index[fill_i],
+                              exit_time=index[j], r_result=r - fee_r,
+                              bars_to_fill=fill_i, bars_in_trade=j - fill_i)
         if hit_target:
             return SimResult(status=WIN, fill_time=index[fill_i], exit_time=index[j],
                               r_result=reward_r - fee_r, bars_to_fill=fill_i,
                               bars_in_trade=j - fill_i)
+
+        favourable = (highs[j] - entry) if long else (entry - lows[j])
+        best_favourable = max(best_favourable, favourable)
+        if breakeven_at_r and risk0 and best_favourable / risk0 >= breakeven_at_r:
+            stop_now = max(stop_now, entry) if long else min(stop_now, entry)
+        if trail_atr_mult and atr_value:
+            candidate = ((highs[j] - trail_atr_mult * atr_value) if long
+                         else (lows[j] + trail_atr_mult * atr_value))
+            stop_now = max(stop_now, candidate) if long else min(stop_now, candidate)
 
     # Filled but unresolved by the end of the data.
     risk = abs(entry - stop)
