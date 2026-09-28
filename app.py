@@ -8,6 +8,7 @@ win-probability estimates, edge claims, or profitability guarantees.
 """
 
 import importlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 import streamlit.components.v1 as components
 import yfinance as yf
@@ -411,6 +412,101 @@ def _render_trailing(direction, entry, stop, atr, key=""):
                "activation price and a trail distance.")
 
 
+
+def _fetch_checked(ticker, timeframe, ref_price=None, min_bars=200, hl_frame=None):
+    """Candles for one instrument from the first source that passes.
+
+    Pure fetching, no Streamlit calls, so it is safe to run in a worker thread.
+    Returns (frame, source_name, note). Sources that a previous call found
+    geo-blocked are skipped instantly by exchanges.py, so the ordering below
+    costs one probe per host per session, not per coin.
+    """
+    gap_limit = 8.0 if timeframe == "1d" else 5.0
+    tried = []
+    if CRYPTO_SOURCE == "bybit":
+        _d, _e = exchanges.fetch_bybit_klines(ticker, timeframe, limit=1000)
+        tried.append(("Bybit", _d))
+    _d, _e = exchanges.fetch_binance_klines(ticker, timeframe, limit=1000)
+    tried.append(("Binance", _d))
+    _d, _e = exchanges.fetch_coinbase_candles(ticker, timeframe, limit=300)
+    tried.append(("Coinbase", _d))
+    _d, _e = exchanges.fetch_kraken_ohlc(ticker, timeframe)
+    tried.append(("Kraken", _d))
+    if hl_frame is not None:
+        tried.append(("Hyperliquid", hl_frame))
+    else:
+        _d, _e = hyperliquid_data.fetch_candles(
+            f"HL:{exchanges.base_asset(ticker)}", timeframe, 1000)
+        tried.append(("Hyperliquid", _d))
+
+    checked, rejected = [], []
+    for name, frame in tried:
+        if frame is not None and not frame.empty and ref_price:
+            close = float(frame["Close"].iloc[-1])
+            gap = abs(close - ref_price) / ref_price * 100
+            if gap > gap_limit:
+                rejected.append(f"{name}: last close {close:,.6g} vs {ref_price:,.6g} "
+                                f"reference ({gap:.0f}% out)")
+                continue
+        checked.append((name, frame))
+
+    if not ref_price:
+        # No reference to check against, so require two sources to agree.
+        closes = [(n, float(f["Close"].iloc[-1]))
+                  for n, f in checked if f is not None and not f.empty]
+        agreed = None
+        for i_, (n1, c1) in enumerate(closes):
+            for n2, c2 in closes[i_ + 1:]:
+                if c1 > 0 and abs(c1 - c2) / c1 * 100 <= 5:
+                    agreed = {n1, n2}
+                    break
+            if agreed:
+                break
+        if closes and agreed is None:
+            spread = ", ".join(f"{n}={c:,.6g}" for n, c in closes)
+            return None, None, (f"No reference price, and the sources disagree ({spread}).")
+        if agreed:
+            checked = [(n, f) for n, f in checked if n in agreed]
+
+    frame, src, why = frame_check.first_valid(checked, timeframe, min_bars=min_bars)
+    return frame, src, "; ".join(rejected + ([why] if why else []))
+
+
+def _prefetch_candles(tickers, timeframe, refs=None, min_bars=200, hl_frames=None,
+                      progress=None, workers=6):
+    """Fetch many instruments at once.
+
+    Scanning was a coin at a time: each waiting on several HTTP round trips
+    before the next even started. These are independent, so they run together
+    and the whole scan takes about as long as its slowest coin rather than the
+    sum of all of them. The progress callback runs on the calling thread.
+    """
+    refs = refs or {}
+    hl_frames = hl_frames or {}
+    out = {}
+    if not tickers:
+        return out
+
+    def _one(tk):
+        return tk, _fetch_checked(tk, timeframe, refs.get(tk), min_bars,
+                                   hl_frames.get(exchanges.base_asset(tk)))
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(tickers))) as pool:
+        futures = [pool.submit(_one, tk) for tk in tickers]
+        for done, future in enumerate(as_completed(futures), start=1):
+            try:
+                tk, result = future.result()
+                out[tk] = result
+            except Exception as e:
+                tk = None
+            if progress:
+                try:
+                    progress(done, len(tickers), tk or "")
+                except Exception:
+                    pass
+    return out
+
+
 def _candles_for(ticker, timeframe, bars=400):
     """Candles for any instrument, from whichever source carries it.
 
@@ -476,7 +572,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-27-b76 (hide entries far from the live price)"
+APP_BUILD = "2026-09-27-b77 (parallel scanning)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -1416,6 +1512,7 @@ with tab_scan:
 
             _loader_notes = {}
             _last_closes = {}
+            _PREFETCHED = {}
             _HL_MARKS = {}
             _REF_PRICES = {}          # ticker -> CoinGecko price, the reference
             if not NON_CRYPTO:
@@ -1458,6 +1555,10 @@ with tab_scan:
                 # Trusting a source's label is what produced plans priced
                 # nowhere near the market.
                 def _five_minute():
+                    pre = _PREFETCHED.get(ticker)
+                    if pre is not None:
+                        return pre
+
                     tried = []
                     if CRYPTO_SOURCE == "bybit":
                         bb, _e = exchanges.fetch_bybit_klines(ticker, "5m", limit=1000)
@@ -1543,6 +1644,15 @@ with tab_scan:
                         _daily_cache[tk] = df
                         return df
 
+                    pre = _PREFETCHED.get(tk)
+                    if pre is not None:
+                        df, src, why = pre
+                        _loader_notes[tk] = (src, why)
+                        if df is not None:
+                            _last_closes[tk] = float(df["Close"].iloc[-1])
+                        _daily_cache[tk] = df
+                        return df
+
                     base = exchanges.base_asset(tk)
                     tried = []
                     if CRYPTO_SOURCE == "bybit":
@@ -1585,6 +1695,15 @@ with tab_scan:
                         progress=lambda i, n, nm: bar.progress(
                             min(i / max(n, 1), 1.0), text=f"{i}/{n} · {nm}"))
                     _bulk_daily = {k.replace("HL:", ""): v for k, v in _got.items()}
+
+                if not NON_CRYPTO:
+                    _tickers = [t for _l, t, _k in instruments]
+                    bar.progress(0.0, text=f"Fetching {len(_tickers)} daily charts…")
+                    _PREFETCHED.update(_prefetch_candles(
+                        _tickers, "1d", refs=_REF_PRICES, min_bars=120,
+                        hl_frames=_bulk_daily,
+                        progress=lambda i, n, nm: bar.progress(
+                            min(i / max(n, 1), 1.0), text=f"{i}/{n} · {nm}")))
 
                 with st.spinner("Applying the swing rules…"):
                     ranked = swing.scan_universe(
@@ -1649,6 +1768,14 @@ with tab_scan:
                             "atr": trend_retrace.atr(frames.get("5m"))}
                         return frames
 
+                    _tickers = [t for _l, t, _k in instruments]
+                    bar.progress(0.0, text=f"Fetching {len(_tickers)} coins…")
+                    _PREFETCHED.update(_prefetch_candles(
+                        _tickers, "5m", refs=_REF_PRICES, min_bars=200,
+                        hl_frames={exchanges.base_asset(k): v
+                                   for k, v in (_bulk or {}).items() if v is not None},
+                        progress=lambda i, n, nm: bar.progress(
+                            min(i / max(n, 1), 1.0), text=f"{i}/{n} · {nm}")))
                     ranked = trend_retrace.scan_universe_tr(
                         instruments, _tr_loader_capture, spot_loader=_spot,
                         params=TR_PARAMS, progress=_progress, extra_features=_extra)
