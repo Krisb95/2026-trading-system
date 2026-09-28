@@ -84,14 +84,16 @@ def _optional(name):
 stop_manager = _optional("stop_manager")
 swing = _optional("swing")
 mean_reversion = _optional("mean_reversion")
+strategy_chart = _optional("strategy_chart")
 _MISSING_MODULES = [n for n, m in (("mean_reversion.py", mean_reversion),
+                                    ("strategy_chart.py", strategy_chart),
                                     ("stop_manager.py", stop_manager),
                                     ("swing.py", swing)) if m is None]
 
 _REQUIRED = {
     coingecko: ['build_frames_v2', 'fetch_description', 'fetch_ohlc', 'fetch_period_changes', 'fetch_prices_bulk', 'fetch_spot_price', 'has_api_key', 'search_coins', 'set_api_key'],
     hyperliquid_data: ['MarketContext', 'fetch_candles', 'fetch_candles_many', 'fetch_market_contexts', 'is_hl_ticker', 'rank_by_volume'],
-    watchlist_mod: ['DEFAULT_WATCHLIST', 'MEME_WATCHLIST', '_normalise', 'parse_aliases', 'parse_list', 'resolve', 'search_markets', 'suggest'],
+    watchlist_mod: ['WATCHLISTS', '_normalise', 'parse_aliases', 'parse_list', 'resolve', 'search_markets', 'suggest'],
     sentiment: ['bucket', 'fetch_fear_greed', 'set_cmc_api_key'],
     theme: ['AMBER', 'BLUE', 'CSS', 'GRADE_COLOURS', 'GREEN', 'GREY', 'PURPLE', 'pill'],
     storage: ['add_journal_entry', 'clear_all', 'close_journal_entry', 'get_journal_df', 'get_signals_df', 'import_journal_csv', 'import_signals_csv', 'init_db', 'journal_to_csv_bytes', 'load_value', 'save_value', 'signals_to_csv_bytes', 'update_journal_entry', 'update_signal'],
@@ -111,6 +113,7 @@ _REQUIRED = {
     stop_manager: ['suggest'],
     frame_check: ['check', 'first_valid'],
     mean_reversion: ['MeanReversionParams', 'analyze', 'scan_universe'],
+    strategy_chart: ['chart_spec', 'entry_zone_of', 'levels_for'],
 }
 
 # Features the app can run without. A missing one degrades that feature only,
@@ -575,7 +578,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-28-b82 (tiered watchlist)"
+APP_BUILD = "2026-09-28-b84 (chart back, as its own tab)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -711,8 +714,12 @@ FX_TICKERS = {
 st.sidebar.header("⚙️ Settings")
 
 st.sidebar.subheader("Strategy")
-strategy_choice = st.sidebar.radio(
-    "Scanner strategy",
+_top = st.container()
+with _top:
+    _t1, _t2, _t3, _t4 = st.columns([3, 1.4, 1.2, 1.2])
+
+strategy_choice = _t1.radio(
+    "Strategy",
     (["Mean Reversion (mine — high win rate)"] if mean_reversion else [])
     + (["Swing Levels (daily — Soloway-style)"] if swing else [])
     + ["Trend Retrace (your 5-minute strategy)"],
@@ -809,21 +816,20 @@ if USE_TR:
 else:
     TR_PARAMS = None
 
-st.sidebar.subheader("Your account")
-ACCOUNT_EQUITY = st.sidebar.number_input("Account equity ($)", min_value=0.0, value=10000.0,
-                                          step=100.0, key="acct_equity")
-RISK_PCT = st.sidebar.number_input("Risk per trade (%)", min_value=0.1, max_value=100.0,
-                                    value=1.0, step=0.1, key="acct_risk",
-                                    help="The most you'll lose if the stop is hit. Used "
-                                         "everywhere — plans, positions and the calculator.")
-LEVERAGE = st.sidebar.number_input("Leverage", min_value=1.0, max_value=50.0, value=1.0,
-                                    step=0.5, key="acct_lev")
+ACCOUNT_EQUITY = _t2.number_input("Equity ($)", min_value=0.0, value=10000.0,
+                                   step=100.0, key="acct_equity")
+RISK_PCT = _t3.number_input("Risk per trade (%)", min_value=0.1, max_value=100.0,
+                             value=1.0, step=0.1, key="acct_risk",
+                             help="The most you'll lose if the stop is hit.")
+LEVERAGE = _t4.number_input("Leverage", min_value=1.0, max_value=50.0, value=1.0,
+                            step=0.5, key="acct_lev")
 with st.sidebar.expander("Costs"):
     FEE_RATE = st.number_input("Fee rate (round trip)", min_value=0.0, value=0.0006,
                                step=0.0001, format="%.4f", key="acct_fee")
     SLIPPAGE = st.number_input("Slippage", min_value=0.0, value=0.0005, step=0.0001,
                                format="%.4f", key="acct_slip")
-st.sidebar.caption(f"Risking **${ACCOUNT_EQUITY * RISK_PCT / 100:,.2f}** per trade.")
+_top.caption(f"Risking **${ACCOUNT_EQUITY * RISK_PCT / 100:,.2f}** per trade · "
+             f"{strategy_choice.split(' (')[0]}")
 
 MAX_ENTRY_GAP = st.sidebar.slider(
     "Hide entries further than this from the live price (%)", 1.0, 30.0, 5.0, 0.5,
@@ -1025,8 +1031,8 @@ st.sidebar.warning(
     "import them back afterwards."
 )
 
-(tab_scan, tab_review, tab_journal, tab_track, tab_learn) = st.tabs(
-    ["🎯 Scan", "🔍 Review", "📓 Journal", "📈 Tracking", "📚 Coins"]
+(tab_scan, tab_chart, tab_review, tab_journal, tab_track, tab_learn) = st.tabs(
+    ["🎯 Scan", "📉 Chart", "🔍 Review", "📓 Journal", "📈 Tracking", "📚 Coins"]
 )
 
 # ---------------------------------------------------------------------
@@ -1980,13 +1986,16 @@ with tab_scan:
                         "settings (stop, target or strategy have changed since). It no "
                         "longer applies, so it isn't used. Re-run the 🔁 Backtest.")
 
-            f1, f2 = st.columns(2)
-            min_score = f1.number_input(
-                "Show scores of at least", min_value=0.0, max_value=10.0, value=0.0,
-                step=0.5, key="uni_min_score",
-                help="Scores are whole numbers, so 8.5 behaves the same as 9. "
-                     "A 9 or 10 appears in only a few percent of market states.")
-            a_plus_only = f2.checkbox("A+ only", key="uni_aplus_only")
+            a_plus_only = st.toggle(
+                "A+ setups only", value=True, key="uni_aplus_only",
+                help="On by default: the full-quality setups, where every rule is met. "
+                     "Switch it off to see the partial ones too.")
+            min_score = 0.0
+            if not a_plus_only:
+                min_score = st.number_input(
+                    "Show scores of at least", min_value=0.0, max_value=10.0, value=0.0,
+                    step=0.5, key="uni_min_score",
+                    help="Scores are whole numbers, so 8.5 behaves the same as 9.")
             proven_only = st.checkbox(
                 "Only show setups with proven positive expectancy",
                 key="uni_proven_only", disabled=EVIDENCE is None,
@@ -2773,6 +2782,96 @@ with tab_scan:
             gaps = missing_entry_sequence_stages(seq_evidence)
             if gaps:
                 st.warning("What would confirm this:\n" + "\n".join(f"- {g}" for g in gaps))
+
+with tab_chart:
+    st.subheader("Chart")
+    if strategy_chart is None:
+        st.warning("Needs `strategy_chart.py` in your repo.")
+    else:
+        st.caption(
+            "Any instrument, with the current strategy's levels drawn on the candles it "
+            "reads. Separate from the scan — look at whatever you like here without "
+            "affecting the results."
+        )
+        g1, g2, g3, g4 = st.columns([2, 2, 1, 1])
+        _ch_lists = {"Crypto": CRYPTO_TICKERS, "Commodities": COMMODITY_TICKERS,
+                     "FX": FX_TICKERS}
+        _ch_market = g1.selectbox("Market", list(_ch_lists), key="ch_market")
+        _ch_name = g2.selectbox("Instrument", list(_ch_lists[_ch_market]), key="ch_name")
+        _ch_ticker = _ch_lists[_ch_market][_ch_name]
+        _ch_tf = g3.selectbox("Timeframe", ["1d", "4h", "1h", "5m"],
+                              index=0 if (USE_SWING or USE_MR) else 1, key="ch_tf")
+        _ch_every = g4.selectbox("Update", ["Off", "30s", "1 min", "5 min"], index=1,
+                                 key="ch_every")
+        _ch_secs = {"30s": 30, "1 min": 60, "5 min": 300}.get(_ch_every)
+        _ch_h = st.select_slider("Size", [300, 400, 520, 680, 850], value=520,
+                                 key="ch_height",
+                                 format_func=lambda v: {300: "Small", 400: "Medium",
+                                                        520: "Large", 680: "Extra large",
+                                                        850: "Full"}[v])
+
+        def _draw_chart():
+            _ref = None
+            _cid = _cg_id_for_symbol(exchanges.base_asset(_ch_ticker))
+            if _cid:
+                _p, _e = _cached_cg_bulk((_cid,))
+                _ref = _p.get(_cid)
+            if "=" in _ch_ticker:
+                df = _candles_for(_ch_ticker, _ch_tf, 400)
+                src, why = "Yahoo", ""
+            else:
+                df, src, why = _fetch_checked(_ch_ticker, _ch_tf, _ref,
+                                               min_bars=60 if _ch_tf == "1d" else 200)
+            if df is None or df.empty:
+                st.warning(f"No usable {_ch_tf} candles for {_ch_name}. {why}")
+                return
+
+            plan = None
+            try:
+                if USE_MR and mean_reversion is not None:
+                    daily = df if _ch_tf == "1d" else _candles_for(_ch_ticker, "1d", 400)
+                    if daily is not None and not daily.empty:
+                        plan = mean_reversion.analyze(_ch_ticker, daily, price=_ref,
+                                                       params=MR_PARAMS)
+                elif USE_SWING and swing is not None:
+                    daily = df if _ch_tf == "1d" else _candles_for(_ch_ticker, "1d", 400)
+                    if daily is not None and not daily.empty:
+                        plan = swing.analyze(_ch_ticker, daily, price=_ref,
+                                              params=SWING_PARAMS)
+                elif USE_TR:
+                    f5 = df if _ch_tf == "5m" else _candles_for(_ch_ticker, "5m", 1000)
+                    if f5 is not None and len(f5) >= 720:
+                        fr = trend_retrace.frames_from_5m(f5)
+                        plan = trend_retrace.analyze(_ch_ticker, fr["4h"], fr["1h"],
+                                                      fr["5m"], live_price=_ref,
+                                                      params=TR_PARAMS)
+            except Exception:
+                plan = None
+
+            st.vega_lite_chart(
+                strategy_chart.chart_spec(
+                    df, strategy_chart.levels_for(plan),
+                    zone=strategy_chart.entry_zone_of(plan), height=_ch_h,
+                    direction=getattr(plan, "direction", None) if plan else None,
+                    sma_period=20),
+                use_container_width=True)
+            bits = [f"{_ch_name} · {_ch_tf} · {len(df)} candles · {src}"]
+            if plan is not None and getattr(plan, "direction", None):
+                bits.append(f"{plan.direction} · {plan.stage}")
+            bits.append(datetime.now().strftime("%H:%M:%S"))
+            st.caption(" · ".join(bits))
+            if plan is None or not getattr(plan, "entry", None):
+                st.caption("No setup here right now, so no entry, stop or target is drawn "
+                           "— the trend line, swing points and average still are.")
+
+        if _ch_secs and hasattr(st, "fragment"):
+            st.fragment(run_every=_ch_secs)(_draw_chart)()
+        else:
+            _draw_chart()
+
+        st.caption("Green target · red stop · amber entry · dashed blue at the live price · "
+                   "grey level · dashed purple trend line · blue average · dots on "
+                   "confirmed swings. Drag to pan, pinch to zoom.")
 
 with tab_review:
     st.subheader("Review")
