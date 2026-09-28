@@ -160,6 +160,8 @@ COINS: Dict[str, Tuple[str, str]] = {
     "POPCAT": ("Meme", "A Solana memecoin built around a cat meme."),
     "MEW": ("Meme", "A Solana cat-themed memecoin."),
     "SPX": ("Meme", "A memecoin riffing on stock-market culture."),
+    "GRASS": ("AI", "Pays people for their spare bandwidth, which is used to gather web "
+                     "data for training AI models."),
 }
 
 

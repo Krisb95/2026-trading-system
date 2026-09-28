@@ -17,17 +17,19 @@ import difflib
 import re
 
 # The trader's list, as given.
-DEFAULT_WATCHLIST = ("RSR, BTC, ETH, SOL, ZEC, HYPE, LIGHTER, TAO, NEAR, PONS, "
-                     "FETCH.AI, SUI, UNI, RNDR, COMP, STACKS, IMMUTABLE, LINK, "
-                     "XRP, AVAX, INJ, ONDO, WLD, GRT, AAVE, LDO, PYTH, TIA, ARB, ATOM")
+# Your list, in tiers. Keeping them apart matters for reading results: a
+# memecoin and a large cap behave nothing alike, and mixing them makes a scan
+# harder to judge — and the learning system harder to trust, since a lesson
+# drawn from one tier may not hold in another.
+TIER_1 = "BTC, ETH, SOL, XRP, BNB, LINK, AAVE"
+TIER_2 = "NEAR, SUI, HYPE, ZEC, ONDO, UNI, TAO, INJ"
+TIER_3 = "FARTCOIN, PEPE, BONK, WIF, PUMP, PONS, GRASS"
 
-# Memecoins are kept apart deliberately. They move on attention rather than
-# anything measurable, so mixing them into the main list makes a scan's results
-# harder to read — and worth judging separately once forward tracking has
-# enough trades to compare the two.
-MEME_WATCHLIST = ("FARTCOIN, PUMP, WIF, PEPE, BONK, DOGE, SHIB, POPCAT, MEW, SPX")
+WATCHLISTS = {"Tier 1": TIER_1, "Tier 2": TIER_2, "Tier 3": TIER_3}
 
-WATCHLISTS = {"Main": DEFAULT_WATCHLIST, "Memes": MEME_WATCHLIST}
+# Everything, for anywhere that wants one list.
+DEFAULT_WATCHLIST = ", ".join((TIER_1, TIER_2, TIER_3))
+MEME_WATCHLIST = TIER_3        # kept so older saved settings still resolve
 
 # Common names and old tickers mapped to the symbol venues use.
 ALIASES: Dict[str, str] = {

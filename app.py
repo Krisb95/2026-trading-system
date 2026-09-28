@@ -83,7 +83,9 @@ def _optional(name):
 
 stop_manager = _optional("stop_manager")
 swing = _optional("swing")
-_MISSING_MODULES = [n for n, m in (("stop_manager.py", stop_manager),
+mean_reversion = _optional("mean_reversion")
+_MISSING_MODULES = [n for n, m in (("mean_reversion.py", mean_reversion),
+                                    ("stop_manager.py", stop_manager),
                                     ("swing.py", swing)) if m is None]
 
 _REQUIRED = {
@@ -105,9 +107,10 @@ _REQUIRED = {
     grid_mod: ['MIN_LEVELS', 'WEIGHTINGS', 'build_grid', 'usable_levels'],
     patterns: ['bias_of', 'contradicts', 'detect', 'summarise'],
     uihelpers: ['scan_count'],
-    swing: ['SwingParams', 'analyze', 'run_backtest', 'scan_universe'],
+    swing: ['SwingParams', 'analyze', 'scan_universe'],
     stop_manager: ['suggest'],
     frame_check: ['check', 'first_valid'],
+    mean_reversion: ['MeanReversionParams', 'analyze', 'scan_universe'],
 }
 
 # Features the app can run without. A missing one degrades that feature only,
@@ -572,7 +575,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-27-b79 (lab split into its own repo)"
+APP_BUILD = "2026-09-28-b82 (tiered watchlist)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -710,7 +713,8 @@ st.sidebar.header("⚙️ Settings")
 st.sidebar.subheader("Strategy")
 strategy_choice = st.sidebar.radio(
     "Scanner strategy",
-    (["Swing Levels (daily — Soloway-style)"] if swing else [])
+    (["Mean Reversion (mine — high win rate)"] if mean_reversion else [])
+    + (["Swing Levels (daily — Soloway-style)"] if swing else [])
     + ["Trend Retrace (your 5-minute strategy)"],
     key="strategy_choice",
     help="Trend Retrace: two 4H candles of HH/HL, a bullish 1H candle, then a 5m "
@@ -718,6 +722,28 @@ strategy_choice = st.sidebar.radio(
          "checklist, kept for comparison.")
 USE_TR = strategy_choice.startswith("Trend")
 USE_SWING = strategy_choice.startswith("Swing") and swing is not None
+USE_MR = strategy_choice.startswith("Mean") and mean_reversion is not None
+if USE_MR:
+    with st.sidebar.expander("Mean Reversion settings", expanded=False):
+        st.caption("Small target, wide stop: it wins often by design. At a 0.4:1 target "
+                   "a market with no edge still wins about 71% of the time, so the win "
+                   "rate alone tells you nothing — one loss undoes two and a half wins.")
+        _mr_target = st.number_input("Target (multiple of risk)", 0.1, 1.0, 0.4, 0.05,
+                                     key="mr_target")
+        st.caption(f"Break-even win rate at {_mr_target:g}:1 is "
+                   f"**{1 / (1 + _mr_target):.0%}**.")
+        _mr_stop = st.slider("Stop beyond the level (ATR)", 0.5, 4.0, 1.5, 0.25,
+                             key="mr_stop")
+        _mr_ext = st.slider("Minimum stretch from the average (ATR)", 0.5, 4.0, 1.5, 0.25,
+                            key="mr_ext")
+        _mr_reject = st.checkbox("Require a rejection candle", value=True, key="mr_reject",
+                                 help="The trigger. Switching it off gives far more "
+                                      "setups, most of them worse.")
+    MR_PARAMS = mean_reversion.MeanReversionParams(
+        target_r=_mr_target, stop_atr=_mr_stop, min_extension_atr=_mr_ext,
+        require_rejection=_mr_reject)
+else:
+    MR_PARAMS = None
 if USE_SWING:
     with st.sidebar.expander("Swing settings", expanded=False):
         st.caption("Daily candles: check once a day, hold for days or weeks. Built from "
@@ -1093,7 +1119,7 @@ with tab_scan:
     )
 
     _modes = (["Rank the universe", "Auto-scan one instrument"]
-              if (USE_TR or USE_SWING)
+              if (USE_TR or USE_SWING or USE_MR)
               else ["Rank the universe", "Auto-scan one instrument", "Manual checklist"])
     mode = st.radio("Mode", _modes, key="scan_mode",
                     help="Rank the universe checks many coins and shortlists the best; "
@@ -1142,33 +1168,29 @@ with tab_scan:
         HL_MODE = ((coin_source.startswith("High volume") or WATCHLIST_MODE)
                    and not NON_CRYPTO)
         if WATCHLIST_MODE:
-            _wl_which = st.radio("Watchlist", ["Main", "Memes", "Both"], horizontal=True,
-                                 key="wl_which",
-                                 help="Memes are kept separate because they move on "
-                                      "attention rather than anything measurable — worth "
-                                      "judging on their own once you have enough trades.")
-            _wl_saved_main = storage.load_value("wl_text_main")[0]
-            _wl_saved_meme = storage.load_value("wl_text_memes")[0]
-            if _wl_which in ("Main", "Both"):
-                _main_text = st.text_area(
-                    "Main list", value=_wl_saved_main or watchlist_mod.DEFAULT_WATCHLIST,
-                    height=90, key="wl_text_main",
-                    help="Separate with commas. Full names work too (stacks, immutable).")
-            else:
-                _main_text = ""
-            if _wl_which in ("Memes", "Both"):
-                _meme_text = st.text_area(
-                    "Meme list", value=_wl_saved_meme or watchlist_mod.MEME_WATCHLIST,
-                    height=70, key="wl_text_memes")
-            else:
-                _meme_text = ""
-            if st.button("Save lists", key="wl_save"):
-                if _wl_which in ("Main", "Both"):
-                    storage.save_value("wl_text_main", _main_text)
-                if _wl_which in ("Memes", "Both"):
-                    storage.save_value("wl_text_memes", _meme_text)
+            _tiers = list(watchlist_mod.WATCHLISTS)
+            _wl_pick = st.multiselect(
+                "Tiers to scan", _tiers, default=_tiers, key="wl_tiers",
+                help="Tiers are kept apart because a memecoin and a large cap behave "
+                     "nothing alike — scanning them together makes the results harder to "
+                     "read, and any lesson the app learns harder to trust.")
+            _wl_which = ", ".join(_wl_pick) if _wl_pick else "none"
+
+            _texts = []
+            for _tier in _tiers:
+                if _tier not in _wl_pick:
+                    continue
+                _key = f"wl_text_{_tier.lower().replace(' ', '')}"
+                _saved = storage.load_value(_key)[0]
+                _texts.append(st.text_area(
+                    _tier, value=_saved or watchlist_mod.WATCHLISTS[_tier], height=68,
+                    key=_key))
+            if st.button("Save tiers", key="wl_save"):
+                for _tier in _wl_pick:
+                    _key = f"wl_text_{_tier.lower().replace(' ', '')}"
+                    storage.save_value(_key, st.session_state.get(_key, ""))
                 st.success("Saved. These survive until the database is wiped.")
-            wl_text = ", ".join(t for t in (_main_text, _meme_text) if t.strip())
+            wl_text = ", ".join(t for t in _texts if t and t.strip())
             _wl_markets = []
             _wl_ctxs, _wl_err = _cached_hl_contexts()
             if _wl_ctxs:
@@ -1298,7 +1320,41 @@ with tab_scan:
                 "⚠️ High volume outside the top coins often means a sharp move, news or a "
                 "pump. These markets are usually more volatile, and your strategy hasn't "
                 "been backtested on them — treat results with extra caution.")
-        if USE_SWING:
+        if USE_MR:
+            st.caption(
+                "**My strategy.** It looks for a market stretched away from its average "
+                "that has arrived at a price it respected before, and takes a small "
+                "profit on the snap back. Daily candles, so one look a day."
+            )
+            st.caption(
+                f"It wins often on purpose — and that is not the same as making money. "
+                f"At {MR_PARAMS.target_r if MR_PARAMS else 0.4:g}:1 a market with no edge "
+                f"still wins about "
+                f"{1 / (1 + (MR_PARAMS.target_r if MR_PARAMS else 0.4)):.0%} of the time, "
+                f"so it only pays above that. One loss undoes "
+                f"{1 / (MR_PARAMS.target_r if MR_PARAMS else 0.4):.1f} wins, which is why "
+                f"the stop matters more here, not less."
+            )
+            # Respect whichever coin source is selected — watchlist, high
+            # volume or top by market cap — rather than forcing the top list.
+            if NON_CRYPTO:
+                _lo, _hi, _default_n = uihelpers.scan_count(len(_list))
+                universe_size = (_default_n if _lo is None else
+                                 st.slider(f"How many {market.lower()} to scan",
+                                           _lo, _hi, _default_n, key="uni_noncrypto_n"))
+            elif WATCHLIST_MODE:
+                universe_size = len(_wl_found) + len(_elsewhere) + len(_via_cg)
+                st.caption(f"Running it over your **{_wl_which.lower()}** watchlist — "
+                           f"{universe_size} instruments.")
+            elif HL_MODE:
+                universe_size = hl_count
+            else:
+                universe_size = st.selectbox(
+                    "Scan the top…", [10, 20, 30, 50, 100], index=1, key="uni_size",
+                    format_func=lambda n: f"Top {n} by market cap")
+            uni_direction = "Auto"
+            uni_min_rr = MR_PARAMS.target_r if MR_PARAMS else 0.4
+        elif USE_SWING:
             st.caption(
                 "Applies the swing rules to each instrument's **daily** chart: a clear "
                 "daily trend, price at a level the market has respected before, and a "
@@ -1619,7 +1675,39 @@ with tab_scan:
                 _loader_notes[ticker] = (None, why)
                 return {"4h": pd.DataFrame(), "1h": pd.DataFrame(), "5m": pd.DataFrame()}
 
-            if USE_SWING:
+            if USE_MR:
+                _mr_cache = {}
+
+                def _mr_loader(payload):
+                    tk = payload[0] if isinstance(payload, tuple) else payload
+                    if tk in _mr_cache:
+                        return _mr_cache[tk]
+                    pre = _PREFETCHED.get(tk)
+                    if pre is not None:
+                        df, src, why = pre
+                        _loader_notes[tk] = (src, why)
+                        if df is not None:
+                            _last_closes[tk] = float(df["Close"].iloc[-1])
+                        _mr_cache[tk] = df
+                        return df
+                    df, src, why = _fetch_checked(tk, "1d", _REF_PRICES.get(tk),
+                                                   min_bars=120)
+                    _loader_notes[tk] = (src, why)
+                    _mr_cache[tk] = df
+                    return df
+
+                _tickers = [t for _l, t, _k in instruments]
+                bar.progress(0.0, text=f"Fetching {len(_tickers)} daily charts…")
+                _PREFETCHED.update(_prefetch_candles(
+                    _tickers, "1d", refs=_REF_PRICES, min_bars=120,
+                    progress=lambda i, n, nm: bar.progress(
+                        min(i / max(n, 1), 1.0), text=f"{i}/{n} · {nm}")))
+                with st.spinner("Looking for stretched markets at a level…"):
+                    ranked = mean_reversion.scan_universe(
+                        instruments, _mr_loader, spot_loader=_spot,
+                        params=MR_PARAMS, progress=_progress)
+
+            elif USE_SWING:
                 _daily_cache = {}
                 # Hyperliquid last, not first — it is the source that was
                 # returning prices from another period entirely.
@@ -1873,8 +1961,12 @@ with tab_scan:
                 _near_enough.append(r)
             scored_all = _near_enough
             # Never hide setups that meet the target the trader chose.
-            _rr_floor = (min(MIN_RR, TR_PARAMS.target_r) if USE_TR and TR_PARAMS
-                         else max(MIN_RR, uni_min_rr))
+            if USE_MR and MR_PARAMS:
+                _rr_floor = MR_PARAMS.target_r      # 0.4:1 is the design, not a fault
+            elif USE_TR and TR_PARAMS:
+                _rr_floor = min(MIN_RR, TR_PARAMS.target_r)
+            else:
+                _rr_floor = max(MIN_RR, uni_min_rr)
             failed = [r for r in ranked if r.error is not None]
 
             _ev_raw, _ev_when = storage.load_value("evidence")
@@ -2110,6 +2202,68 @@ with tab_scan:
                 with st.expander(f"⚠️ {len(failed)} instrument(s) could not be scored"):
                     for r in failed:
                         st.caption(f"**{r.label}** — {r.error}")
+
+        score_evidence, seq_evidence = {}, {}
+
+    elif mode == "Auto-scan one instrument" and USE_MR:
+        mr1, mr2 = st.columns([3, 1])
+        _mr_market = mr1.selectbox("Market", ["Crypto", "Commodities", "FX"],
+                                   key="mrs_market")
+        _mr_lists = {"Crypto": CRYPTO_TICKERS, "Commodities": COMMODITY_TICKERS,
+                     "FX": FX_TICKERS}
+        _mr_name = mr2.selectbox("Instrument", list(_mr_lists[_mr_market]), key="mrs_name")
+        _mr_ticker = _mr_lists[_mr_market][_mr_name]
+
+        st.caption("Checks whether this market is stretched from its average and sitting "
+                   "at a price it has respected before, with a candle rejecting that level.")
+
+        if st.button("🔍 Check this market", use_container_width=True, key="mrs_go"):
+            with st.spinner("Loading daily candles…"):
+                _ref = None
+                _cid = _cg_id_for_symbol(exchanges.base_asset(_mr_ticker))
+                if _cid:
+                    _p, _e = _cached_cg_bulk((_cid,))
+                    _ref = _p.get(_cid)
+                _df, _src, _why = _fetch_checked(_mr_ticker, "1d", _ref, min_bars=120)
+            if _df is None:
+                st.error(f"No usable daily candles. {_why}")
+            else:
+                st.session_state.mr_plan = mean_reversion.analyze(
+                    _mr_ticker, _df, price=_ref, params=MR_PARAMS)
+                st.session_state.mr_src = _src
+
+        _mrp = st.session_state.get("mr_plan")
+        if _mrp is None:
+            st.info("Pick a market and press **Check this market**.")
+        else:
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("Instrument", _mrp.ticker)
+            h2.metric("Direction", _mrp.direction or "—")
+            h3.metric("Score", f"{_mrp.score:.0f}/10", _mrp.grade)
+            h4.metric("Price", format_price(_mrp.price))
+            st.markdown(f"##### Status: **{_mrp.stage}**")
+            for r_ in _mrp.reasons:
+                st.caption(f"• {r_}")
+            if _mrp.entry and _mrp.stop and _mrp.target:
+                e1, e2, e3, e4 = st.columns(4)
+                e1.metric("Entry", format_price(_mrp.entry))
+                e2.metric("Stop", format_price(_mrp.stop))
+                e3.metric("Target", format_price(_mrp.target))
+                e4.metric("R:R", format_rr(_mrp.reward_risk))
+                _szm = _size_plan(_mrp.direction, _mrp.entry, _mrp.stop, _mrp.target,
+                                   _mrp.ticker)
+                _render_size(_szm)
+                if st.button("💾 Save this setup to re-check later",
+                             key=f"savemr_{_mrp.ticker}", use_container_width=True):
+                    _sid = tracking.record_one(_mrp, source="mean-reversion")
+                    st.success(f"Saved as #{_sid}." if _sid else "Already saved.")
+                _take_trade_widget(f"mr_{_mrp.ticker}", _mrp.ticker, _mrp.direction,
+                                   _mrp.entry, _mrp.stop, _mrp.target,
+                                   features=_mrp.features, score=_mrp.score,
+                                   grade=_mrp.grade,
+                                   reason=f"Mean Reversion: {_mrp.stage}",
+                                   suggested_qty=_szm.quantity if _szm else 0.0)
+            st.caption(f"Candles from {st.session_state.get('mr_src', 'unknown')}.")
 
         score_evidence, seq_evidence = {}, {}
 
@@ -2561,7 +2715,7 @@ with tab_scan:
     # The confluence score/readiness panel only applies to the original
     # strategy's single-coin and manual modes. Under Trend Retrace, or after a
     # universe scan, it would show a meaningless score built from no evidence.
-    if not USE_TR and not USE_SWING and mode != "Rank the universe":
+    if not USE_TR and not USE_SWING and not USE_MR and mode != "Rank the universe":
         st.markdown("---")
         result = score_setup(score_evidence)
         r1, r2 = st.columns([1, 2])
